@@ -1,0 +1,13 @@
+[image]
+architecture = "amd64"
+
+[repositories.debian]
+url = "https://deb.debian.org/debian"
+distribution = "bookworm"
+components = ["main"]
+
+[[packages]]
+name = "ca-certificates"
+
+[entrypoint]
+cmd = ["/bin/sh"]

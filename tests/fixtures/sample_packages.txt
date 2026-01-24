@@ -1,0 +1,258 @@
+Package: base-files
+Version: 12.4+deb12u13
+Essential: yes
+Installed-Size: 341
+Maintainer: Santiago Vila <sanvila@debian.org>
+Architecture: amd64
+Replaces: base, dpkg (<= 1.15.0), miscutils
+Provides: base
+Pre-Depends: awk
+Breaks: debian-security-support (<< 2019.04.25), initscripts (<< 2.88dsf-13.3), sendfile (<< 2.1b.20080616-5.2~)
+Description: Debian base system miscellaneous files
+Multi-Arch: foreign
+Description-md5: 6d16337f57b84c4747f56438355b2395
+Tag: admin::configuring, admin::filesystem, admin::install, admin::login,
+ role::app-data, suite::debian
+Section: admin
+Priority: required
+Filename: pool/main/b/base-files/base-files_12.4+deb12u13_amd64.deb
+Size: 70904
+MD5sum: ced213913cedb4837c78114df96ff134
+SHA256: d0aee30a91b1283e0c724e9ad0ae7394d8e56f07d20cacfcb79b8f444daa94cd
+
+Package: bash
+Source: bash (5.2.15-2)
+Version: 5.2.15-2+b10
+Essential: yes
+Installed-Size: 7164
+Maintainer: Matthias Klose <doko@debian.org>
+Architecture: amd64
+Replaces: bash-completion (<< 20060301-0), bash-doc (<= 2.05-1)
+Depends: base-files (>= 2.1.12), debianutils (>= 5.6-0.1)
+Pre-Depends: libc6 (>= 2.36), libtinfo6 (>= 6)
+Recommends: bash-completion (>= 20060301-0)
+Suggests: bash-doc
+Conflicts: bash-completion (<< 20060301-0)
+Description: GNU Bourne Again SHell
+Multi-Arch: foreign
+Homepage: http://tiswww.case.edu/php/chet/bash/bashtop.html
+Description-md5: 3522aa7b4374048d6450e348a5bb45d9
+Tag: admin::TODO, devel::TODO, devel::interpreter, implemented-in::c,
+ interface::shell, interface::text-mode, role::program,
+ scope::application, suite::gnu, uitoolkit::ncurses
+Section: shells
+Priority: required
+Filename: pool/main/b/bash/bash_5.2.15-2+b10_amd64.deb
+Size: 1490048
+MD5sum: fbbc9c0c551979123914e47f7d67821a
+SHA256: be3ab2fd057cb9a29e733d0d8c2b867468731d99af2ce62a63ec6a6c7928572f
+
+Package: ca-certificates
+Version: 20230311+deb12u1
+Installed-Size: 387
+Maintainer: Julien Cristau <jcristau@debian.org>
+Architecture: all
+Depends: openssl (>= 1.1.1), debconf (>= 0.5) | debconf-2.0
+Enhances: openssl
+Breaks: ca-certificates-java (<< 20121112+nmu1)
+Description: Common CA certificates
+Multi-Arch: foreign
+Description-md5: e867d2a359bea1800b5bff209fc65bd1
+Tag: protocol::ssl, role::app-data, security::authentication
+Section: misc
+Priority: standard
+Filename: pool/main/c/ca-certificates/ca-certificates_20230311+deb12u1_all.deb
+Size: 155260
+MD5sum: 8dc2c61e11c1e40bbbb70884be1392c0
+SHA256: 0d5f444f594e48c1e16a41d8fc628a09b24c658916a1274025c2330f2a802bed
+
+Package: coreutils
+Version: 9.1-1
+Essential: yes
+Installed-Size: 18062
+Maintainer: Michael Stone <mstone@debian.org>
+Architecture: amd64
+Pre-Depends: libacl1 (>= 2.2.23), libattr1 (>= 1:2.4.44), libc6 (>= 2.34), libgmp10 (>= 2:6.2.1+dfsg1), libselinux1 (>= 3.1~)
+Description: GNU core utilities
+Multi-Arch: foreign
+Homepage: http://gnu.org/software/coreutils
+Description-md5: d0d975dec3625409d24be1238cede238
+Tag: admin::configuring, implemented-in::c, interface::commandline,
+ role::program, scope::utility, suite::gnu, works-with::file
+Section: utils
+Priority: required
+Filename: pool/main/c/coreutils/coreutils_9.1-1_amd64.deb
+Size: 2896560
+MD5sum: 422d5a39db59ce199e9588ac35167081
+SHA256: 61038f857e346e8500adf53a2a0a20859f4d3a3b51570cc876b153a2d51a3091
+
+Package: debianutils
+Version: 5.7-0.5~deb12u1
+Essential: yes
+Installed-Size: 243
+Maintainer: Clint Adams <clint@debian.org>
+Architecture: amd64
+Pre-Depends: libc6 (>= 2.34)
+Breaks: ifupdown (<< 0.8.36+nmu1), printer-driver-pnm2ppa (<< 1.13-12), x11-common (<< 1:7.7+23~)
+Description: Miscellaneous utilities specific to Debian
+Multi-Arch: foreign
+Description-md5: 133cfb7cff1ec5713bc396f059f97013
+Tag: admin::configuring, devel::lang:perl, devel::library, implemented-in::c,
+ implemented-in::perl, interface::commandline, role::devel-lib,
+ role::program, scope::utility, suite::debian
+Section: utils
+Priority: required
+Filename: pool/main/d/debianutils/debianutils_5.7-0.5~deb12u1_amd64.deb
+Size: 102588
+MD5sum: 1982880343ff077fcdd8f4866d35f80c
+SHA256: 55f951359670eb3236c9e2ccd5fac9ccb3db734f5a22aff21589e7a30aee48c9
+
+Package: gawk
+Version: 1:5.2.1-2
+Installed-Size: 2906
+Maintainer: Adrian Bunk <bunk@debian.org>
+Architecture: amd64
+Provides: awk
+Pre-Depends: libc6 (>= 2.34), libgmp10 (>= 2:6.2.1+dfsg1), libmpfr6 (>= 3.1.3), libreadline8 (>= 6.0), libsigsegv2 (>= 2.9)
+Suggests: gawk-doc
+Description: GNU awk, a pattern scanning and processing language
+Multi-Arch: foreign
+Homepage: http://www.gnu.org/software/gawk/
+Description-md5: 0dce81fe543994c3caea814e2777732e
+Tag: devel::interpreter, implemented-in::c, interface::commandline,
+ role::program, scope::utility, suite::gnu, use::converting,
+ use::filtering, use::scanning, works-with::text
+Section: interpreters
+Priority: optional
+Filename: pool/main/g/gawk/gawk_5.2.1-2_amd64.deb
+Size: 672772
+MD5sum: 37a046e07c55a0c6e6ae5d0191bb5931
+SHA256: 9cd63c1b35ff082092c221a23dcb167f72c4d1c3de3a42e11f16181f42ab3b55
+
+Package: libgcc-s1
+Source: gcc-12
+Version: 12.2.0-14+deb12u1
+Installed-Size: 140
+Maintainer: Debian GCC Maintainers <debian-gcc@lists.debian.org>
+Architecture: amd64
+Replaces: libgcc1 (<< 1:10)
+Provides: libgcc1 (= 1:12.2.0-14+deb12u1)
+Depends: gcc-12-base (= 12.2.0-14+deb12u1), libc6 (>= 2.35)
+Description: GCC support library
+Multi-Arch: same
+Homepage: http://gcc.gnu.org/
+Description-md5: bbd60d723e97d8e06c04228ee4c76f10
+Important: yes
+Protected: yes
+Tag: role::shared-lib
+Section: libs
+Priority: optional
+Filename: pool/main/g/gcc-12/libgcc-s1_12.2.0-14+deb12u1_amd64.deb
+Size: 49856
+MD5sum: 9db51e73a4a0547f1e67400bc2c11a86
+SHA256: 3016e62cb4b7cd8038822870601f5ed131befe942774d0f745622cc77d8a88f7
+
+Package: libc6
+Source: glibc
+Version: 2.36-9+deb12u13
+Installed-Size: 13000
+Maintainer: GNU Libc Maintainers <debian-glibc@lists.debian.org>
+Architecture: amd64
+Replaces: libc6-amd64
+Depends: libgcc-s1
+Recommends: libidn2-0 (>= 2.0.5~)
+Suggests: glibc-doc, debconf | debconf-2.0, libc-l10n, locales, libnss-nis, libnss-nisplus
+Breaks: aide (<< 0.17.3-4+b3), busybox (<< 1.30.1-6), chrony (<< 4.2-3~), fakechroot (<< 2.19-3.5), firefox (<< 91~), firefox-esr (<< 91~), gnumach-image-1.8-486 (<< 2:1.8+git20210923~), gnumach-image-1.8-486-dbg (<< 2:1.8+git20210923~), gnumach-image-1.8-xen-486 (<< 2:1.8+git20210923~), gnumach-image-1.8-xen-486-dbg (<< 2:1.8+git20210923~), hurd (<< 1:0.9.git20220301-2), ioquake3 (<< 1.36+u20200211.f2c61c1~dfsg-2~), iraf-fitsutil (<< 2018.07.06-4), libgegl-0.4-0 (<< 0.4.18), libtirpc1 (<< 0.2.3), locales (<< 2.36), locales-all (<< 2.36), macs (<< 2.2.7.1-3~), nocache (<< 1.1-1~), nscd (<< 2.36), openarena (<< 0.8.8+dfsg-4~), openssh-server (<< 1:8.1p1-5), python3-iptables (<< 1.0.0-2), r-cran-later (<< 0.7.5+dfsg-2), tinydns (<< 1:1.05-14), valgrind (<< 1:3.19.0-1~), wcc (<< 0.0.2+dfsg-3)
+Description: GNU C Library: Shared libraries
+Multi-Arch: same
+Homepage: https://www.gnu.org/software/libc/libc.html
+Description-md5: fc3001b0b90a1c8e6690b283a619d57f
+Tag: role::shared-lib
+Section: libs
+Priority: optional
+Filename: pool/main/g/glibc/libc6_2.36-9+deb12u13_amd64.deb
+Size: 2757632
+MD5sum: fc709ca0fa8b78562e2d071f2860d333
+SHA256: 3d8072c73b017e907bbf44b7db870687888a991961d74f1ecbba6b9458f32a2c
+
+Package: libselinux1
+Source: libselinux (3.4-1)
+Version: 3.4-1+b6
+Installed-Size: 199
+Maintainer: Debian SELinux maintainers <selinux-devel@lists.alioth.debian.org>
+Architecture: amd64
+Depends: libc6 (>= 2.34), libpcre2-8-0 (>= 10.22)
+Description: SELinux runtime shared libraries
+Multi-Arch: same
+Homepage: https://selinuxproject.org
+Description-md5: 90f6e1cb06c527bc3fc11ec6f969c59c
+Tag: role::shared-lib
+Section: libs
+Priority: optional
+Filename: pool/main/libs/libselinux/libselinux1_3.4-1+b6_amd64.deb
+Size: 73720
+MD5sum: 78f9188026cbf5e150859a45ec6a608f
+SHA256: 2b07f5287b9105f40158b56e4d70cc1652dac56a408f3507b4ab3d061eed425f
+
+Package: mawk
+Version: 1.3.4.20200120-3.1
+Installed-Size: 263
+Maintainer: Boyuan Yang <byang@debian.org>
+Architecture: amd64
+Provides: awk
+Depends: libc6 (>= 2.29)
+Description: Pattern scanning and text processing language
+Multi-Arch: foreign
+Homepage: https://invisible-island.net/mawk/
+Description-md5: 05965bfcd1a2333e963d9f1945d161fc
+Tag: devel::interpreter, implemented-in::c, interface::commandline,
+ role::program, scope::utility, use::filtering, use::scanning,
+ works-with::text
+Section: interpreters
+Priority: required
+Filename: pool/main/m/mawk/mawk_1.3.4.20200120-3.1_amd64.deb
+Size: 119144
+MD5sum: 31b4bf928cdc04e445b5f61ba621ac74
+SHA256: bcbc83f391854ea9d50ce2a4101aacf330de3b8b71d81a798faadba14a157f78
+
+Package: libpcre2-8-0
+Source: pcre2
+Version: 10.42-1
+Installed-Size: 685
+Maintainer: Matthew Vernon <matthew@debian.org>
+Architecture: amd64
+Depends: libc6 (>= 2.34)
+Description: New Perl Compatible Regular Expression Library- 8 bit runtime files
+Multi-Arch: same
+Homepage: https://pcre.org/
+Description-md5: c7a3d45ed09bfb032aada6998b70c4e1
+Tag: role::shared-lib
+Section: libs
+Priority: optional
+Filename: pool/main/p/pcre2/libpcre2-8-0_10.42-1_amd64.deb
+Size: 260776
+MD5sum: 2164cb282e379d053789306c07ce9828
+SHA256: 030db54f4d76cdfe2bf0e8eb5f9efea0233ab3c7aa942d672c7b63b52dbaf935
+
+Package: zlib1g
+Source: zlib
+Version: 1:1.2.13.dfsg-1
+Installed-Size: 168
+Maintainer: Mark Brown <broonie@debian.org>
+Architecture: amd64
+Provides: libz1
+Depends: libc6 (>= 2.14)
+Conflicts: zlib1 (<= 1:1.0.4-7)
+Breaks: libxml2 (<< 2.7.6.dfsg-2), texlive-binaries (<< 2009-12)
+Description: compression library - runtime
+Multi-Arch: same
+Homepage: http://zlib.net/
+Description-md5: 567f396aeeb2b2b63295099aed237057
+Tag: role::shared-lib
+Section: libs
+Priority: optional
+Filename: pool/main/z/zlib/zlib1g_1.2.13.dfsg-1_amd64.deb
+Size: 86684
+MD5sum: ec42cc09e926444a817ddd913057af67
+SHA256: d7dd1d1411fedf27f5e27650a6eff20ef294077b568f4c8c5e51466dc7c08ce4
+

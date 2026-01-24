@@ -1,0 +1,14 @@
+[image]
+name = "node"
+architecture = "arm64"
+
+[repositories.debian]
+url = "https://deb.debian.org/debian"
+distribution = "bookworm"
+components = ["main"]
+
+[[packages]]
+name = "nodejs"
+
+[entrypoint]
+cmd = ["node"]
