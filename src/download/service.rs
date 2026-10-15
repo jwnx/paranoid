@@ -8,71 +8,30 @@ use indexmap::IndexMap;
 use crate::config::RepositoryConfig;
 use crate::http::Client;
 use crate::lock::{LockFile, LockedPackage};
+use crate::report::{Event, Phase, Reporter};
 
 use super::cache::PackageCache;
-use super::error::{DownloadError, DownloadFailure, DownloadResult, DownloadedPackage};
-use super::progress::DownloadProgress;
+use super::error::{DownloadError, DownloadFailures, Fetched};
 
-/// Configuration for the download service.
-///
-/// Use the builder methods for ergonomic construction:
-/// ```
-/// use std::num::NonZeroUsize;
-/// use paranoid::download::DownloadConfig;
-///
-/// let config = DownloadConfig::new()
-///     .with_max_concurrent(NonZeroUsize::new(8).unwrap())
-///     .with_force_download(true);
-/// ```
+/// Download options.
 #[derive(Debug, Clone)]
 pub struct DownloadConfig {
     /// Maximum number of concurrent downloads.
-    max_concurrent: NonZeroUsize,
-    /// Force re-download even if cached.
-    force_download: bool,
-}
-
-impl DownloadConfig {
-    /// Create a new configuration with default values.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Set the maximum number of concurrent downloads.
-    pub fn with_max_concurrent(mut self, n: NonZeroUsize) -> Self {
-        self.max_concurrent = n;
-        self
-    }
-
-    /// Set whether to force re-download even if cached.
-    pub fn with_force_download(mut self, force: bool) -> Self {
-        self.force_download = force;
-        self
-    }
-
-    /// Get the maximum number of concurrent downloads.
-    #[must_use]
-    pub fn max_concurrent(&self) -> NonZeroUsize {
-        self.max_concurrent
-    }
-
-    /// Get whether to force re-download even if cached.
-    #[must_use]
-    pub fn force_download(&self) -> bool {
-        self.force_download
-    }
+    pub jobs: NonZeroUsize,
+    /// Re-download even when a package is cached.
+    pub force: bool,
 }
 
 impl Default for DownloadConfig {
     fn default() -> Self {
         Self {
-            max_concurrent: NonZeroUsize::new(4).unwrap(),
-            force_download: false,
+            jobs: NonZeroUsize::new(4).unwrap(),
+            force: false,
         }
     }
 }
 
-/// Service for downloading packages in parallel.
+/// Downloads packages into a [`PackageCache`].
 pub struct DownloadService {
     client: Client,
     cache: PackageCache,
@@ -80,135 +39,99 @@ pub struct DownloadService {
 }
 
 impl DownloadService {
-    /// Create a new download service with default configuration.
-    pub fn new() -> Result<Self, DownloadError> {
-        Self::with_config(DownloadConfig::default())
+    /// Create a download service using the default cache directory.
+    pub fn new(config: DownloadConfig) -> Result<Self, DownloadError> {
+        Self::with_cache(PackageCache::new()?, config)
     }
 
-    /// Create a new download service with custom configuration.
-    pub fn with_config(config: DownloadConfig) -> Result<Self, DownloadError> {
-        let client = Client::new()?;
-        let cache = PackageCache::new()?;
-        Ok(Self {
-            client,
-            cache,
-            config,
-        })
-    }
-
-    /// Create a new download service with custom cache directory.
+    /// Create a download service with a specific cache.
     pub fn with_cache(cache: PackageCache, config: DownloadConfig) -> Result<Self, DownloadError> {
-        let client = Client::new()?;
         Ok(Self {
-            client,
+            client: Client::new()?,
             cache,
             config,
         })
     }
 
-    /// Download all packages from a lock file.
+    /// Make every package in the lock available in the cache.
     ///
-    /// Uses bounded parallelism and reports progress via the provided reporter.
-    #[must_use = "download results should be checked for failures"]
-    pub async fn download_all<P: DownloadProgress>(
+    /// Results come back in lock order. All packages are attempted; if any
+    /// fail, every failure is returned together.
+    pub async fn download_all<'a>(
         &self,
-        lock_file: &LockFile,
+        lock_file: &'a LockFile,
         repositories: &IndexMap<String, RepositoryConfig>,
-        progress: &P,
-    ) -> DownloadResult {
-        let total_bytes: u64 = lock_file.packages.iter().map(|p| p.size).sum();
-        progress.on_start(lock_file.packages.len(), total_bytes);
-
-        // Create download tasks
-        let download_futures = lock_file.packages.iter().map(|package| {
-            let repo_config = repositories.get(&package.repository);
-            self.download_package(package, repo_config, progress)
+        reporter: &dyn Reporter,
+    ) -> Result<Vec<Fetched<'a>>, DownloadFailures> {
+        let total_bytes = lock_file.packages.iter().map(|p| p.size).sum();
+        reporter.report(Event::Begin {
+            phase: Phase::Download,
+            total: total_bytes,
         });
 
-        // Execute with bounded concurrency
-        let results: Vec<Result<DownloadedPackage, DownloadFailure>> =
-            stream::iter(download_futures)
-                .buffer_unordered(self.config.max_concurrent().get())
-                .collect()
+        let downloads = lock_file.packages.iter().map(|package| async move {
+            let result = self
+                .download(package, repositories.get(&package.repository))
                 .await;
-
-        // Partition results
-        let mut download_result = DownloadResult::new();
-        for result in results {
-            match result {
-                Ok(pkg) => download_result.succeeded.push(pkg),
-                Err(failure) => download_result.failed.push(failure),
+            match &result {
+                Ok(_) => reporter.report(Event::Advance {
+                    phase: Phase::Download,
+                    units: package.size,
+                    item: &package.name,
+                }),
+                Err(error) => reporter.report(Event::Failed {
+                    phase: Phase::Download,
+                    item: &package.name,
+                    error,
+                }),
             }
-        }
+            result.map_err(|error| (package.name.clone(), error))
+        });
 
-        progress.on_complete(
-            download_result.succeeded.len(),
-            download_result.failed.len(),
-        );
-        download_result
+        let results: Vec<_> = stream::iter(downloads)
+            .buffered(self.config.jobs.get())
+            .collect()
+            .await;
+
+        reporter.report(Event::End {
+            phase: Phase::Download,
+            summary: total_bytes,
+        });
+
+        let (fetched, failures): (Vec<_>, Vec<_>) = results.into_iter().partition(Result::is_ok);
+        if failures.is_empty() {
+            Ok(fetched.into_iter().map(Result::unwrap).collect())
+        } else {
+            Err(DownloadFailures(
+                failures.into_iter().map(Result::unwrap_err).collect(),
+            ))
+        }
     }
 
-    /// Download a single package.
-    async fn download_package<P: DownloadProgress>(
+    /// Make one package available in the cache.
+    async fn download<'a>(
         &self,
-        package: &LockedPackage,
+        package: &'a LockedPackage,
         repo_config: Option<&RepositoryConfig>,
-        progress: &P,
-    ) -> Result<DownloadedPackage, DownloadFailure> {
-        progress.on_package_start(package);
-
-        let result = self.download_package_inner(package, repo_config).await;
-
-        match &result {
-            Ok(downloaded) => {
-                progress.on_package_complete(package, downloaded.from_cache);
-            }
-            Err(error) => {
-                progress.on_package_error(package, error);
-            }
-        }
-
-        result.map_err(|error| DownloadFailure {
-            name: package.name.clone(),
-            version: package.version.clone(),
-            error,
-        })
-    }
-
-    /// Inner download logic without progress reporting.
-    async fn download_package_inner(
-        &self,
-        package: &LockedPackage,
-        repo_config: Option<&RepositoryConfig>,
-    ) -> Result<DownloadedPackage, DownloadError> {
-        // Check cache first (unless force_download is set)
-        if !self.config.force_download()
-            && let Some(cached_path) = self.cache.get(package)
+    ) -> Result<Fetched<'a>, DownloadError> {
+        if !self.config.force
+            && let Some(path) = self.cache.get(package)
         {
-            return Ok(DownloadedPackage {
-                name: package.name.clone(),
-                version: package.version.clone(),
-                path: cached_path,
+            return Ok(Fetched {
+                package,
+                path,
                 from_cache: true,
             });
         }
 
-        // Get repository config (required)
         let repo_config = repo_config
             .ok_or_else(|| DownloadError::UnknownRepository(package.repository.clone()))?;
-
-        // Build download URL
         let url = Self::build_download_url(package, repo_config);
-
-        // Download the package
         let data = self.client.fetch_bytes(&url).await?;
-
-        // Store in cache (which verifies checksum)
         let path = self.cache.store(package, &data)?;
 
-        Ok(DownloadedPackage {
-            name: package.name.clone(),
-            version: package.version.clone(),
+        Ok(Fetched {
+            package,
             path,
             from_cache: false,
         })
@@ -234,17 +157,8 @@ mod tests {
     #[test]
     fn test_download_config_default() {
         let config = DownloadConfig::default();
-        assert_eq!(config.max_concurrent().get(), 4);
-        assert!(!config.force_download());
-    }
-
-    #[test]
-    fn test_download_config_builder() {
-        let config = DownloadConfig::new()
-            .with_max_concurrent(NonZeroUsize::new(8).unwrap())
-            .with_force_download(true);
-        assert_eq!(config.max_concurrent().get(), 8);
-        assert!(config.force_download());
+        assert_eq!(config.jobs.get(), 4);
+        assert!(!config.force);
     }
 
     #[test]

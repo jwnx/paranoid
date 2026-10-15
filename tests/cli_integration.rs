@@ -479,37 +479,42 @@ fn e2e_lock_build_produces_valid_oci_tarball() {
     );
 }
 
-/// Verify that two builds from the same lock file produce bit-identical tarballs.
+/// Verify that two builds from the same lock file produce bit-identical
+/// tarballs, even from separate, empty caches.
 #[test]
 #[ignore]
 fn e2e_build_is_reproducible() {
     let tmp = TempDir::new().unwrap();
-    // Use the pre-generated lock to avoid network for the resolve step.
+    // Lock fresh: committed locks go stale as Debian rotates security updates
+    // off the mirrors.
     fs::copy(
         hello_world_dir().join("paranoid.toml"),
         tmp.path().join("paranoid.toml"),
     )
     .unwrap();
-    copy_hello_world_lock(tmp.path());
-
-    let tar1 = tmp.path().join("image1.tar");
-    let tar2 = tmp.path().join("image2.tar");
-
-    let out1 = paranoid_in(tmp.path(), &["build", "-o", tar1.to_str().unwrap()]);
+    let lock_out = paranoid_in(tmp.path(), &["lock"]);
     assert!(
-        out1.status.success(),
-        "first build failed: {}",
-        stderr(&out1)
+        lock_out.status.success(),
+        "lock failed: {}",
+        stderr(&lock_out)
     );
 
-    let out2 = paranoid_in(tmp.path(), &["build", "-o", tar2.to_str().unwrap()]);
-    assert!(
-        out2.status.success(),
-        "second build failed: {}",
-        stderr(&out2)
-    );
+    let build = |n: u32| {
+        let tar = tmp.path().join(format!("image{n}.tar"));
+        let cache = tmp.path().join(format!("cache{n}"));
+        let out = paranoid_in(
+            tmp.path(),
+            &[
+                "build",
+                "-o",
+                tar.to_str().unwrap(),
+                "--cache-dir",
+                cache.to_str().unwrap(),
+            ],
+        );
+        assert!(out.status.success(), "build {n} failed: {}", stderr(&out));
+        fs::read(&tar).unwrap()
+    };
 
-    let bytes1 = fs::read(&tar1).unwrap();
-    let bytes2 = fs::read(&tar2).unwrap();
-    assert_eq!(bytes1, bytes2, "builds must be bit-identical");
+    assert!(build(1) == build(2), "builds must be bit-identical");
 }

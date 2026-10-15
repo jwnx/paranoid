@@ -7,15 +7,7 @@
 //!   - 60-byte header
 //!   - File content (padded to even length)
 
-use std::fs::{self, File};
-use std::io::Write;
-use std::path::Path;
-use std::sync::Arc;
-
-use crate::extract::path::validate_path;
-
-use super::archive::{Archive, ArchiveEntry, ExtractOptions};
-use super::error::{EntryType, ExtractedFile, ExtractionError};
+use super::DebError;
 
 /// Magic bytes for ar archive.
 const AR_MAGIC: &[u8] = b"!<arch>\n";
@@ -35,19 +27,17 @@ pub struct ArMember {
     pub(crate) offset: usize,
 }
 
-#[derive(Clone)]
-pub struct ArArchive {
-    data: Arc<[u8]>,
+/// A parsed ar archive borrowing its bytes.
+pub struct ArArchive<'a> {
+    data: &'a [u8],
     members: Vec<ArMember>,
 }
 
-impl ArArchive {
-    pub fn new(data: impl Into<Arc<[u8]>>) -> Result<Self, ExtractionError> {
-        let data: Arc<[u8]> = data.into();
-
+impl<'a> ArArchive<'a> {
+    pub fn new(data: &'a [u8]) -> Result<Self, DebError> {
         // Check magic (8-byte "!<arch>\n" signature)
         if data.len() < AR_MAGIC.len() || &data[..AR_MAGIC.len()] != AR_MAGIC {
-            return Err(ExtractionError::InvalidArchive(
+            return Err(DebError::Invalid(
                 "not an ar archive (invalid magic)".to_string(),
             ));
         }
@@ -66,7 +56,7 @@ impl ArArchive {
 
             // Each member header ends with "`\n" (0x60 0x0a)
             if &header[58..60] != b"`\n" {
-                return Err(ExtractionError::InvalidArchive(
+                return Err(DebError::Invalid(
                     "invalid ar member header magic".to_string(),
                 ));
             }
@@ -75,16 +65,16 @@ impl ArArchive {
 
             // Convert size to usize with overflow check (matters on 32-bit platforms)
             let size_usize = usize::try_from(size).map_err(|_| {
-                ExtractionError::InvalidArchive("ar member size too large for platform".to_string())
+                DebError::Invalid("ar member size too large for platform".to_string())
             })?;
 
             // Verify we have enough data (with overflow check)
-            let content_end = content_offset.checked_add(size_usize).ok_or_else(|| {
-                ExtractionError::InvalidArchive("ar member offset overflow".to_string())
-            })?;
+            let content_end = content_offset
+                .checked_add(size_usize)
+                .ok_or_else(|| DebError::Invalid("ar member offset overflow".to_string()))?;
 
             if content_end > data.len() {
-                return Err(ExtractionError::InvalidArchive(
+                return Err(DebError::Invalid(
                     "ar member extends beyond archive".to_string(),
                 ));
             }
@@ -107,13 +97,12 @@ impl ArArchive {
     }
 
     // String slices are to be considered utf8, but still.
-    fn parse_utf8(bytes: &[u8]) -> Result<&str, ExtractionError> {
-        std::str::from_utf8(bytes).map_err(|_| {
-            ExtractionError::InvalidArchive("invalid UTF-8 in ar member name".to_string())
-        })
+    fn parse_utf8(bytes: &[u8]) -> Result<&str, DebError> {
+        std::str::from_utf8(bytes)
+            .map_err(|_| DebError::Invalid("invalid UTF-8 in ar member name".to_string()))
     }
 
-    fn parse_name(bytes: &[u8]) -> Result<String, ExtractionError> {
+    fn parse_name(bytes: &[u8]) -> Result<String, DebError> {
         let s = Self::parse_utf8(bytes)?;
 
         // Name is space-padded and may end with /
@@ -122,108 +111,42 @@ impl ArArchive {
         Ok(name.to_string())
     }
 
-    fn parse_octal(bytes: &[u8]) -> Result<u32, ExtractionError> {
+    fn parse_octal(bytes: &[u8]) -> Result<u32, DebError> {
         let s = Self::parse_utf8(bytes)?.trim();
 
         if s.is_empty() {
             return Ok(0);
         }
 
-        u32::from_str_radix(s, 8).map_err(|_| {
-            ExtractionError::InvalidArchive(format!("invalid octal in ar header: {}", s))
-        })
+        u32::from_str_radix(s, 8)
+            .map_err(|_| DebError::Invalid(format!("invalid octal in ar header: {}", s)))
     }
 
-    fn parse_decimal(bytes: &[u8]) -> Result<u64, ExtractionError> {
+    fn parse_decimal(bytes: &[u8]) -> Result<u64, DebError> {
         let s = Self::parse_utf8(bytes)?.trim();
 
         if s.is_empty() {
             return Ok(0);
         }
 
-        s.parse().map_err(|_| {
-            ExtractionError::InvalidArchive(format!("invalid decimal in ar header: {}", s))
-        })
+        s.parse()
+            .map_err(|_| DebError::Invalid(format!("invalid decimal in ar header: {}", s)))
     }
 
     pub fn members(&self) -> &[ArMember] {
         &self.members
     }
 
-    pub fn find_member<F>(&self, predicate: F) -> Option<(&ArMember, &[u8])>
-    where
-        F: Fn(&ArMember) -> bool,
-    {
-        self.members.iter().find(|m| predicate(m)).map(|m| {
-            let start = m.offset;
-            let end = start + m.size as usize;
-            (m, &self.data[start..end])
-        })
-    }
-}
-
-impl Archive for ArArchive {
-    fn entries(&self) -> Result<Vec<ArchiveEntry>, ExtractionError> {
-        Ok(self
-            .members
-            .iter()
-            .map(|m| ArchiveEntry {
-                path: m.name.clone().into(),
-                entry_type: EntryType::Regular,
-                size: m.size,
-                mode: m.mode,
-            })
-            .collect())
-    }
-
-    fn extract_to(
+    /// Find a member by name and return it with its contents.
+    pub fn find_member(
         &self,
-        dest: &Path,
-        options: &ExtractOptions,
-    ) -> Result<Vec<ExtractedFile>, ExtractionError> {
-        fs::create_dir_all(dest).map_err(|e| ExtractionError::CreateDirectory {
-            path: dest.to_path_buf(),
-            source: e,
-        })?;
-        let mut extracted = Vec::new();
-
-        for member in &self.members {
-            let full_path = validate_path(Path::new(&member.name), dest)?;
-
-            // Check overwrite
-            if full_path.exists() && !options.overwrite {
-                continue;
-            }
-
-            // Get content
-            let content = &self.data[member.offset..member.offset + member.size as usize];
-
-            // Write file
-            let mut file = File::create(&full_path).map_err(|e| ExtractionError::WriteFile {
-                path: full_path.clone(),
-                source: e,
-            })?;
-            file.write_all(content)
-                .map_err(|e| ExtractionError::WriteFile {
-                    path: full_path.clone(),
-                    source: e,
-                })?;
-
-            #[cfg(unix)]
-            if options.preserve_permissions {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&full_path, fs::Permissions::from_mode(member.mode))?;
-            }
-
-            extracted.push(ExtractedFile {
-                path: full_path,
-                entry_type: EntryType::Regular,
-                mode: member.mode,
-                size: member.size,
-            });
-        }
-
-        Ok(extracted)
+        predicate: impl Fn(&ArMember) -> bool,
+    ) -> Option<(&ArMember, &'a [u8])> {
+        self.members.iter().find(|m| predicate(m)).map(|m| {
+            // In bounds: `new` checked every member against the data length.
+            let end = m.offset + m.size as usize;
+            (m, &self.data[m.offset..end])
+        })
     }
 }
 
@@ -258,7 +181,7 @@ mod tests {
     #[test]
     fn test_parse_ar() {
         let data = make_test_archive();
-        let ar = ArArchive::new(data).unwrap();
+        let ar = ArArchive::new(&data).unwrap();
         assert_eq!(ar.members().len(), 1);
         assert_eq!(ar.members()[0].name, "test.txt");
         assert_eq!(ar.members()[0].size, 5);
@@ -267,7 +190,7 @@ mod tests {
     #[test]
     fn test_find_member() {
         let data = make_test_archive();
-        let ar = ArArchive::new(data).unwrap();
+        let ar = ArArchive::new(&data).unwrap();
         let (member, content) = ar.find_member(|m| m.name == "test.txt").unwrap();
         assert_eq!(member.name, "test.txt");
         assert_eq!(content, b"hello");
@@ -276,6 +199,6 @@ mod tests {
     #[test]
     fn test_invalid_magic() {
         let data = b"not an ar archive".to_vec();
-        assert!(ArArchive::new(data).is_err());
+        assert!(ArArchive::new(&data).is_err());
     }
 }

@@ -1,19 +1,16 @@
-//! OCI image generation service.
-//!
-//! Provides a high-level API for generating OCI container images.
+//! OCI image configuration and generation.
 
-use std::fs::{self, File};
-use std::io::Write;
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use crate::arch::Architecture;
 use crate::config::Manifest;
+use crate::report::{Event, Phase, Reporter};
+use crate::rootfs::Rootfs;
 
-use super::blob::BlobStore;
 use super::digest::Digest;
 use super::error::{OciError, OciImageResult};
 use super::layer::{Compression, Layer};
-use super::progress::OciProgress;
 use super::spec::{
     ContainerConfig, Descriptor, History, ImageConfig, ImageIndex, ImageManifest, MediaType,
     OciLayout,
@@ -287,16 +284,6 @@ impl OciConfig {
 
         Ok(config)
     }
-
-    /// Get the image name, if set.
-    pub fn get_image_name(&self) -> Option<&ImageName> {
-        self.image_name.as_ref()
-    }
-
-    /// Get the image tag.
-    pub fn get_image_tag(&self) -> &ImageTag {
-        &self.image_tag
-    }
 }
 
 impl Default for OciConfig {
@@ -317,356 +304,245 @@ impl Default for OciConfig {
     }
 }
 
-pub struct OciImageService {
-    config: OciConfig,
+/// Where to write an image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageOutput {
+    /// An OCI image layout directory.
+    Layout(PathBuf),
+    /// A tarball of the layout, loadable with `podman load` / `docker load`.
+    Tarball(PathBuf),
 }
 
-impl OciImageService {
-    pub fn new() -> Self {
-        Self::with_config(OciConfig::default())
-    }
-
-    pub fn with_config(config: OciConfig) -> Self {
-        Self { config }
-    }
-
-    /// Generate an OCI image directory layout.
-    ///
-    /// Creates the standard OCI image layout:
-    /// ```text
-    /// output_dir/
-    /// ├── blobs/sha256/
-    /// │   ├── {config-hash}
-    /// │   ├── {manifest-hash}
-    /// │   └── {layer-hash}
-    /// ├── oci-layout
-    /// └── index.json
-    /// ```
-    pub fn generate<P: OciProgress>(
-        &self,
-        source_dir: &Path,
-        output_dir: &Path,
-        progress: &P,
-    ) -> Result<OciImageResult, OciError> {
-        progress.on_start();
-
-        fs::create_dir_all(output_dir).map_err(|e| OciError::CreateOutputDir {
-            path: output_dir.to_path_buf(),
-            source: e,
-        })?;
-
-        let store = BlobStore::new(output_dir)?;
-
-        progress.on_layer_start();
-
-        let layer = Layer::from_directory(source_dir, self.config.compression)?;
-
-        progress.on_layer_complete(layer.size());
-        progress.on_config_start();
-
-        let image_config = self.build_image_config(layer.diff_id());
-        let config_json = serde_json::to_vec_pretty(&image_config)?;
-        let (config_digest, config_size) = store.write(&config_json)?;
-
-        progress.on_config_complete();
-        progress.on_manifest_start();
-
-        let manifest = self.build_manifest(&config_digest, config_size, &layer);
-        let manifest_json = serde_json::to_vec_pretty(&manifest)?;
-        let (manifest_digest, manifest_size) = store.write(&manifest_json)?;
-
-        progress.on_manifest_complete();
-        progress.on_writing_blobs();
-
-        store.write_with_digest(layer.data(), layer.digest())?;
-
-        // Write oci-layout
-        let layout = OciLayout;
-        let layout_json = serde_json::to_vec(&layout)?;
-        let layout_path = output_dir.join("oci-layout");
-        write_file(&layout_path, &layout_json)?;
-
-        // Write index.json
-        let index = self.build_index(&manifest_digest, manifest_size);
-        let index_json = serde_json::to_vec_pretty(&index)?;
-        let index_path = output_dir.join("index.json");
-        write_file(&index_path, &index_json)?;
-
-        let total_size = layer.size() + config_size + manifest_size;
-
-        progress.on_complete(manifest_digest.as_str(), total_size);
-
-        Ok(OciImageResult {
-            path: output_dir.to_path_buf(),
-            manifest_digest,
-            config_digest,
-            layer_digest: layer.digest().clone(),
-            total_size,
-        })
-    }
-
-    /// Generate an OCI image as a tarball.
-    ///
-    /// Creates a tar archive containing the OCI layout that can be loaded
-    /// with `podman load -i` or `docker load -i`.
-    pub fn generate_tarball<P: OciProgress>(
-        &self,
-        source_dir: &Path,
-        output_path: &Path,
-        progress: &P,
-    ) -> Result<OciImageResult, OciError> {
-        progress.on_start();
-
-        let temp_dir = tempfile::tempdir().map_err(|source| OciError::CreateTempDir { source })?;
-        let oci_dir = temp_dir.path();
-
-        let inner_progress = SkipStartProgress(progress);
-        let result = self.generate(source_dir, oci_dir, &inner_progress)?;
-
-        progress.on_creating_tarball();
-
-        let tar_file = File::create(output_path).map_err(|e| OciError::WriteFile {
-            path: output_path.to_path_buf(),
-            source: e,
-        })?;
-
-        let mut tar_builder = tar::Builder::new(tar_file);
-        add_dir_to_tar(&mut tar_builder, oci_dir, "")?;
-        tar_builder
-            .finish()
-            .map_err(|e| OciError::LayerCreation(format!("failed to finish tarball: {}", e)))?;
-
-        let total_size = fs::metadata(output_path)
-            .map(|m| m.len())
-            .unwrap_or(result.total_size);
-
-        progress.on_complete(result.manifest_digest.as_str(), total_size);
-
-        Ok(OciImageResult {
-            path: output_path.to_path_buf(),
-            manifest_digest: result.manifest_digest,
-            config_digest: result.config_digest,
-            layer_digest: result.layer_digest,
-            total_size,
-        })
-    }
-
-    fn build_image_config(&self, diff_id: &Digest) -> ImageConfig {
-        let mut config = ImageConfig::new(self.config.architecture, vec![diff_id.clone()]);
-
-        config.created.clone_from(&self.config.created);
-
-        if self.config.entrypoint.is_some()
-            || self.config.cmd.is_some()
-            || self.config.env.is_some()
-            || self.config.workdir.is_some()
-            || self.config.labels.is_some()
-            || self.config.user.is_some()
-        {
-            let mut container_config = ContainerConfig::default();
-
-            container_config
-                .entrypoint
-                .clone_from(&self.config.entrypoint);
-
-            container_config.cmd.clone_from(&self.config.cmd);
-            container_config.env.clone_from(&self.config.env);
-            container_config
-                .working_dir
-                .clone_from(&self.config.workdir);
-            container_config.user.clone_from(&self.config.user);
-
-            if let Some(ref labels) = self.config.labels {
-                let label_map = labels.iter().cloned().collect();
-                container_config.labels = Some(label_map);
-            }
-
-            config.config = Some(container_config);
+impl ImageOutput {
+    /// A path ending in `.tar` means a tarball; anything else a layout.
+    pub fn from_path(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        if path.extension().is_some_and(|e| e == "tar") {
+            Self::Tarball(path)
+        } else {
+            Self::Layout(path)
         }
-
-        let history = History {
-            created: self.config.created.clone(),
-            created_by: Some("paranoid".to_string()),
-            ..Default::default()
-        };
-
-        config.history = Some(vec![history]);
-
-        config
     }
 
-    fn build_manifest(
-        &self,
-        config_digest: &Digest,
-        config_size: u64,
-        layer: &Layer,
-    ) -> ImageManifest {
-        let config_desc =
-            Descriptor::new(MediaType::ImageConfig, config_digest.clone(), config_size);
-        let layer_desc = Descriptor::new(layer.media_type(), layer.digest().clone(), layer.size());
-        ImageManifest::new(config_desc, vec![layer_desc])
-    }
-
-    fn build_index(&self, manifest_digest: &Digest, manifest_size: u64) -> ImageIndex {
-        let mut manifest_desc = Descriptor::new(
-            MediaType::ImageManifest,
-            manifest_digest.clone(),
-            manifest_size,
-        );
-
-        let ref_name = match &self.config.image_name {
-            Some(name) => format!("{}:{}", name.as_str(), self.config.image_tag.as_str()),
-            None => self.config.image_tag.as_str().to_string(),
-        };
-
-        manifest_desc =
-            manifest_desc.with_annotation("org.opencontainers.image.ref.name", ref_name);
-
-        ImageIndex::new(vec![manifest_desc])
-    }
-
-    pub fn config(&self) -> &OciConfig {
-        &self.config
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Layout(path) | Self::Tarball(path) => path,
+        }
     }
 }
 
-impl Default for OciImageService {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+/// Steps reported for [`Phase::Image`].
+const IMAGE_STEPS: u64 = 3;
 
-fn write_file(path: &Path, data: &[u8]) -> Result<(), OciError> {
-    fs::write(path, data).map_err(|e| OciError::WriteFile {
-        path: path.to_path_buf(),
-        source: e,
+/// Build a single-layer image from `rootfs` and write it to `output`.
+///
+/// The image is assembled in memory as a sorted list of files (blobs,
+/// `oci-layout`, `index.json`) and then written out, so a layout directory
+/// and a tarball always hold byte-identical content.
+pub fn write_image(
+    config: &OciConfig,
+    rootfs: &Rootfs,
+    output: &ImageOutput,
+    reporter: &dyn Reporter,
+) -> Result<OciImageResult, OciError> {
+    let step = |item| {
+        reporter.report(Event::Advance {
+            phase: Phase::Image,
+            units: 1,
+            item,
+        })
+    };
+    reporter.report(Event::Begin {
+        phase: Phase::Image,
+        total: IMAGE_STEPS,
+    });
+
+    let layer = Layer::from_rootfs(rootfs, config.compression)?;
+    step("layer");
+
+    let image_config = serde_json::to_vec_pretty(&config.image_config(layer.diff_id()))?;
+    let config_digest = Digest::from_bytes(&image_config);
+    let manifest = serde_json::to_vec_pretty(&ImageManifest::new(
+        Descriptor::new(
+            MediaType::ImageConfig,
+            config_digest.clone(),
+            image_config.len() as u64,
+        ),
+        vec![Descriptor::new(
+            layer.media_type(),
+            layer.digest().clone(),
+            layer.size(),
+        )],
+    ))?;
+    let manifest_digest = Digest::from_bytes(&manifest);
+    let index = serde_json::to_vec_pretty(&config.image_index(&manifest_digest, manifest.len()))?;
+    step("manifest");
+
+    let total_size = layer.size() + image_config.len() as u64 + manifest.len() as u64;
+    let layer_digest = layer.digest().clone();
+    let blob = |digest: &Digest| format!("blobs/sha256/{}", digest.hash());
+    let mut files: Vec<(String, Vec<u8>)> = vec![
+        (blob(&layer_digest), layer.into_data()),
+        (blob(&config_digest), image_config),
+        (blob(&manifest_digest), manifest),
+        ("oci-layout".to_string(), serde_json::to_vec(&OciLayout)?),
+        ("index.json".to_string(), index),
+    ];
+    files.sort();
+
+    match output {
+        ImageOutput::Layout(dir) => write_layout(dir, &files)?,
+        ImageOutput::Tarball(path) => write_tarball(path, &files)?,
+    }
+    step("write");
+
+    reporter.report(Event::End {
+        phase: Phase::Image,
+        summary: total_size,
+    });
+
+    Ok(OciImageResult {
+        path: output.path().to_path_buf(),
+        reference: config.reference(),
+        manifest_digest,
+        config_digest,
+        layer_digest,
+        total_size,
     })
 }
 
-fn add_dir_to_tar<W: Write>(
-    builder: &mut tar::Builder<W>,
-    dir: &Path,
-    prefix: &str,
-) -> Result<(), OciError> {
-    for entry in fs::read_dir(dir).map_err(|e| OciError::ReadSourceDir {
-        path: dir.to_path_buf(),
-        source: e,
-    })? {
-        let entry = entry.map_err(|e| OciError::ReadSourceDir {
-            path: dir.to_path_buf(),
-            source: e,
-        })?;
+impl OciConfig {
+    /// The image config document for a single layer.
+    fn image_config(&self, diff_id: &Digest) -> ImageConfig {
+        let mut image = ImageConfig::new(self.architecture, vec![diff_id.clone()]);
+        image.created.clone_from(&self.created);
 
-        let path = entry.path();
-        let name = entry.file_name();
-        let tar_path = if prefix.is_empty() {
-            name.to_string_lossy().into_owned()
-        } else {
-            format!("{}/{}", prefix, name.to_string_lossy())
+        let container = ContainerConfig {
+            entrypoint: self.entrypoint.clone(),
+            cmd: self.cmd.clone(),
+            env: self.env.clone(),
+            working_dir: self.workdir.clone(),
+            user: self.user.clone(),
+            labels: self
+                .labels
+                .as_ref()
+                .map(|labels| labels.iter().cloned().collect()),
+            ..ContainerConfig::default()
         };
-
-        let metadata = fs::metadata(&path).map_err(|e| OciError::ReadSourceDir {
-            path: path.clone(),
-            source: e,
-        })?;
-
-        if metadata.is_dir() {
-            builder
-                .append_dir(&tar_path, &path)
-                .map_err(|e| OciError::LayerCreation(format!("failed to add directory: {}", e)))?;
-            add_dir_to_tar(builder, &path, &tar_path)?;
-        } else {
-            let mut file = File::open(&path).map_err(|e| OciError::ReadSourceDir {
-                path: path.clone(),
-                source: e,
-            })?;
-            builder
-                .append_file(&tar_path, &mut file)
-                .map_err(|e| OciError::LayerCreation(format!("failed to add file: {}", e)))?;
+        if container != ContainerConfig::default() {
+            image.config = Some(container);
         }
+
+        image.history = Some(vec![History {
+            created: self.created.clone(),
+            created_by: Some("paranoid".to_string()),
+            ..History::default()
+        }]);
+        image
     }
 
+    /// The index pointing at the manifest, annotated with the image reference.
+    fn image_index(&self, manifest_digest: &Digest, manifest_size: usize) -> ImageIndex {
+        let manifest = Descriptor::new(
+            MediaType::ImageManifest,
+            manifest_digest.clone(),
+            manifest_size as u64,
+        )
+        .with_annotation("org.opencontainers.image.ref.name", self.reference());
+        ImageIndex::new(vec![manifest])
+    }
+
+    /// `name:tag`, or just the tag when the image has no name.
+    pub fn reference(&self) -> String {
+        match &self.image_name {
+            Some(name) => format!("{}:{}", name.as_str(), self.image_tag.as_str()),
+            None => self.image_tag.as_str().to_string(),
+        }
+    }
+}
+
+fn write_layout(dir: &Path, files: &[(String, Vec<u8>)]) -> Result<(), OciError> {
+    for (name, data) in files {
+        let path = dir.join(name);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|source| OciError::CreateOutputDir {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        fs::write(&path, data).map_err(|source| OciError::WriteFile { path, source })?;
+    }
     Ok(())
 }
 
-struct SkipStartProgress<'a, P: OciProgress>(&'a P);
+/// Write the layout as a tarball with fixed metadata, through a temp file
+/// in the same directory so a failed write never leaves a partial image.
+fn write_tarball(path: &Path, files: &[(String, Vec<u8>)]) -> Result<(), OciError> {
+    let write_err = |source| OciError::WriteFile {
+        path: path.to_path_buf(),
+        source,
+    };
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
 
-impl<P: OciProgress> OciProgress for SkipStartProgress<'_, P> {
-    fn on_start(&self) {}
+    let temp = tempfile::NamedTempFile::new_in(dir).map_err(write_err)?;
+    let mut builder = tar::Builder::new(temp);
 
-    fn on_layer_start(&self) {
-        self.0.on_layer_start();
+    let header = |kind, mode, size| {
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(kind);
+        h.set_mode(mode);
+        h.set_size(size);
+        h.set_mtime(0);
+        h.set_uid(0);
+        h.set_gid(0);
+        h
+    };
+    for dir in ["blobs/", "blobs/sha256/"] {
+        builder
+            .append_data(
+                &mut header(tar::EntryType::Directory, 0o755, 0),
+                dir,
+                std::io::empty(),
+            )
+            .map_err(write_err)?;
+    }
+    for (name, data) in files {
+        let mut h = header(tar::EntryType::Regular, 0o644, data.len() as u64);
+        builder
+            .append_data(&mut h, name, data.as_slice())
+            .map_err(write_err)?;
     }
 
-    fn on_layer_complete(&self, size: u64) {
-        self.0.on_layer_complete(size);
-    }
-
-    fn on_config_start(&self) {
-        self.0.on_config_start();
-    }
-
-    fn on_config_complete(&self) {
-        self.0.on_config_complete();
-    }
-
-    fn on_manifest_start(&self) {
-        self.0.on_manifest_start();
-    }
-
-    fn on_manifest_complete(&self) {
-        self.0.on_manifest_complete();
-    }
-
-    fn on_writing_blobs(&self) {
-        self.0.on_writing_blobs();
-    }
-
-    fn on_creating_tarball(&self) {
-        self.0.on_creating_tarball();
-    }
-
-    fn on_complete(&self, _digest: &str, _total_size: u64) {}
-
-    fn on_error(&self, error: &str) {
-        self.0.on_error(error);
-    }
+    let temp = builder.into_inner().map_err(write_err)?;
+    temp.persist(path).map_err(|e| write_err(e.error))?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::File;
-    use std::io::Write;
     use tempfile::TempDir;
 
-    use crate::oci::progress::NoProgress;
+    use crate::report::test_utils::Recorder;
 
-    fn create_test_rootfs() -> TempDir {
-        let dir = TempDir::new().unwrap();
-
-        fs::create_dir_all(dir.path().join("bin")).unwrap();
-        fs::create_dir_all(dir.path().join("etc")).unwrap();
-
-        let mut script = File::create(dir.path().join("bin/hello")).unwrap();
-        script.write_all(b"#!/bin/sh\necho hello\n").unwrap();
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(dir.path().join("bin/hello"))
-                .unwrap()
-                .permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(dir.path().join("bin/hello"), perms).unwrap();
-        }
-
-        File::create(dir.path().join("etc/hostname"))
-            .unwrap()
-            .write_all(b"test-container\n")
+    fn test_rootfs() -> Rootfs {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_mode(0o755);
+        h.set_uid(0);
+        h.set_gid(0);
+        h.set_size(21);
+        builder
+            .append_data(&mut h, "./bin/hello", &b"#!/bin/sh\necho hello\n"[..])
             .unwrap();
-
-        dir
+        let mut fs = Rootfs::new();
+        fs.apply_tar(builder.into_inner().unwrap().as_slice())
+            .unwrap();
+        fs
     }
 
     #[test]
@@ -760,152 +636,108 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_oci_directory() {
-        let rootfs = create_test_rootfs();
-        let output = TempDir::new().unwrap();
-
-        let config = OciConfig::new()
-            .architecture(Architecture::Amd64)
-            .try_image_name("test")
-            .unwrap();
-
-        let service = OciImageService::with_config(config);
-        let result = service
-            .generate(rootfs.path(), output.path(), &NoProgress)
-            .unwrap();
-
-        assert!(output.path().join("oci-layout").exists());
-        assert!(output.path().join("index.json").exists());
-        assert!(output.path().join("blobs/sha256").exists());
-
-        assert!(result.manifest_digest.as_str().starts_with("sha256:"));
-        assert!(result.config_digest.as_str().starts_with("sha256:"));
-        assert!(result.layer_digest.as_str().starts_with("sha256:"));
-        assert!(result.total_size > 0);
-
-        let layout_json = fs::read(output.path().join("oci-layout")).unwrap();
-        let _layout: OciLayout = serde_json::from_slice(&layout_json).unwrap();
-        assert!(String::from_utf8_lossy(&layout_json).contains("1.0.0"));
-
-        let index_json = fs::read(output.path().join("index.json")).unwrap();
-        let index: ImageIndex = serde_json::from_slice(&index_json).unwrap();
-        assert!(String::from_utf8_lossy(&index_json).contains("\"schemaVersion\": 2"));
-        assert_eq!(index.manifests.len(), 1);
+    fn test_image_output_from_path() {
+        assert!(matches!(
+            ImageOutput::from_path("image.tar"),
+            ImageOutput::Tarball(_)
+        ));
+        assert!(matches!(
+            ImageOutput::from_path("out/image"),
+            ImageOutput::Layout(_)
+        ));
     }
 
     #[test]
-    fn test_generate_tarball() {
-        let rootfs = create_test_rootfs();
+    fn test_write_layout() {
         let output = TempDir::new().unwrap();
-        let tarball_path = output.path().join("image.tar");
+        let config = OciConfig::new().try_image_name("test").unwrap();
+        let recorder = Recorder::default();
 
-        let config = OciConfig::new()
-            .architecture(Architecture::Amd64)
-            .try_image_name("test")
-            .unwrap();
+        let result = write_image(
+            &config,
+            &test_rootfs(),
+            &ImageOutput::Layout(output.path().to_path_buf()),
+            &recorder,
+        )
+        .unwrap();
 
-        let service = OciImageService::with_config(config);
-        let result = service
-            .generate_tarball(rootfs.path(), &tarball_path, &NoProgress)
-            .unwrap();
+        assert_eq!(result.reference, "test:latest");
+        for digest in [
+            &result.manifest_digest,
+            &result.config_digest,
+            &result.layer_digest,
+        ] {
+            assert!(
+                output
+                    .path()
+                    .join("blobs/sha256")
+                    .join(digest.hash())
+                    .exists()
+            );
+        }
+        let layout = fs::read(output.path().join("oci-layout")).unwrap();
+        let _: OciLayout = serde_json::from_slice(&layout).unwrap();
+        let index: ImageIndex =
+            serde_json::from_slice(&fs::read(output.path().join("index.json")).unwrap()).unwrap();
+        assert_eq!(index.manifests.len(), 1);
+        assert_eq!(index.manifests[0].digest, result.manifest_digest);
 
-        assert!(tarball_path.exists());
-        assert!(result.path == tarball_path);
-        assert!(result.total_size > 0);
+        let events = recorder.0.into_inner().unwrap();
+        assert_eq!(events.first().unwrap(), "begin Image 3");
+        assert!(events.last().unwrap().starts_with("end Image"));
+    }
 
-        let tar_file = File::open(&tarball_path).unwrap();
-        let mut archive = tar::Archive::new(tar_file);
-        let entries: Vec<_> = archive.entries().unwrap().collect();
+    #[test]
+    fn test_tarball_is_byte_identical_across_builds() {
+        let output = TempDir::new().unwrap();
+        let config = OciConfig::new().created(Timestamp::epoch());
+        let paths = [output.path().join("a.tar"), output.path().join("b.tar")];
 
-        let paths: Vec<String> = entries
-            .into_iter()
-            .map(|e| e.unwrap().path().unwrap().to_string_lossy().to_string())
+        let results: Vec<_> = paths
+            .iter()
+            .map(|p| {
+                write_image(
+                    &config,
+                    &test_rootfs(),
+                    &ImageOutput::Tarball(p.clone()),
+                    &(),
+                )
+                .unwrap()
+            })
             .collect();
 
-        assert!(paths.iter().any(|p| p == "oci-layout"));
-        assert!(paths.iter().any(|p| p == "index.json"));
-        assert!(paths.iter().any(|p| p.starts_with("blobs")));
+        assert_eq!(results[0].manifest_digest, results[1].manifest_digest);
+        assert_eq!(fs::read(&paths[0]).unwrap(), fs::read(&paths[1]).unwrap());
+
+        let mut archive = tar::Archive::new(fs::File::open(&paths[0]).unwrap());
+        let names: Vec<String> = archive
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(&names[..2], ["blobs/", "blobs/sha256/"]);
+        assert!(names.contains(&"index.json".to_string()));
+        assert!(names.contains(&"oci-layout".to_string()));
     }
 
     #[test]
-    fn test_generate_missing_source_dir() {
+    fn test_layout_and_tarball_have_the_same_digest() {
         let output = TempDir::new().unwrap();
-        let service = OciImageService::new();
-
-        let result = service.generate(
-            Path::new("/nonexistent/source/dir"),
-            output.path(),
-            &NoProgress,
-        );
-
-        assert!(matches!(result, Err(OciError::SourceNotFound { .. })));
-    }
-
-    #[test]
-    fn test_skip_start_progress_suppresses_on_start_and_on_complete() {
-        use std::sync::atomic::{AtomicU32, Ordering};
-
-        struct CountingProgress {
-            start_count: AtomicU32,
-            complete_count: AtomicU32,
-        }
-
-        impl OciProgress for CountingProgress {
-            fn on_start(&self) {
-                self.start_count.fetch_add(1, Ordering::Relaxed);
-            }
-            fn on_complete(&self, _digest: &str, _size: u64) {
-                self.complete_count.fetch_add(1, Ordering::Relaxed);
-            }
-            fn on_layer_start(&self) {}
-            fn on_layer_complete(&self, _: u64) {}
-            fn on_config_start(&self) {}
-            fn on_config_complete(&self) {}
-            fn on_manifest_start(&self) {}
-            fn on_manifest_complete(&self) {}
-            fn on_writing_blobs(&self) {}
-            fn on_creating_tarball(&self) {}
-            fn on_error(&self, _: &str) {}
-        }
-
-        let inner = CountingProgress {
-            start_count: AtomicU32::new(0),
-            complete_count: AtomicU32::new(0),
-        };
-        let wrapped = SkipStartProgress(&inner);
-
-        wrapped.on_start();
-        wrapped.on_complete("sha256:abc", 0);
-
-        // SkipStartProgress suppresses both on_start and on_complete on the wrapper.
-        assert_eq!(inner.start_count.load(Ordering::Relaxed), 0);
-        assert_eq!(inner.complete_count.load(Ordering::Relaxed), 0);
-
-        // But direct delegation for other hooks works.
-        wrapped.on_layer_start(); // should not panic
-    }
-
-    #[test]
-    fn test_reproducibility() {
-        let rootfs = create_test_rootfs();
-        let output1 = TempDir::new().unwrap();
-        let output2 = TempDir::new().unwrap();
-
-        let config = OciConfig::new()
-            .architecture(Architecture::Amd64)
-            .created(Timestamp::epoch());
-
-        let service = OciImageService::with_config(config);
-
-        let result1 = service
-            .generate(rootfs.path(), output1.path(), &NoProgress)
-            .unwrap();
-        let result2 = service
-            .generate(rootfs.path(), output2.path(), &NoProgress)
-            .unwrap();
-
-        assert_eq!(result1.manifest_digest, result2.manifest_digest);
-        assert_eq!(result1.config_digest, result2.config_digest);
-        assert_eq!(result1.layer_digest, result2.layer_digest);
+        let config = OciConfig::new();
+        let layout = write_image(
+            &config,
+            &test_rootfs(),
+            &ImageOutput::Layout(output.path().join("layout")),
+            &(),
+        )
+        .unwrap();
+        let tarball = write_image(
+            &config,
+            &test_rootfs(),
+            &ImageOutput::Tarball(output.path().join("image.tar")),
+            &(),
+        )
+        .unwrap();
+        assert_eq!(layout.manifest_digest, tarball.manifest_digest);
     }
 }

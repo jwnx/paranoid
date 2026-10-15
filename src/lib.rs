@@ -1,10 +1,13 @@
 pub mod arch;
+pub mod build;
 pub mod config;
+pub mod deb;
 pub mod download;
-pub mod extract;
 pub mod http;
 pub mod lock;
 pub mod oci;
+pub mod report;
 pub mod repository;
 pub mod resolve;
+pub mod rootfs;
 pub mod version;

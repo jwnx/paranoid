@@ -8,9 +8,9 @@
 //! # Example
 //!
 //! ```no_run
-//! use std::path::Path;
 //! use paranoid::arch::Architecture;
-//! use paranoid::oci::{OciConfig, OciImageService, NoProgress, EnvVar, Timestamp};
+//! use paranoid::oci::{write_image, EnvVar, ImageOutput, OciConfig};
+//! use paranoid::rootfs::Rootfs;
 //! use std::convert::TryFrom;
 //!
 //! let config = OciConfig::new()
@@ -20,22 +20,17 @@
 //!     .try_image_name("my-image").unwrap()
 //!     .try_image_tag("v1.0").unwrap();
 //!
-//! let service = OciImageService::with_config(config);
-//! let result = service.generate_tarball(
-//!     Path::new("./rootfs"),
-//!     Path::new("./image.tar"),
-//!     &NoProgress,
-//! ).expect("failed to generate image");
+//! let rootfs = Rootfs::new(); // normally assembled from packages
+//! let result = write_image(&config, &rootfs, &ImageOutput::from_path("image.tar"), &())
+//!     .expect("failed to generate image");
 //!
 //! println!("Generated image: {}", result.manifest_digest);
 //! // Load with: podman load -i ./image.tar
 //! ```
 
-mod blob;
 mod digest;
 mod error;
 mod layer;
-mod progress;
 mod service;
 mod spec;
 pub mod types;
@@ -43,8 +38,7 @@ pub mod types;
 pub use digest::{Digest, DigestError};
 pub use error::{OciError, OciImageResult};
 pub use layer::{Compression, Layer};
-pub use progress::{NoProgress, OciProgress, StderrProgress};
-pub use service::{OciConfig, OciConfigError, OciImageService};
+pub use service::{ImageOutput, OciConfig, OciConfigError, write_image};
 pub use spec::{
     ContainerConfig, Descriptor, History, ImageConfig, ImageIndex, ImageManifest, MediaType,
     OciLayout, RootFs,

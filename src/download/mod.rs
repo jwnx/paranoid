@@ -1,20 +1,14 @@
-//! Download manager for fetching packages.
+//! Fetching locked packages into a content-addressable cache.
 //!
-//! This module provides:
-//! - Parallel HTTP downloads with bounded concurrency
-//! - SHA256 verification before caching
-//! - Content-addressable cache (`~/.cache/paranoid/sha256/`)
-//! - Progress reporting via trait
-//! - Cache hits (skip already-downloaded packages)
+//! Downloads run with bounded concurrency, are verified against the lock's
+//! SHA-256 before being cached, and cache hits skip the network.
 
 mod cache;
 mod error;
-mod progress;
 mod service;
 
 pub use cache::PackageCache;
-pub use error::{DownloadError, DownloadFailure, DownloadResult, DownloadedPackage};
-pub use progress::{DownloadProgress, NoProgress, StderrProgress};
+pub use error::{DownloadError, DownloadFailures, Fetched};
 pub use service::{DownloadConfig, DownloadService};
 
 #[cfg(test)]

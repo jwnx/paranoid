@@ -1,12 +1,14 @@
 //! Download error types.
 
+use std::fmt;
 use std::path::PathBuf;
 
 use thiserror::Error;
 
 use crate::http::ClientError;
+use crate::lock::LockedPackage;
 
-/// Errors that can occur during download operations.
+/// Errors that can occur downloading one package.
 #[derive(Debug, Error)]
 pub enum DownloadError {
     #[error("HTTP error: {0}")]
@@ -29,62 +31,26 @@ pub enum DownloadError {
     UnknownRepository(String),
 }
 
-/// A successfully downloaded package.
+/// A package available in the local cache.
 #[derive(Debug, Clone)]
-pub struct DownloadedPackage {
-    /// Package name.
-    pub name: String,
-    /// Package version.
-    pub version: String,
-    /// Path to the downloaded .deb file.
+pub struct Fetched<'a> {
+    /// The lock entry this file satisfies.
+    pub package: &'a LockedPackage,
+    /// Path to the cached `.deb`.
     pub path: PathBuf,
-    /// Whether the package was served from cache.
+    /// Whether it was already cached before this run.
     pub from_cache: bool,
 }
 
-/// A failed package download.
-#[derive(Debug)]
-pub struct DownloadFailure {
-    /// Package name.
-    pub name: String,
-    /// Package version.
-    pub version: String,
-    /// The error that occurred.
-    pub error: DownloadError,
-}
+/// One or more packages failed to download.
+#[derive(Debug, Error)]
+pub struct DownloadFailures(pub Vec<(String, DownloadError)>);
 
-/// Result of a batch download operation.
-#[derive(Debug)]
-#[must_use = "download results should be checked for failures"]
-pub struct DownloadResult {
-    /// Successfully downloaded packages.
-    pub succeeded: Vec<DownloadedPackage>,
-    /// Failed downloads.
-    pub failed: Vec<DownloadFailure>,
-}
-
-impl DownloadResult {
-    /// Create a new empty download result.
-    pub fn new() -> Self {
-        Self {
-            succeeded: Vec::new(),
-            failed: Vec::new(),
+impl fmt::Display for DownloadFailures {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0.as_slice() {
+            [(name, error)] => write!(f, "failed to download {name}: {error}"),
+            failures => write!(f, "{} packages failed to download", failures.len()),
         }
-    }
-
-    /// Check if all downloads succeeded.
-    pub fn all_succeeded(&self) -> bool {
-        self.failed.is_empty()
-    }
-
-    /// Get the total number of packages (succeeded + failed).
-    pub fn total(&self) -> usize {
-        self.succeeded.len() + self.failed.len()
-    }
-}
-
-impl Default for DownloadResult {
-    fn default() -> Self {
-        Self::new()
     }
 }

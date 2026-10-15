@@ -488,7 +488,7 @@ name = "ca-certificates"
 #[ignore]
 async fn test_download_packages() {
     use paranoid::config::Manifest;
-    use paranoid::download::{DownloadConfig, DownloadService, PackageCache, StderrProgress};
+    use paranoid::download::{DownloadConfig, DownloadService, PackageCache};
     use paranoid::lock::LockFile;
     use paranoid::resolve::ResolveService;
     use tempfile::TempDir;
@@ -515,23 +515,17 @@ name = "ca-certificates"
     let temp_dir = TempDir::new().expect("Should create temp dir");
     let cache =
         PackageCache::with_base_dir(temp_dir.path().to_path_buf()).expect("Should create cache");
-    let download_config = DownloadConfig::new()
-        .with_max_concurrent(std::num::NonZeroUsize::new(4).unwrap())
-        .with_force_download(false);
+    let download_config = DownloadConfig::default();
     let download_service = DownloadService::with_cache(cache, download_config)
         .expect("Should create download service");
 
-    let result = download_service
-        .download_all(&lock, &manifest.repositories, &StderrProgress)
-        .await;
+    let fetched = download_service
+        .download_all(&lock, &manifest.repositories, &())
+        .await
+        .expect("All downloads should succeed");
 
-    assert!(
-        result.failed.is_empty(),
-        "All downloads should succeed: {:?}",
-        result.failed.iter().map(|f| &f.name).collect::<Vec<_>>()
-    );
-
-    for pkg in &result.succeeded {
+    assert_eq!(fetched.len(), lock.packages.len());
+    for pkg in &fetched {
         assert!(
             pkg.path.exists(),
             "Downloaded file should exist: {:?}",
@@ -539,8 +533,8 @@ name = "ca-certificates"
         );
         println!(
             "  {} {} -> {} (cached: {})",
-            pkg.name,
-            pkg.version,
+            pkg.package.name,
+            pkg.package.version,
             pkg.path.display(),
             pkg.from_cache
         );
@@ -553,7 +547,7 @@ name = "ca-certificates"
 #[ignore]
 async fn test_download_cache_hit() {
     use paranoid::config::Manifest;
-    use paranoid::download::{DownloadConfig, DownloadService, NoProgress, PackageCache};
+    use paranoid::download::{DownloadConfig, DownloadService, PackageCache};
     use paranoid::lock::LockFile;
     use paranoid::resolve::ResolveService;
     use tempfile::TempDir;
@@ -580,19 +574,17 @@ name = "base-files"
     let temp_dir = TempDir::new().expect("Should create temp dir");
     let cache =
         PackageCache::with_base_dir(temp_dir.path().to_path_buf()).expect("Should create cache");
-    let download_config = DownloadConfig::new()
-        .with_max_concurrent(std::num::NonZeroUsize::new(4).unwrap())
-        .with_force_download(false);
+    let download_config = DownloadConfig::default();
     let download_service = DownloadService::with_cache(cache, download_config)
         .expect("Should create download service");
 
     // First download - should fetch from network
     let result1 = download_service
-        .download_all(&lock, &manifest.repositories, &NoProgress)
-        .await;
+        .download_all(&lock, &manifest.repositories, &())
+        .await
+        .expect("First download should succeed");
 
-    assert!(result1.failed.is_empty(), "First download should succeed");
-    let first_download = result1.succeeded.iter().find(|p| p.name == "base-files");
+    let first_download = result1.iter().find(|p| p.package.name == "base-files");
     assert!(
         first_download.is_some(),
         "Should have downloaded base-files"
@@ -604,11 +596,11 @@ name = "base-files"
 
     // Second download - should use cache
     let result2 = download_service
-        .download_all(&lock, &manifest.repositories, &NoProgress)
-        .await;
+        .download_all(&lock, &manifest.repositories, &())
+        .await
+        .expect("Second download should succeed");
 
-    assert!(result2.failed.is_empty(), "Second download should succeed");
-    let cached_download = result2.succeeded.iter().find(|p| p.name == "base-files");
+    let cached_download = result2.iter().find(|p| p.package.name == "base-files");
     assert!(cached_download.is_some(), "Should have base-files");
     assert!(
         cached_download.unwrap().from_cache,

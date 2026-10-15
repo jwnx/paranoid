@@ -10,17 +10,6 @@ use super::digest::Digest;
 #[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum OciError {
-    /// Failed to create a temporary directory.
-    #[error("failed to create temporary directory: {source}")]
-    CreateTempDir { source: std::io::Error },
-
-    /// Failed to read source directory.
-    #[error("failed to read source directory '{}': {source}", path.display())]
-    ReadSourceDir {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-
     /// Failed to create output directory.
     #[error("failed to create output directory '{}': {source}", path.display())]
     CreateOutputDir {
@@ -39,14 +28,6 @@ pub enum OciError {
     #[error("failed to serialize JSON: {0}")]
     JsonSerialization(#[from] serde_json::Error),
 
-    /// Source directory does not exist.
-    #[error("source directory does not exist: {}", path.display())]
-    SourceNotFound { path: PathBuf },
-
-    /// Source path is not a directory.
-    #[error("source path is not a directory: {}", path.display())]
-    NotADirectory { path: PathBuf },
-
     /// Failed to create tar layer.
     #[error("failed to create tar layer: {0}")]
     LayerCreation(String),
@@ -54,10 +35,6 @@ pub enum OciError {
     /// Failed to compress layer.
     #[error("compression failed: {0}")]
     Compression(String),
-
-    /// Failed to compute relative path.
-    #[error("failed to compute relative path for '{}'", path.display())]
-    RelativePath { path: PathBuf },
 }
 
 /// Result of a successful OCI image generation.
@@ -67,6 +44,8 @@ pub enum OciError {
 pub struct OciImageResult {
     /// Path to the generated image (directory or tarball).
     pub path: PathBuf,
+    /// The image reference recorded in the index, `name:tag` or `tag`.
+    pub reference: String,
     /// SHA256 digest of the image manifest.
     pub manifest_digest: Digest,
     /// SHA256 digest of the image config.

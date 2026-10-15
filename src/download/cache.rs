@@ -1,6 +1,7 @@
 //! Content-addressable package cache.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -54,25 +55,39 @@ impl PackageCache {
 
     /// Check if a package is already cached.
     ///
-    /// Returns the cache path if the package exists, None otherwise.
+    /// Returns the cache path if an entry of the expected size exists. A
+    /// truncated or partial entry counts as a miss. Contents are verified
+    /// against the lock when the package is read with [`Self::read`].
     pub fn get(&self, package: &LockedPackage) -> Option<PathBuf> {
         let path = self.path_for(package);
-        path.exists().then_some(path)
+        let len = fs::metadata(&path).ok()?.len();
+        (len == package.size).then_some(path)
+    }
+
+    /// Read a cached package, verifying its checksum against the lock.
+    pub fn read(path: &Path, package: &LockedPackage) -> Result<Vec<u8>, DownloadError> {
+        let data = fs::read(path)?;
+        Self::verify(package, &data)?;
+        Ok(data)
+    }
+
+    fn verify(package: &LockedPackage, data: &[u8]) -> Result<(), DownloadError> {
+        let actual = Self::compute_sha256(data);
+        if actual != package.sha256.as_str() {
+            return Err(DownloadError::ChecksumMismatch {
+                package: package.name.clone(),
+                expected: package.sha256.to_string(),
+                actual,
+            });
+        }
+        Ok(())
     }
 
     /// Store downloaded data in the cache after verifying its checksum.
     ///
     /// Returns the path to the cached file on success.
     pub fn store(&self, package: &LockedPackage, data: &[u8]) -> Result<PathBuf, DownloadError> {
-        // Verify checksum
-        let actual_hash = Self::compute_sha256(data);
-        if actual_hash != package.sha256.as_str() {
-            return Err(DownloadError::ChecksumMismatch {
-                package: package.name.clone(),
-                expected: package.sha256.to_string(),
-                actual: actual_hash,
-            });
-        }
+        Self::verify(package, data)?;
 
         // Determine target path and ensure parent directory exists
         let target_path = self.path_for(package);
@@ -86,10 +101,13 @@ impl PackageCache {
             })?;
         }
 
-        // Write atomically using a temp file
-        let temp_path = target_path.with_extension("deb.tmp");
-        fs::write(&temp_path, data)?;
-        fs::rename(&temp_path, &target_path)?;
+        // Write atomically through a uniquely named temp file, so concurrent
+        // runs sharing the cache never write to the same temp path.
+        let dir = target_path.parent().unwrap_or(&self.base_dir);
+        let mut temp = tempfile::NamedTempFile::new_in(dir)?;
+        temp.write_all(data)?;
+        temp.as_file().sync_all()?;
+        temp.persist(&target_path).map_err(|e| e.error)?;
 
         Ok(target_path)
     }
@@ -155,7 +173,8 @@ mod tests {
         let data = b"test package content";
         let hash = PackageCache::compute_sha256(data);
 
-        let package = make_test_package("test-pkg", &hash);
+        let mut package = make_test_package("test-pkg", &hash);
+        package.size = data.len() as u64;
 
         // Store the package
         let path = cache.store(&package, data).unwrap();
@@ -169,6 +188,38 @@ mod tests {
         // Verify content
         let read_data = std::fs::read(&path).unwrap();
         assert_eq!(read_data, data);
+    }
+
+    #[test]
+    fn test_get_treats_wrong_size_as_miss() {
+        let dir = TempDir::new().unwrap();
+        let cache = PackageCache::with_base_dir(dir.path().to_path_buf()).unwrap();
+
+        let data = b"test package content";
+        let mut package = make_test_package("test-pkg", &PackageCache::compute_sha256(data));
+        package.size = data.len() as u64;
+        let path = cache.store(&package, data).unwrap();
+
+        std::fs::write(&path, b"trunc").unwrap();
+        assert!(cache.get(&package).is_none());
+    }
+
+    #[test]
+    fn test_read_rejects_tampered_entry() {
+        let dir = TempDir::new().unwrap();
+        let cache = PackageCache::with_base_dir(dir.path().to_path_buf()).unwrap();
+
+        let data = b"test package content";
+        let mut package = make_test_package("test-pkg", &PackageCache::compute_sha256(data));
+        package.size = data.len() as u64;
+        let path = cache.store(&package, data).unwrap();
+        assert_eq!(PackageCache::read(&path, &package).unwrap(), data);
+
+        std::fs::write(&path, b"test package CONTENT").unwrap();
+        assert!(matches!(
+            PackageCache::read(&path, &package),
+            Err(DownloadError::ChecksumMismatch { .. })
+        ));
     }
 
     #[test]

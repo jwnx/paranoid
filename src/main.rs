@@ -2,7 +2,7 @@
 //!
 //! Subcommands:
 //!   lock     Resolve dependencies and write paranoid.lock
-//!   build    Download, extract, and build an OCI image
+//!   build    Download packages and build an OCI image from them
 //!   inspect  Show the contents of a lock file or built image
 
 use std::num::NonZeroUsize;
@@ -18,14 +18,14 @@ mod cli {
 }
 
 use cli::error::CliError;
-use cli::progress::{DotsDownloadProgress, DotsExtractionProgress, DotsOciProgress};
+use cli::progress::DotsReporter;
 use cli::style as st;
 
+use paranoid::build::{BuildOptions, build};
 use paranoid::config::Manifest;
-use paranoid::download::{DownloadConfig, DownloadService, PackageCache};
-use paranoid::extract::{ExtractionConfig, ExtractionMode, ExtractionService};
+use paranoid::download::DownloadConfig;
 use paranoid::lock::LockFile;
-use paranoid::oci::{OciConfig, OciImageService, Timestamp};
+use paranoid::oci::{ImageOutput, Timestamp};
 use paranoid::resolve::ResolveService;
 
 // ── Top-level CLI ─────────────────────────────────────────────────────────────
@@ -261,93 +261,39 @@ async fn run_build(args: BuildArgs, quiet: bool) -> Result<(), CliError> {
         ));
     }
 
-    // ── Download ──────────────────────────────────────────────────────────────
-    let download_config = DownloadConfig::new()
-        .with_max_concurrent(args.jobs)
-        .with_force_download(args.force_download);
-
-    let download_service = match args.cache_dir {
-        Some(dir) => PackageCache::with_base_dir(dir)
-            .and_then(|cache| DownloadService::with_cache(cache, download_config)),
-        None => DownloadService::with_config(download_config),
-    }
-    .map_err(CliError::download)?;
-
-    let download_progress = DotsDownloadProgress::new(quiet);
-    let download_result = download_service
-        .download_all(&lock, &manifest.repositories, &download_progress)
-        .await;
-
-    download_progress.finish();
-
-    // Individual failures were already reported by the progress reporter.
-    if !download_result.failed.is_empty() {
-        return Err(CliError::download_failures(download_result.failed.len()));
-    }
-
-    // ── Extract ───────────────────────────────────────────────────────────────
-    let extract_dir = tempfile::tempdir().map_err(CliError::io)?;
-    let extract_config = ExtractionConfig::new().with_mode(ExtractionMode::Merged);
-    let extract_service = ExtractionService::with_config(extract_config);
-
-    let extract_progress = DotsExtractionProgress::new(quiet);
-    let extract_result = extract_service
-        .extract_all(
-            &download_result.succeeded,
-            extract_dir.path(),
-            &extract_progress,
-        )
-        .await;
-
-    extract_progress.finish();
-
-    if !extract_result.failed.is_empty() {
-        return Err(CliError::extract_failures(extract_result.failed.len()));
-    }
-
-    // ── OCI ───────────────────────────────────────────────────────────────────
-    let oci_config = OciConfig::from_manifest(&manifest, source_date_epoch()?)
-        .map_err(|e| CliError::config(e.to_string()))?;
-
-    // Capture name+tag before moving config into the service.
-    let image_ref: Option<String> = oci_config
-        .get_image_name()
-        .map(|name| format!("{}:{}", name.as_str(), oci_config.get_image_tag().as_str()));
-
-    let oci_service = OciImageService::with_config(oci_config);
-    let oci_progress = DotsOciProgress::new(quiet);
-
-    let source_dir = extract_dir.path();
-    let output = &args.output;
-    let result = if output.extension().is_some_and(|e| e == "tar") {
-        oci_service.generate_tarball(source_dir, output, &oci_progress)
-    } else {
-        oci_service.generate(source_dir, output, &oci_progress)
-    }
-    .map_err(CliError::oci)?;
-
-    oci_progress.finish();
+    let options = BuildOptions {
+        download: DownloadConfig {
+            jobs: args.jobs,
+            force: args.force_download,
+        },
+        cache_dir: args.cache_dir,
+        output: ImageOutput::from_path(&args.output),
+        created: source_date_epoch()?,
+    };
+    // Failures of individual packages are reported as they happen; the
+    // returned error summarizes them.
+    let report = build(&manifest, &lock, &options, &DotsReporter::new(quiet))
+        .await
+        .map_err(CliError::build)?;
 
     if !quiet {
         eprintln!("Done.");
         eprintln!();
 
-        let pkg_count = lock.packages.len();
-        let fresh = download_progress.fresh_count();
-        let cached = download_progress.cached_count();
-
-        let output_str = output.display().to_string();
-        let ref_part = image_ref.as_deref().unwrap_or(&output_str);
-
+        let output = options.output.path();
+        let name = match manifest.image.as_ref().and_then(|i| i.name.as_ref()) {
+            Some(_) => report.image.reference.clone(),
+            None => output.display().to_string(),
+        };
         eprintln!(
             "Built {} with {} packages ({} fresh, {} cached) sized {}.",
-            ref_part,
-            pkg_count,
-            fresh,
-            cached,
-            st::fmt_size(result.total_size),
+            name,
+            lock.packages.len(),
+            report.fresh,
+            report.cached,
+            st::fmt_size(report.image.total_size),
         );
-        st::footer(output, result.manifest_digest.as_str());
+        st::footer(output, report.image.manifest_digest.as_str());
     }
 
     Ok(())

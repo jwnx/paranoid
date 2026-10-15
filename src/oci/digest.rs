@@ -53,17 +53,6 @@ impl Digest {
         Self(format!("sha256:{}", hex::encode(Sha256::digest(data))))
     }
 
-    /// Create a digest from a pre-computed, trusted hex hash (without prefix).
-    ///
-    /// # Safety / Correctness
-    ///
-    /// This is `pub(crate)` and intended only for code that has already
-    /// verified the hash is correct (e.g. values read from our own cache
-    /// or produced by `sha256_hex`). External callers must use `TryFrom`.
-    pub(crate) fn from_trusted_hash(hash: &str) -> Self {
-        Self(format!("sha256:{}", hash))
-    }
-
     /// Get the full digest string including the `"sha256:"` prefix.
     pub fn as_str(&self) -> &str {
         &self.0
@@ -147,11 +136,6 @@ impl<'de> Deserialize<'de> for Digest {
         let s = String::deserialize(deserializer)?;
         Self::try_from(s).map_err(serde::de::Error::custom)
     }
-}
-
-/// Compute the SHA256 hash of data and return it as a 64-char hex string (without prefix).
-pub fn sha256_hex(data: &[u8]) -> String {
-    hex::encode(Sha256::digest(data))
 }
 
 #[cfg(test)]
