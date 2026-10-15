@@ -9,8 +9,6 @@ use std::str::FromStr;
 
 use thiserror::Error;
 
-use crate::version::VersionConstraint;
-
 use super::architecture::Architecture;
 use super::package::{DebianPackage, ParseDebianPackageError};
 use super::provides::ProvidesEntry;
@@ -182,97 +180,6 @@ impl PackageIndex {
             .values()
             .flat_map(|by_version| by_version.values())
             .collect()
-    }
-
-    pub fn find_virtual_provider(
-        &self,
-        name: &str,
-        version_constraint: Option<&VersionConstraint<DebianVersion>>,
-        arch: Architecture,
-    ) -> Option<&DebianPackage> {
-        let mut virtual_providers = self.virtual_providers(name, arch);
-
-        if virtual_providers.is_empty() {
-            return None;
-        }
-
-        // TODO(juliana): Maybe implement Ord?
-        virtual_providers.sort_by(|a, b| match (&b.provider.priority, &a.provider.priority) {
-            (Some(pb), Some(pa)) => pb.cmp(pa),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => std::cmp::Ordering::Equal,
-        });
-
-        for provider in virtual_providers {
-            if let Some(constraint) = version_constraint {
-                // First check if the provided version satisfies the constraint
-                if let Some(ref provided_ver) = provider.provided_version
-                    && constraint.is_satisfied_by(provided_ver)
-                {
-                    return Some(&provider.provider);
-                }
-
-                // If no version provided, check if provider's own version satisfies
-                if constraint.is_satisfied_by(&provider.provider.version) {
-                    return Some(&provider.provider);
-                }
-            } else {
-                // No constraint, accept any provider
-                return Some(&provider.provider);
-            }
-        }
-
-        None
-    }
-
-    pub fn find_package(
-        &self,
-        name: &str,
-        version_constraint: Option<&VersionConstraint<DebianVersion>>,
-        arch: Architecture,
-    ) -> Option<&DebianPackage> {
-        let mut all_package_versions = self.versions(name, arch);
-
-        // If empty, let's return early.
-        if all_package_versions.is_empty() {
-            return None;
-        }
-
-        // Sort from latest to oldest package version.
-        // This will give us the latest version first.
-        all_package_versions.sort_by(|a, b| b.version.cmp(&a.version));
-
-        let Some(constraint) = version_constraint else {
-            // SAFETY: We know the package is not empty.
-            let latest = all_package_versions.first().unwrap();
-            return Some(latest);
-        };
-
-        // We apply constrains from the latest to oldest to make sure
-        // we find the latest version that satisfies the constraint.
-        all_package_versions
-            .into_iter()
-            .find(|package| constraint.is_satisfied_by(&package.version))
-    }
-
-    // Resolve a package by name, version constraint, and architecture.
-    // This method will first try to find a virtual provider, and then a regular package.
-    pub fn resolve_package(
-        &self,
-        name: &str,
-        version_constraint: Option<&VersionConstraint<DebianVersion>>,
-        arch: Architecture,
-    ) -> Option<&DebianPackage> {
-        if let Some(pkg) = self.find_virtual_provider(name, version_constraint, arch) {
-            return Some(pkg);
-        }
-
-        if let Some(pkg) = self.find_package(name, version_constraint, arch) {
-            return Some(pkg);
-        }
-
-        None
     }
 }
 

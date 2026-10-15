@@ -6,30 +6,22 @@ progress model, one hash type and a thin `main.rs`. Resolution and trust
 were left alone on purpose. They are next, in this order, because each one
 changes what the lock file contains.
 
-## 1. Resolver correctness
+## 1. Resolver
 
-The resolver gives plausible answers for simple manifests but is wrong at
-the edges. Each item below was reproduced during the review.
+Version comparison, relation parsing and package selection were rewritten
+after the tidy-up. `scripts/dpkg-oracle.sh` and `scripts/apt-oracle.sh`
+check them against dpkg and apt. What's left:
 
-- **Virtual packages are chosen wrong** (`package_index.rs:187-276`):
-  - an unversioned `Provides` satisfies a versioned dependency;
-  - providers with no priority sort first;
-  - a virtual provider beats a real package with the same name;
-  - `arch: all` providers are never found (`debconf-2.0` resolves to nothing).
-- **No global consistency** (`resolver.rs`). Each root is resolved alone
-  and merged by name, so when `A` needs `libfoo (<< 2)` and `B` needs
-  `libfoo`, one constraint silently loses. Alternatives only try the first
-  option, `Breaks`/`Conflicts` are ignored, and `with_recommends` does
-  nothing because `Recommends` is never parsed. Start with a single pass
-  that checks already-selected packages against each new constraint and
-  reports conflicts; reach for `pubgrub` or `resolvo` if that isn't enough.
-- **Repository pins only relabel** (`resolve/service.rs`). A package pinned
-  to a repository is still resolved from all of them, so its download URL
-  can point at the wrong mirror. Pass the pin into resolution.
-
-Once these land, make `PackageSpec.version` a parsed constraint in the
-manifest (it is still parsed late, in the resolver), and give
-`ResolvedManifest.unmet` a typed `Vec<UnmetDependency>` instead of strings.
+- Parse `PackageSpec.version` into a constraint when the manifest is
+  loaded. It's still parsed late, in the resolve service.
+- The resolver is greedy, with restarts when a requirement needs a
+  different version of something already chosen (see `resolver.rs`). If a
+  real manifest hits a conflict apt gets around, reach for `pubgrub` or
+  `resolvo`.
+- Essential packages (`dpkg`, `coreutils`, ...) are never declared as
+  dependencies, so an image only has them if the manifest lists them. apt
+  does the same on an empty system, but it's easy to trip over: apt itself
+  needs dpkg's data files to run. Consider a warning, or an opt-in.
 
 ## 2. Trust chain
 
@@ -61,9 +53,8 @@ but is never called.
 - `PackageIndex` keys by `(Architecture, String)` and allocates on every
   lookup. A per-arch `HashMap<String, BTreeMap<DebianVersion, _>>` gives
   `latest_version` for free. `VirtualPackageProvider` clones whole packages.
-- Single-implementation traits (`Version`, `Package`) and the
-  `ProvidesList`/`DependencyList` `Deref<Target = Vec>` wrappers can become
-  concrete types.
+- The single-implementation `Version` trait can become the concrete
+  `DebianVersion`.
 - Most modules are `pub`. Shrink the library surface to what the CLI and
   tests need.
 - The HTTP client has no timeouts, and decompresses `Packages` into a

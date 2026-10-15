@@ -345,7 +345,7 @@ name = "coreutils"
                 },
             ],
             unmet: vec![],
-            graph: std::collections::HashMap::from([(
+            graph: std::collections::BTreeMap::from([(
                 "bash".to_string(),
                 vec!["coreutils".to_string()],
             )]),

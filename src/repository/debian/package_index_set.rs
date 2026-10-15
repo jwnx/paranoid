@@ -6,49 +6,30 @@
 use super::architecture::Architecture;
 use super::package::DebianPackage;
 use super::package_index::PackageIndex;
-use super::resolver::ResolveBuilder;
 use super::version::DebianVersion;
-use crate::version::VersionConstraint;
 
-/// A package found in an index set, with its source repository (borrowed).
-///
-/// This is the borrowed version used for lookups. For owned results
-/// (e.g., in resolution), see [`super::resolver::SourcedPackage`].
-#[derive(Debug, Clone)]
+/// A package found in an index set, with the repository it came from.
+#[derive(Debug, Clone, Copy)]
 pub struct SourcedPackage<'a> {
     pub package: &'a DebianPackage,
     pub repository: &'a str,
 }
 
-/// A set of package indices from multiple repositories.
+/// A package that provides a virtual package, and the version it provides
+/// (`Provides: foo (= 1.0)`), if any.
+#[derive(Debug, Clone, Copy)]
+pub struct SourcedProvider<'a> {
+    pub provider: SourcedPackage<'a>,
+    pub provided_version: Option<&'a DebianVersion>,
+}
+
+/// The package indexes of every repository in a manifest, in declaration
+/// order.
 ///
-/// Provides unified lookups across all repositories while tracking
-/// which repository each package comes from.
-///
-/// Repositories are kept in insertion order, which is the order they are
-/// declared in the manifest. When several repositories carry a matching
-/// package, the highest version wins and ties go to the earlier repository,
-/// so the same inputs always resolve to the same package.
-///
-/// # Example
-///
-/// ```ignore
-/// use paranoid::repository::debian::{PackageIndexSet, Architecture};
-///
-/// let mut index = PackageIndexSet::new();
-/// // ... add indices ...
-///
-/// // Simple package lookup
-/// if let Some(pkg) = index.resolve("bash", None, Architecture::Amd64) {
-///     println!("Found {} from {}", pkg.package.name, pkg.repository);
-/// }
-///
-/// // Full transitive resolution
-/// let result = index
-///     .resolve_all("bash", None, Architecture::Amd64)
-///     .with_recommends(true)
-///     .execute()?;
-/// ```
+/// Lookups cover both the target architecture and `all`, and list
+/// repositories in order, so callers that pick "the first best" get the
+/// earliest repository on ties. See [`super::resolver`] for how packages are
+/// chosen.
 #[derive(Default)]
 pub struct PackageIndexSet {
     indices: Vec<(String, PackageIndex)>,
@@ -64,101 +45,70 @@ impl PackageIndexSet {
         self.indices.push((name, index));
     }
 
-    /// Pick the best match across repositories: highest version first, then
-    /// the earliest repository.
-    fn best<'a>(
+    /// Every real package called `name` for `arch` or `all`, in repository
+    /// order.
+    pub fn packages<'a, 'n>(
         &'a self,
-        find: impl Fn(&'a PackageIndex) -> Option<&'a DebianPackage>,
-    ) -> Option<SourcedPackage<'a>> {
-        self.indices
-            .iter()
-            .filter_map(|(repo, index)| {
-                find(index).map(|package| SourcedPackage {
+        name: &'n str,
+        arch: Architecture,
+    ) -> impl Iterator<Item = SourcedPackage<'a>> + 'n
+    where
+        'a: 'n,
+    {
+        self.indices.iter().flat_map(move |(repo, index)| {
+            [arch, Architecture::All]
+                .into_iter()
+                .flat_map(move |arch| index.versions(name, arch))
+                .map(move |package| SourcedPackage {
                     package,
                     repository: repo,
                 })
-            })
-            // `max_by` keeps the last of equal elements, so iterate in reverse
-            // to let the earliest repository win ties.
-            .rev()
-            .max_by(|a, b| a.package.version.cmp(&b.package.version))
+        })
     }
 
-    /// Resolve a single package by name, optionally with a version constraint.
-    ///
-    /// This handles:
-    /// 1. Virtual packages (via Provides)
-    /// 2. Version constraints
-    /// 3. Architecture-specific packages
-    /// 4. Architecture "all" fallback
-    #[must_use]
-    pub fn resolve(
-        &self,
-        name: &str,
-        version_constraint: Option<&VersionConstraint<DebianVersion>>,
+    /// Every package for `arch` or `all` that provides `name`, in
+    /// repository order.
+    pub fn providers<'a, 'n>(
+        &'a self,
+        name: &'n str,
         arch: Architecture,
-    ) -> Option<SourcedPackage<'_>> {
-        self.find_virtual_provider(name, version_constraint, arch)
-            .or_else(|| self.find_package(name, version_constraint, arch))
-            .or_else(|| self.find_package(name, version_constraint, Architecture::All))
-    }
-
-    /// Resolve a package with all its transitive dependencies.
-    ///
-    /// Returns a builder that can be configured before execution.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let result = index
-    ///     .resolve_all("bash", None, Architecture::Amd64)
-    ///     .with_recommends(true)
-    ///     .execute()?;
-    /// ```
-    pub fn resolve_all(
-        &self,
-        name: &str,
-        version_constraint: Option<&VersionConstraint<DebianVersion>>,
-        arch: Architecture,
-    ) -> ResolveBuilder<'_> {
-        ResolveBuilder::new(self, name, version_constraint, arch)
-    }
-
-    /// Find a virtual package provider across all repositories.
-    fn find_virtual_provider(
-        &self,
-        name: &str,
-        version_constraint: Option<&VersionConstraint<DebianVersion>>,
-        arch: Architecture,
-    ) -> Option<SourcedPackage<'_>> {
-        self.best(|index| index.find_virtual_provider(name, version_constraint, arch))
-    }
-
-    /// Find the highest version matching the given criteria across all
-    /// repositories.
-    fn find_package(
-        &self,
-        name: &str,
-        version_constraint: Option<&VersionConstraint<DebianVersion>>,
-        arch: Architecture,
-    ) -> Option<SourcedPackage<'_>> {
-        self.best(|index| index.find_package(name, version_constraint, arch))
+    ) -> impl Iterator<Item = SourcedProvider<'a>> + 'n
+    where
+        'a: 'n,
+    {
+        self.indices.iter().flat_map(move |(repo, index)| {
+            [arch, Architecture::All]
+                .into_iter()
+                .flat_map(move |arch| index.virtual_providers(name, arch))
+                .map(move |p| SourcedProvider {
+                    provider: SourcedPackage {
+                        package: &p.provider,
+                        repository: repo,
+                    },
+                    provided_version: p.provided_version.as_ref(),
+                })
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repository::debian::test_utils::make_package;
+    use crate::repository::debian::test_utils::{make_package, provides};
 
     fn make_index_set() -> PackageIndexSet {
         let mut debian = PackageIndex::new();
         debian.add(make_package("libc6", "2.36-9", "amd64"));
-        debian.add(make_package("bash", "5.2.15", "amd64"));
+        debian.add(make_package("ca-certificates", "20230311", "all"));
+        let mut mawk = make_package("mawk", "1.3.4", "amd64");
+        mawk.provides = provides(&["awk"]);
+        debian.add(mawk);
 
         let mut security = PackageIndex::new();
         security.add(make_package("libc6", "2.36-10", "amd64"));
-        security.add(make_package("openssl", "3.0.11", "amd64"));
+        let mut gawk = make_package("gawk", "5.2", "all");
+        gawk.provides = provides(&["awk (= 5.2)"]);
+        security.add(gawk);
 
         let mut set = PackageIndexSet::new();
         set.add_index("debian".to_string(), debian);
@@ -167,61 +117,46 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_returns_match_with_repository() {
+    fn packages_lists_every_repository_in_order() {
         let set = make_index_set();
-
-        let result = set.resolve("bash", None, Architecture::Amd64);
-        assert!(result.is_some());
-
-        let sourced = result.unwrap();
-        assert_eq!(sourced.package.name, "bash");
-        assert_eq!(sourced.repository, "debian");
+        let found: Vec<_> = set
+            .packages("libc6", Architecture::Amd64)
+            .map(|p| format!("{} {}", p.repository, p.package.version))
+            .collect();
+        assert_eq!(found, ["debian 2.36-9", "security 2.36-10"]);
     }
 
     #[test]
-    fn test_resolve_prefers_highest_version_across_repositories() {
+    fn packages_include_arch_all() {
         let set = make_index_set();
-
-        let sourced = set.resolve("libc6", None, Architecture::Amd64).unwrap();
-        assert_eq!(sourced.package.version.to_string(), "2.36-10");
-        assert_eq!(sourced.repository, "security");
+        let found: Vec<_> = set
+            .packages("ca-certificates", Architecture::Arm64)
+            .map(|p| p.package.architecture)
+            .collect();
+        assert_eq!(found, [Some(Architecture::All)]);
+        assert_eq!(set.packages("nonexistent", Architecture::Amd64).count(), 0);
     }
 
     #[test]
-    fn test_resolve_breaks_version_ties_by_repository_order() {
-        let mut set = PackageIndexSet::new();
-        for repo in ["first", "second", "third"] {
-            let mut index = PackageIndex::new();
-            index.add(make_package("bash", "5.2.15", "amd64"));
-            set.add_index(repo.to_string(), index);
-        }
-
-        let sourced = set.resolve("bash", None, Architecture::Amd64).unwrap();
-        assert_eq!(sourced.repository, "first");
-    }
-
-    #[test]
-    fn test_resolve_not_found() {
+    fn providers_include_arch_all_and_provided_versions() {
         let set = make_index_set();
-
-        let result = set.resolve("nonexistent", None, Architecture::Amd64);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_resolve_uses_fallback_strategy() {
-        let mut set = PackageIndexSet::new();
-        let mut index = PackageIndex::new();
-        // Only available as arch: all
-        index.add(make_package("ca-certificates", "20230311", "all"));
-        set.add_index("debian".to_string(), index);
-
-        // Request for amd64 should fall back to all
-        let result = set.resolve("ca-certificates", None, Architecture::Amd64);
-        assert!(result.is_some());
+        let found: Vec<_> = set
+            .providers("awk", Architecture::Amd64)
+            .map(|p| {
+                let version = p.provided_version.map(ToString::to_string);
+                (
+                    p.provider.package.name.as_str(),
+                    p.provider.repository,
+                    version,
+                )
+            })
+            .collect();
         assert_eq!(
-            result.unwrap().package.architecture,
-            Some(Architecture::All)
+            found,
+            [
+                ("mawk", "debian", None),
+                ("gawk", "security", Some("5.2".to_string()))
+            ]
         );
     }
 }

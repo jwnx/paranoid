@@ -5,7 +5,9 @@
 
 use std::str::FromStr;
 
-use paranoid::repository::debian::{Architecture, PackageIndex, PackageIndexSet, Priority};
+use paranoid::repository::debian::{
+    Architecture, PackageIndex, PackageIndexSet, Priority, Request, ResolveError, resolve,
+};
 
 /// Load the test fixture containing real Debian packages.
 fn load_fixture() -> PackageIndex {
@@ -153,54 +155,57 @@ fn test_ca_certificates_arch_all() {
     );
 }
 
+/// Resolve one request against the fixture, returning the selected names.
+fn resolve_fixture(request: Request) -> Result<Vec<String>, ResolveError> {
+    let index = make_index_set(load_fixture());
+    let resolution = resolve(&index, &[request], Architecture::Amd64)?;
+    Ok(resolution
+        .packages
+        .iter()
+        .map(|r| r.package.name.clone())
+        .collect())
+}
+
 #[test]
 fn test_resolver_with_real_packages() {
-    let pkg_index = load_fixture();
-    let index = make_index_set(pkg_index);
+    let bash = resolve_fixture(Request::new("bash")).expect("Should resolve bash");
+    assert!(bash.contains(&"bash".to_string()));
 
-    // Resolve bash - should find it
-    let bash = index.resolve("bash", None, Architecture::Amd64);
-    assert!(bash.is_some(), "Should resolve bash");
-    assert_eq!(bash.unwrap().package.name, "bash");
-
-    // Resolve virtual package "awk"
-    // Should prefer mawk (priority: required) over gawk (priority: optional)
-    let awk = index.resolve("awk", None, Architecture::Amd64);
-    assert!(awk.is_some(), "Should resolve virtual package awk");
+    // Both mawk and gawk provide awk. Like apt, we won't guess which one a
+    // request for "awk" meant.
     assert_eq!(
-        awk.unwrap().package.name,
-        "mawk",
-        "awk should resolve to mawk (priority: required) over gawk (priority: optional)"
+        resolve_fixture(Request::new("awk")),
+        Err(ResolveError::AmbiguousVirtual {
+            name: "awk".into(),
+            providers: vec!["gawk".into(), "mawk".into()],
+        })
     );
 }
 
 #[test]
 fn test_resolver_fallback_to_arch_all() {
-    let pkg_index = load_fixture();
-    let index = make_index_set(pkg_index);
-
     // ca-certificates is only available as arch: all
-    // Requesting it for amd64 should fall back to "all"
-    let ca_certs = index.resolve("ca-certificates", None, Architecture::Amd64);
-    assert!(
-        ca_certs.is_some(),
-        "Should resolve ca-certificates via arch:all fallback"
-    );
-    assert_eq!(
-        ca_certs.unwrap().package.architecture,
-        Some(Architecture::All)
-    );
+    let index = make_index_set(load_fixture());
+    let resolution = resolve(
+        &index,
+        &[Request::new("ca-certificates")],
+        Architecture::Amd64,
+    )
+    .expect("Should resolve ca-certificates via arch:all");
+    let ca_certs = resolution
+        .packages
+        .iter()
+        .find(|r| r.package.name == "ca-certificates")
+        .unwrap();
+    assert_eq!(ca_certs.package.architecture, Some(Architecture::All));
 }
 
 #[test]
 fn test_resolver_nonexistent_package() {
-    let pkg_index = load_fixture();
-    let index = make_index_set(pkg_index);
-
-    let result = index
-        .resolve_all("this-package-does-not-exist", None, Architecture::Amd64)
-        .execute();
-    assert!(result.is_err(), "Should fail for nonexistent package");
+    assert!(matches!(
+        resolve_fixture(Request::new("this-package-does-not-exist")),
+        Err(ResolveError::NotFound { .. })
+    ));
 }
 
 #[test]

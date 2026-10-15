@@ -114,6 +114,16 @@ impl FromStr for DependencySpec {
     }
 }
 
+impl std::fmt::Display for DependencySpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.name)?;
+        if let Some(version) = &self.version {
+            write!(f, " ({version})")?;
+        }
+        Ok(())
+    }
+}
+
 /// A package dependency, either required or one of several alternatives.
 ///
 /// Examples:
@@ -125,12 +135,19 @@ pub enum PackageDependency {
     Required(DependencySpec),
 }
 
-impl PackageDependency {
-    pub fn resolve(&self) -> Option<&DependencySpec> {
+impl std::fmt::Display for PackageDependency {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            // NOTE(juliana): let's just pick the first one.
-            PackageDependency::Alternate(specs) => specs.first(),
-            PackageDependency::Required(spec) => Some(spec),
+            PackageDependency::Required(spec) => write!(f, "{spec}"),
+            PackageDependency::Alternate(specs) => {
+                for (i, spec) in specs.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(" | ")?;
+                    }
+                    write!(f, "{spec}")?;
+                }
+                Ok(())
+            }
         }
     }
 }

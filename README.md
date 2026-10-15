@@ -189,11 +189,13 @@ What does **not** hold yet:
   repository signatures     InRelease is not verified. The checksums in the
                             lock are only as trustworthy as the mirror you
                             locked against. Use https mirrors.
-  dpkg-exact resolution     version ordering, Provides and conflicting
-                            constraints differ from apt at the edges.
+  complete resolution       the resolver is greedy, with restarts. It picks
+                            what apt picks for the packages in
+                            scripts/apt-oracle.sh, but contrived conflicts
+                            can fail where a full search would succeed.
 ```
 
-Both are the next things to fix. See [`docs/next.md`](docs/next.md).
+See [`docs/next.md`](docs/next.md) for what's next.
 
 ## INSPECT
 
@@ -209,6 +211,8 @@ $ cargo test                    # unit + offline integration tests
 $ cargo test -- --ignored       # network tests: real mirrors, real builds,
                                 #   including build-twice-and-compare
 $ cargo clippy --all-targets
+$ scripts/apt-oracle.sh         # compare resolution with apt (needs podman)
+$ scripts/dpkg-oracle.sh        # regenerate dpkg's version-order test data
 ```
 
 ```

@@ -19,9 +19,11 @@ pub use dependency::{
 };
 pub use package::{DebianPackage, ParseDebianPackageError};
 pub use package_index::{PackageIndex, ParsePackageIndexError, VirtualPackageProvider};
-pub use package_index_set::{PackageIndexSet, SourcedPackage};
+pub use package_index_set::{PackageIndexSet, SourcedPackage, SourcedProvider};
 pub use priority::Priority;
 pub use provides::ProvidesEntry;
 pub use repository::{DebianRepository, DebianRepositoryError};
-pub use resolver::{ResolveBuilder, ResolveError, ResolveResult, ResolvedEntry, UnmetDependency};
+pub use resolver::{
+    Origin, Request, Requirement, Resolution, ResolveError, Resolved, UnmetDependency, resolve,
+};
 pub use version::{DebianVersion, ParseDebianVersionError};

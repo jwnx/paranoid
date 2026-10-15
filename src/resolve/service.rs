@@ -1,6 +1,6 @@
 //! Resolution service implementation.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use thiserror::Error;
 
@@ -10,7 +10,7 @@ use crate::hash::{ParseSha256Error, Sha256};
 use crate::http::{Client, ClientError};
 use crate::repository::debian::{
     DebianPackage, DebianRepository, DebianRepositoryError, DebianVersion, PackageIndexSet,
-    ResolveError,
+    Request, ResolveError, UnmetDependency, resolve,
 };
 use crate::version::VersionConstraint;
 
@@ -93,10 +93,10 @@ impl ResolvedPackage {
 pub struct ResolvedManifest {
     /// All resolved packages (including transitive dependencies).
     pub packages: Vec<ResolvedPackage>,
-    /// Packages that could not be resolved.
-    pub unmet: Vec<String>,
-    /// Merged dependency graph: parent name → sorted list of child names.
-    pub graph: std::collections::HashMap<String, Vec<String>>,
+    /// Dependencies nothing in the repositories satisfies.
+    pub unmet: Vec<UnmetDependency>,
+    /// Dependency graph: parent name → sorted list of child names.
+    pub graph: BTreeMap<String, Vec<String>>,
 }
 
 /// Service for resolving packages from a manifest.
@@ -136,77 +136,36 @@ impl ResolveService {
             index_set.add_index(repo_name.clone(), index);
         }
 
-        // Resolve each requested package
-        let mut all_packages: HashMap<String, ResolvedPackage> = HashMap::new();
-        let mut all_unmet: Vec<String> = Vec::new();
-        let mut all_graph: HashMap<String, Vec<String>> = HashMap::new();
-
-        for pkg_spec in &manifest.packages {
-            let version_constraint = pkg_spec
-                .version
-                .as_deref()
-                .map(|v| {
-                    v.parse::<VersionConstraint<DebianVersion>>()
+        let requests = manifest
+            .packages
+            .iter()
+            .map(|spec| {
+                let mut request = Request::new(&spec.name);
+                request.repository = spec.repository.clone();
+                if let Some(version) = &spec.version {
+                    let constraint = version
+                        .parse::<VersionConstraint<DebianVersion>>()
                         .map_err(|source| ResolveServiceError::InvalidVersionConstraint {
-                            package: pkg_spec.name.clone(),
+                            package: spec.name.clone(),
                             source,
-                        })
-                })
-                .transpose()?;
-
-            let result = index_set
-                .resolve_all(&pkg_spec.name, version_constraint.as_ref(), arch)
-                .execute()?;
-
-            // Use repository override if specified, otherwise use resolved repo
-            let root_repo = pkg_spec
-                .repository
-                .clone()
-                .unwrap_or_else(|| result.root.repository.clone());
-
-            all_packages.insert(
-                result.root.package.name.clone(),
-                ResolvedPackage::from_debian_package(&result.root.package, root_repo, true)?,
-            );
-
-            // Add dependencies (repository comes directly from resolution)
-            for dep in &result.dependencies {
-                if !all_packages.contains_key(&dep.package.name) {
-                    all_packages.insert(
-                        dep.package.name.clone(),
-                        ResolvedPackage::from_debian_package(&dep.package, &dep.repository, false)?,
-                    );
+                        })?;
+                    request = request.version(constraint);
                 }
-            }
+                Ok(request)
+            })
+            .collect::<Result<Vec<_>, ResolveServiceError>>()?;
 
-            // Merge dependency graph (union of all per-root graphs)
-            for (parent, mut children) in result.graph {
-                let entry = all_graph.entry(parent).or_default();
-                for child in children.drain(..) {
-                    if !entry.contains(&child) {
-                        entry.push(child);
-                    }
-                }
-            }
-
-            // Track unmet dependencies
-            for unmet in result.unmet {
-                all_unmet.push(format!(
-                    "{} (required by {})",
-                    unmet.name, unmet.required_by
-                ));
-            }
-        }
-
-        // Sort children in each adjacency list for determinism
-        for children in all_graph.values_mut() {
-            children.sort();
-        }
+        let resolution = resolve(&index_set, &requests, arch)?;
+        let packages = resolution
+            .packages
+            .iter()
+            .map(|r| ResolvedPackage::from_debian_package(r.package, r.repository, r.direct))
+            .collect::<Result<_, _>>()?;
 
         Ok(ResolvedManifest {
-            packages: all_packages.into_values().collect(),
-            unmet: all_unmet,
-            graph: all_graph,
+            packages,
+            unmet: resolution.unmet,
+            graph: resolution.graph,
         })
     }
 }
@@ -214,61 +173,10 @@ impl ResolveService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repository::debian::PackageIndex;
 
     #[test]
     fn test_resolve_service_creation() {
         let _service = ResolveService::new().expect("Should create service");
-    }
-
-    /// Helper: build a PackageIndexSet with a single package at a given version.
-    fn make_index_set_with(name: &str, version: &str, arch: &str) -> PackageIndexSet {
-        use crate::repository::debian::test_utils::make_package;
-
-        let mut index = PackageIndex::new();
-        index.add(make_package(name, version, arch));
-        let mut set = PackageIndexSet::new();
-        set.add_index("test-repo".to_string(), index);
-        set
-    }
-
-    #[test]
-    fn test_version_constraint_exact_match_accepted() {
-        use crate::arch::Architecture;
-
-        let set = make_index_set_with("bash", "5.2.15-2", "amd64");
-        let constraint: VersionConstraint<DebianVersion> = "= 5.2.15-2".parse().unwrap();
-        let result = set
-            .resolve_all("bash", Some(&constraint), Architecture::Amd64)
-            .execute();
-        assert!(result.is_ok(), "exact version should resolve");
-        assert_eq!(result.unwrap().root.package.name, "bash");
-    }
-
-    #[test]
-    fn test_version_constraint_too_new_rejected() {
-        use crate::arch::Architecture;
-
-        let set = make_index_set_with("bash", "5.2.15-2", "amd64");
-        // Require a version newer than what's available
-        let constraint: VersionConstraint<DebianVersion> = ">> 5.2.15-2".parse().unwrap();
-        let result = set
-            .resolve_all("bash", Some(&constraint), Architecture::Amd64)
-            .execute();
-        // Should fail: no package satisfies >> 5.2.15-2
-        assert!(result.is_err(), "newer-than constraint should fail");
-    }
-
-    #[test]
-    fn test_version_constraint_gte_accepted() {
-        use crate::arch::Architecture;
-
-        let set = make_index_set_with("bash", "5.2.15-2", "amd64");
-        let constraint: VersionConstraint<DebianVersion> = ">= 5.0".parse().unwrap();
-        let result = set
-            .resolve_all("bash", Some(&constraint), Architecture::Amd64)
-            .execute();
-        assert!(result.is_ok(), ">= older version should resolve");
     }
 
     #[test]

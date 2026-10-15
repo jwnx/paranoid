@@ -1,271 +1,572 @@
-//! Debian dependency resolver.
+//! Debian dependency resolution.
 //!
-//! Resolves package dependencies using a stack-based algorithm to handle
-//! circular dependencies and alternatives.
+//! [`resolve`] takes every package a manifest asks for and picks one version
+//! of each, plus everything they need, such that:
 //!
-//! # Example
+//! - every `Pre-Depends` and `Depends` relation is satisfied by a selected
+//!   package, by name or through `Provides`;
+//! - each package is selected at most once;
+//! - no selected package `Conflicts` with or `Breaks` another.
 //!
-//! ```ignore
-//! use paranoid::repository::debian::{PackageIndexSet, Architecture};
+//! Choices follow apt where it matters: a relation already satisfied by the
+//! selection adds nothing, a real package beats a virtual one, and higher
+//! versions beat lower ones. Alternatives (`a | b`) are tried in order.
+//! Remaining ties are broken by priority, then name, then repository order,
+//! so the same indexes always give the same answer.
 //!
-//! let index: PackageIndexSet = /* ... */;
-//!
-//! // Simple resolution
-//! let result = index.resolve_all("bash", None, Architecture::Amd64).execute()?;
-//!
-//! // With options
-//! let result = index
-//!     .resolve_all("bash", None, Architecture::Amd64)
-//!     .with_recommends(true)
-//!     .execute()?;
-//!
-//! // Access results with provenance
-//! println!("Root: {} from {}", result.root.package.name, result.root.repository);
-//! ```
+//! The search is greedy, with one kind of backtracking. When a relation needs
+//! a different version of a package than the one already chosen, the
+//! resolver remembers every requirement on that package and starts over,
+//! choosing it with all of them applied. The result is always consistent,
+//! but in contrived cases this can report a conflict that a full search
+//! would get around, or settle for a lower version than necessary.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::fmt;
 
 use thiserror::Error;
 
 use super::architecture::Architecture;
+use super::dependency::{DependencySpec, PackageDependency};
 use super::package::DebianPackage;
-use super::package_index_set::PackageIndexSet;
+use super::package_index_set::{PackageIndexSet, SourcedPackage};
 use super::version::DebianVersion;
-use crate::repository::Package;
 use crate::version::VersionConstraint;
 
-/// Errors that can occur during dependency resolution.
-#[derive(Debug, Error)]
-pub enum ResolveError {
-    /// The requested package was not found in the index.
-    #[error("package not found: {name}{} for architecture {architecture:?}", version_constraint.as_ref().map(|c| format!(" ({:?})", c)).unwrap_or_default())]
-    PackageNotFound {
-        name: String,
-        version_constraint: Option<VersionConstraint<DebianVersion>>,
-        architecture: Architecture,
-    },
-}
-
-/// A resolved package with its source repository (owned).
-///
-/// This is the owned version of [`super::index_set::SourcedPackage`],
-/// used in resolution results where we need to own the data.
-#[derive(Debug, Clone)]
-pub struct ResolvedEntry {
-    pub package: DebianPackage,
-    pub repository: String,
-}
-
-/// Dependency graph: maps each package name to the names of its direct dependencies.
-///
-/// Only packages that appear as parents (i.e. have at least one resolved child)
-/// are present as keys. The root package is always a key if it has any deps.
-pub type DepGraph = HashMap<String, Vec<String>>;
-
-/// Result of resolving a package and its dependencies.
-#[derive(Debug)]
-pub struct ResolveResult {
-    /// The requested root package with its source repository.
-    pub root: ResolvedEntry,
-    /// All transitive dependencies (not including root) with their repositories.
-    pub dependencies: Vec<ResolvedEntry>,
-    /// Dependencies that could not be resolved.
-    pub unmet: Vec<UnmetDependency>,
-    /// Adjacency map: parent package name → list of direct dependency names.
-    ///
-    /// Used to reconstruct the dependency tree for display.
-    pub graph: DepGraph,
-}
-
-/// A dependency that could not be satisfied.
-#[derive(Debug, Clone)]
-pub struct UnmetDependency {
-    /// Package that requires this dependency.
-    pub required_by: String,
-    /// Name of the unmet dependency.
+/// A package the manifest asks for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Request {
     pub name: String,
-    /// Version constraint (if any).
-    pub version_constraint: Option<VersionConstraint<DebianVersion>>,
+    pub version: Option<VersionConstraint<DebianVersion>>,
+    /// Only take the package from this repository.
+    pub repository: Option<String>,
 }
 
-/// Builder for configuring and executing dependency resolution.
-///
-/// Created via [`PackageIndexSet::resolve_all`].
-#[must_use = "ResolveBuilder does nothing until .execute() is called"]
-pub struct ResolveBuilder<'a> {
-    index: &'a PackageIndexSet,
-    name: String,
-    version_constraint: Option<VersionConstraint<DebianVersion>>,
-    arch: Architecture,
-    include_recommends: bool,
-}
-
-impl<'a> ResolveBuilder<'a> {
-    /// Create a new resolve builder.
-    ///
-    /// This is typically called via [`PackageIndexSet::resolve_all`] rather than directly.
-    pub fn new(
-        index: &'a PackageIndexSet,
-        name: &str,
-        version_constraint: Option<&VersionConstraint<DebianVersion>>,
-        arch: Architecture,
-    ) -> Self {
+impl Request {
+    pub fn new(name: impl Into<String>) -> Self {
         Self {
-            index,
-            name: name.to_string(),
-            version_constraint: version_constraint.cloned(),
-            arch,
-            include_recommends: false,
+            name: name.into(),
+            version: None,
+            repository: None,
         }
     }
 
-    /// Include Recommends as dependencies.
-    ///
-    /// By default, only Depends and Pre-Depends are resolved.
-    /// Setting this to `true` will also resolve Recommends.
-    pub fn with_recommends(mut self, include: bool) -> Self {
-        self.include_recommends = include;
+    pub fn version(mut self, version: VersionConstraint<DebianVersion>) -> Self {
+        self.version = Some(version);
         self
     }
 
-    /// Execute the resolution and return the result.
-    ///
-    /// This resolves the root package and all its transitive dependencies
-    /// using a stack-based algorithm to handle circular dependencies.
-    pub fn execute(self) -> Result<ResolveResult, ResolveError> {
-        let root = self
-            .index
-            .resolve(&self.name, self.version_constraint.as_ref(), self.arch)
-            .ok_or_else(|| ResolveError::PackageNotFound {
-                name: self.name.clone(),
-                version_constraint: self.version_constraint.clone(),
-                architecture: self.arch,
-            })?;
+    pub fn repository(mut self, repository: impl Into<String>) -> Self {
+        self.repository = Some(repository.into());
+        self
+    }
 
-        let root = ResolvedEntry {
-            package: root.package.clone(),
-            repository: root.repository.to_string(),
+    fn spec(&self) -> DependencySpec {
+        DependencySpec {
+            name: self.name.clone(),
+            version: self.version.clone(),
+        }
+    }
+}
+
+impl fmt::Display for Request {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.spec())?;
+        if let Some(repository) = &self.repository {
+            write!(f, " from repository '{repository}'")?;
+        }
+        Ok(())
+    }
+}
+
+/// Who asked for a package: the manifest, or another package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Origin {
+    Manifest,
+    Package(String),
+}
+
+impl fmt::Display for Origin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Origin::Manifest => f.write_str("the manifest"),
+            Origin::Package(name) => f.write_str(name),
+        }
+    }
+}
+
+/// A requirement on a package's version, and who made it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Requirement {
+    pub version: Option<VersionConstraint<DebianVersion>>,
+    pub required_by: Origin,
+}
+
+impl Requirement {
+    fn allows(&self, version: &DebianVersion) -> bool {
+        self.version
+            .as_ref()
+            .is_none_or(|c| c.is_satisfied_by(version))
+    }
+}
+
+impl fmt::Display for Requirement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.version {
+            Some(constraint) => write!(f, "({constraint})")?,
+            None => f.write_str("any version")?,
+        }
+        write!(f, " from {}", self.required_by)
+    }
+}
+
+/// A dependency nothing in the indexes satisfies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnmetDependency {
+    pub required_by: String,
+    pub dependency: PackageDependency,
+}
+
+impl fmt::Display for UnmetDependency {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} (required by {})", self.dependency, self.required_by)
+    }
+}
+
+/// Errors that can occur during dependency resolution.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ResolveError {
+    #[error("no package matches '{request}' for {arch}")]
+    NotFound {
+        request: Box<Request>,
+        arch: Architecture,
+    },
+
+    #[error(
+        "'{name}' is a virtual package provided by {}; ask for one of them by name",
+        providers.join(", ")
+    )]
+    AmbiguousVirtual {
+        name: String,
+        providers: Vec<String>,
+    },
+
+    #[error(
+        "no version of '{name}' satisfies every requirement: {}",
+        requirements.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+    )]
+    Conflict {
+        name: String,
+        requirements: Vec<Requirement>,
+    },
+
+    #[error("'{package}' {field} '{relation}', but '{other}' is also needed")]
+    Conflicts {
+        package: String,
+        field: &'static str,
+        relation: Box<DependencySpec>,
+        other: String,
+    },
+}
+
+/// A selected package.
+#[derive(Debug, Clone, Copy)]
+pub struct Resolved<'a> {
+    pub package: &'a DebianPackage,
+    pub repository: &'a str,
+    /// Asked for by the manifest, rather than pulled in by another package.
+    pub direct: bool,
+}
+
+/// The outcome of [`resolve`].
+#[derive(Debug)]
+pub struct Resolution<'a> {
+    /// Every selected package, sorted by name.
+    pub packages: Vec<Resolved<'a>>,
+    /// Each selected package's dependencies, as the sorted names of the
+    /// selected packages that satisfy them.
+    pub graph: BTreeMap<String, Vec<String>>,
+    /// Dependencies of selected packages that nothing satisfies.
+    pub unmet: Vec<UnmetDependency>,
+}
+
+/// Resolve `requests`, and everything they depend on, for `arch`.
+///
+/// Fails if a request matches no package, if requirements on a package
+/// can't all be met, or if selected packages conflict. A dependency that
+/// matches nothing at all is reported in [`Resolution::unmet`].
+pub fn resolve<'a>(
+    index: &'a PackageIndexSet,
+    requests: &[Request],
+    arch: Architecture,
+) -> Result<Resolution<'a>, ResolveError> {
+    let pins: HashMap<&str, &str> = requests
+        .iter()
+        .filter_map(|r| Some((r.name.as_str(), r.repository.as_deref()?)))
+        .collect();
+    let mut learned: HashMap<String, Vec<Requirement>> = HashMap::new();
+
+    loop {
+        let mut pass = Pass {
+            index,
+            arch,
+            pins: &pins,
+            learned: &learned,
+            selected: BTreeMap::new(),
+            provided: HashMap::new(),
+            requirements: HashMap::new(),
+            graph: BTreeMap::new(),
+            unmet: Vec::new(),
         };
-
-        let mut resolved: HashMap<String, ResolvedEntry> = HashMap::new();
-        let mut unmet: Vec<UnmetDependency> = Vec::new();
-        let mut already_processed: HashSet<String> = HashSet::new();
-        let mut graph: DepGraph = HashMap::new();
-
-        // Stack of (dependency, required_by)
-        let mut stack: Vec<(PendingDependency, String)> = Vec::new();
-
-        // Add root's dependencies to the stack
-        self.push_dependencies(&mut stack, &root.package, &root.package.name);
-
-        already_processed.insert(package_key(
-            &root.package.name,
-            &root.package.version.to_string(),
-        ));
-
-        while let Some((dep, required_by)) = stack.pop() {
-            // Try to resolve this dependency
-            let src = self
-                .index
-                .resolve(&dep.name, dep.version.as_ref(), self.arch);
-
-            match src {
-                Some(src) => {
-                    let resolved_name = src.package.name.clone();
-                    let key = package_key(&resolved_name, &src.package.version.to_string());
-
-                    // Record the edge in the graph regardless of whether we've
-                    // already visited this package (we still want to show the edge).
-                    graph
-                        .entry(required_by.clone())
-                        .or_default()
-                        .push(resolved_name.clone());
-
-                    // Circular dependency (or duplicate) check — don't traverse again
-                    if already_processed.contains(&key) {
-                        continue;
-                    }
-
-                    already_processed.insert(key);
-
-                    // Add this package's dependencies to the stack
-                    self.push_dependencies(&mut stack, src.package, &resolved_name);
-
-                    // Add to resolved list (skip if same as root)
-                    if src.package.name != root.package.name
-                        || src.package.version != root.package.version
-                    {
-                        resolved.insert(
-                            resolved_name,
-                            ResolvedEntry {
-                                package: src.package.clone(),
-                                repository: src.repository.to_string(),
-                            },
-                        );
+        match pass.run(requests)? {
+            Outcome::Done => {
+                let resolution = pass.finish();
+                check_conflicts(&resolution)?;
+                return Ok(resolution);
+            }
+            Outcome::Retry { name, requirements } => {
+                let known = learned.entry(name.clone()).or_default();
+                let before = known.len();
+                for requirement in requirements {
+                    if !known.contains(&requirement) {
+                        known.push(requirement);
                     }
                 }
-                None => {
-                    // Could not resolve dependency
-                    unmet.push(UnmetDependency {
-                        required_by,
-                        name: dep.name,
-                        version_constraint: dep.version,
+                // Each retry must learn something, or we'd loop forever.
+                if known.len() == before {
+                    return Err(ResolveError::Conflict {
+                        name,
+                        requirements: known.clone(),
                     });
                 }
             }
         }
-
-        Ok(ResolveResult {
-            root,
-            dependencies: resolved.into_values().collect(),
-            unmet,
-            graph,
-        })
     }
+}
 
-    /// Push a package's dependencies onto the stack.
-    fn push_dependencies(
-        &self,
-        stack: &mut Vec<(PendingDependency, String)>,
-        pkg: &DebianPackage,
-        required_by: &str,
-    ) {
-        // Always include Depends and Pre-Depends
-        for dep in pkg.dependencies() {
-            stack.push((
-                PendingDependency {
-                    name: dep.name.clone(),
-                    version: dep.version.clone(),
+enum Outcome {
+    Done,
+    /// Start over, choosing `name` with these requirements applied.
+    Retry {
+        name: String,
+        requirements: Vec<Requirement>,
+    },
+}
+
+/// What [`Pass::choose`] found for one alternative.
+enum Choice<'a> {
+    Package(SourcedPackage<'a>),
+    /// A different version of this package is already selected.
+    Conflict(Vec<Requirement>),
+    Nothing,
+}
+
+/// One greedy pass over the requests and their dependencies.
+struct Pass<'a, 'p> {
+    index: &'a PackageIndexSet,
+    arch: Architecture,
+    /// Package name → the only repository it may come from.
+    pins: &'p HashMap<&'p str, &'p str>,
+    /// Requirements remembered from earlier passes, by package name.
+    learned: &'p HashMap<String, Vec<Requirement>>,
+
+    selected: BTreeMap<&'a str, Resolved<'a>>,
+    /// Virtual name → selected packages providing it, and what version.
+    provided: HashMap<&'a str, Vec<(&'a str, Option<&'a DebianVersion>)>>,
+    /// Requirements met so far in this pass, by package name.
+    requirements: HashMap<String, Vec<Requirement>>,
+    graph: BTreeMap<String, BTreeSet<String>>,
+    unmet: Vec<UnmetDependency>,
+}
+
+impl<'a> Pass<'a, '_> {
+    fn run(&mut self, requests: &[Request]) -> Result<Outcome, ResolveError> {
+        // Breadth-first, so everything the manifest asks for is chosen
+        // before any dependency gets a say.
+        let mut queue: VecDeque<(Origin, PackageDependency)> = requests
+            .iter()
+            .map(|r| (Origin::Manifest, PackageDependency::Required(r.spec())))
+            .collect();
+
+        while let Some((origin, dependency)) = queue.pop_front() {
+            let alternatives = match &dependency {
+                PackageDependency::Required(spec) => std::slice::from_ref(spec),
+                PackageDependency::Alternate(specs) => specs.as_slice(),
+            };
+
+            if let Some((spec, name)) = alternatives
+                .iter()
+                .find_map(|spec| Some((spec, self.satisfied_by(spec)?)))
+            {
+                self.note(spec, name, &origin);
+                continue;
+            }
+
+            let mut conflict = None;
+            let mut chosen = None;
+            for spec in alternatives {
+                match self.choose(spec, &origin)? {
+                    Choice::Package(package) => {
+                        chosen = Some((spec, package));
+                        break;
+                    }
+                    Choice::Conflict(requirements) => {
+                        conflict.get_or_insert((spec.name.clone(), requirements));
+                    }
+                    Choice::Nothing => {}
+                }
+            }
+
+            match (chosen, conflict) {
+                (Some((spec, package)), _) => {
+                    self.select(package, spec, &origin);
+                    let by = Origin::Package(package.package.name.clone());
+                    queue.extend(
+                        package
+                            .package
+                            .dependencies()
+                            .map(|d| (by.clone(), d.clone())),
+                    );
+                }
+                (None, Some((name, requirements))) => return self.retry(name, requirements),
+                (None, None) => match origin {
+                    Origin::Manifest => {
+                        let request = requests
+                            .iter()
+                            .find(|r| r.spec() == alternatives[0])
+                            .expect("manifest dependencies come from requests");
+                        return Err(ResolveError::NotFound {
+                            request: Box::new(request.clone()),
+                            arch: self.arch,
+                        });
+                    }
+                    Origin::Package(required_by) => self.unmet.push(UnmetDependency {
+                        required_by,
+                        dependency,
+                    }),
                 },
-                required_by.to_string(),
-            ));
+            }
         }
 
-        // Optionally include Recommends
-        if self.include_recommends {
-            for dep in pkg.recommends() {
-                stack.push((
-                    PendingDependency {
-                        name: dep.name.clone(),
-                        version: dep.version.clone(),
-                    },
-                    required_by.to_string(),
-                ));
+        Ok(Outcome::Done)
+    }
+
+    /// The name of a selected package that satisfies `spec`, if any.
+    fn satisfied_by(&self, spec: &DependencySpec) -> Option<&'a str> {
+        if let Some(selected) = self.selected.get(spec.name.as_str())
+            && satisfies(spec, &selected.package.version)
+        {
+            return Some(selected.package.name.as_str());
+        }
+        self.provided
+            .get(spec.name.as_str())?
+            .iter()
+            .find(|(_, version)| provides(spec, *version))
+            .map(|(provider, _)| *provider)
+    }
+
+    /// Pick a package to satisfy `spec`, given that nothing selected does.
+    fn choose(&self, spec: &DependencySpec, origin: &Origin) -> Result<Choice<'a>, ResolveError> {
+        // A package by this name is selected, but the wrong version.
+        if self.selected.contains_key(spec.name.as_str()) {
+            let mut requirements = self.requirements_on(&spec.name);
+            requirements.push(requirement(spec, origin));
+            return Ok(Choice::Conflict(requirements));
+        }
+
+        if let Some(package) = self.best_package(&spec.name, &[requirement(spec, origin)]) {
+            return Ok(Choice::Package(package));
+        }
+
+        // Providers, best first. One already selected would have satisfied
+        // `spec`, so a selected provider name here is a different version.
+        let mut providers: Vec<SourcedPackage<'a>> = self
+            .index
+            .providers(&spec.name, self.arch)
+            .filter(|p| provides(spec, p.provided_version))
+            .map(|p| p.provider)
+            .filter(|p| !self.selected.contains_key(p.package.name.as_str()))
+            .filter(|p| self.allowed(&spec.name, p) && self.allowed(&p.package.name, p))
+            .collect();
+        providers.sort_by(|a, b| {
+            let (a, b) = (a.package, b.package);
+            (b.priority.cmp(&a.priority))
+                .then_with(|| a.name.cmp(&b.name))
+                .then_with(|| b.version.cmp(&a.version))
+        });
+
+        // apt refuses to guess which provider the user meant.
+        if *origin == Origin::Manifest {
+            let names: BTreeSet<&str> = providers.iter().map(|p| p.package.name.as_str()).collect();
+            let has_real = self.index.packages(&spec.name, self.arch).next().is_some();
+            if names.len() > 1 && !has_real {
+                return Err(ResolveError::AmbiguousVirtual {
+                    name: spec.name.clone(),
+                    providers: names.into_iter().map(String::from).collect(),
+                });
+            }
+        }
+
+        Ok(providers
+            .into_iter()
+            .next()
+            .map_or(Choice::Nothing, Choice::Package))
+    }
+
+    /// The highest version of `name` that meets `requirements`, everything
+    /// learned about `name`, and its pin. Ties go to the earliest repository.
+    fn best_package(&self, name: &str, requirements: &[Requirement]) -> Option<SourcedPackage<'a>> {
+        let learned = self.learned.get(name).map_or(&[][..], Vec::as_slice);
+        let mut best: Option<SourcedPackage<'a>> = None;
+        for candidate in self.index.packages(name, self.arch) {
+            let version = &candidate.package.version;
+            if requirements
+                .iter()
+                .chain(learned)
+                .all(|r| r.allows(version))
+                && self.allowed(name, &candidate)
+                && best.is_none_or(|b| *version > b.package.version)
+            {
+                best = Some(candidate);
+            }
+        }
+        best
+    }
+
+    /// Whether `name`'s pin, if any, lets `candidate` be used for it.
+    fn allowed(&self, name: &str, candidate: &SourcedPackage<'_>) -> bool {
+        self.pins
+            .get(name)
+            .is_none_or(|repository| *repository == candidate.repository)
+    }
+
+    fn select(&mut self, package: SourcedPackage<'a>, spec: &DependencySpec, origin: &Origin) {
+        let name = package.package.name.as_str();
+        self.selected.insert(
+            name,
+            Resolved {
+                package: package.package,
+                repository: package.repository,
+                direct: false,
+            },
+        );
+        for provide in &package.package.provides {
+            self.provided
+                .entry(provide.name.as_str())
+                .or_default()
+                .push((name, provide.version.as_ref()));
+        }
+        self.note(spec, name, origin);
+    }
+
+    /// Record that `name`, already selected, satisfies `spec` for `origin`.
+    fn note(&mut self, spec: &DependencySpec, name: &str, origin: &Origin) {
+        if spec.name == name {
+            self.requirements
+                .entry(spec.name.clone())
+                .or_default()
+                .push(requirement(spec, origin));
+        }
+        match origin {
+            Origin::Manifest => {
+                if let Some(selected) = self.selected.get_mut(name) {
+                    selected.direct = true;
+                }
+            }
+            Origin::Package(parent) if parent != name => {
+                self.graph
+                    .entry(parent.clone())
+                    .or_default()
+                    .insert(name.to_string());
+            }
+            Origin::Package(_) => {}
+        }
+    }
+
+    fn requirements_on(&self, name: &str) -> Vec<Requirement> {
+        let learned = self.learned.get(name).into_iter().flatten();
+        let seen = self.requirements.get(name).into_iter().flatten();
+        let mut all: Vec<Requirement> = Vec::new();
+        for requirement in learned.chain(seen) {
+            if !all.contains(requirement) {
+                all.push(requirement.clone());
+            }
+        }
+        all
+    }
+
+    /// Start over with `requirements` on `name`, if some version meets them
+    /// all; otherwise this is a real conflict.
+    fn retry(&self, name: String, requirements: Vec<Requirement>) -> Result<Outcome, ResolveError> {
+        if self.best_package(&name, &requirements).is_some() {
+            Ok(Outcome::Retry { name, requirements })
+        } else {
+            Err(ResolveError::Conflict { name, requirements })
+        }
+    }
+
+    fn finish(self) -> Resolution<'a> {
+        Resolution {
+            packages: self.selected.into_values().collect(),
+            graph: self
+                .graph
+                .into_iter()
+                .map(|(parent, children)| (parent, children.into_iter().collect()))
+                .collect(),
+            unmet: self.unmet,
+        }
+    }
+}
+
+fn requirement(spec: &DependencySpec, origin: &Origin) -> Requirement {
+    Requirement {
+        version: spec.version.clone(),
+        required_by: origin.clone(),
+    }
+}
+
+/// Whether a real package at `version` satisfies `spec`.
+fn satisfies(spec: &DependencySpec, version: &DebianVersion) -> bool {
+    spec.version
+        .as_ref()
+        .is_none_or(|c| c.is_satisfied_by(version))
+}
+
+/// Whether providing `spec.name` at `provided` satisfies `spec`. Policy
+/// says an unversioned `Provides` never satisfies a versioned relation.
+fn provides(spec: &DependencySpec, provided: Option<&DebianVersion>) -> bool {
+    match (&spec.version, provided) {
+        (None, _) => true,
+        (Some(constraint), Some(version)) => constraint.is_satisfied_by(version),
+        (Some(_), None) => false,
+    }
+}
+
+/// Fail if a selected package `Conflicts` with or `Breaks` another one,
+/// either by name or through what it provides. A package may conflict with
+/// something it provides itself.
+fn check_conflicts(resolution: &Resolution<'_>) -> Result<(), ResolveError> {
+    for this in &resolution.packages {
+        for (field, relation) in this.package.conflicts() {
+            let other = resolution.packages.iter().find(|other| {
+                let other = other.package;
+                other.name != this.package.name
+                    && ((other.name == relation.name && satisfies(relation, &other.version))
+                        || other.provides.iter().any(|p| {
+                            p.name == relation.name && provides(relation, p.version.as_ref())
+                        }))
+            });
+            if let Some(other) = other {
+                return Err(ResolveError::Conflicts {
+                    package: this.package.name.clone(),
+                    field,
+                    relation: Box::new(relation.clone()),
+                    other: other.package.name.clone(),
+                });
             }
         }
     }
-}
-
-/// A dependency waiting to be resolved.
-#[derive(Debug, Clone)]
-struct PendingDependency {
-    name: String,
-    version: Option<VersionConstraint<DebianVersion>>,
-}
-
-/// Create a unique key for a package (name + version).
-fn package_key(name: &str, version: &str) -> String {
-    format!("{}={}", name, version)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -273,397 +574,467 @@ mod tests {
     use std::str::FromStr;
 
     use super::super::package_index::PackageIndex;
-    use super::super::test_utils::{make_package, make_package_with_deps, provides};
     use super::*;
 
-    /// Helper to create an PackageIndexSet from a single PackageIndex.
-    fn make_index_set(pkg_index: PackageIndex) -> PackageIndexSet {
+    /// An index from `Packages`-style stanzas. `Architecture` defaults to
+    /// amd64 and `Filename` is filled in.
+    fn index(stanzas: &str) -> PackageIndex {
+        let mut text = String::new();
+        for stanza in stanzas
+            .split("\n\n")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let stanza: String = stanza.lines().map(|l| format!("{}\n", l.trim())).collect();
+            text.push_str(&stanza);
+            if !stanza.contains("Architecture:") {
+                text.push_str("Architecture: amd64\n");
+            }
+            text.push_str("Filename: pool/x.deb\n\n");
+        }
+        PackageIndex::from_str(&text).unwrap()
+    }
+
+    fn repos(repos: &[(&str, &str)]) -> PackageIndexSet {
         let mut set = PackageIndexSet::new();
-        set.add_index("test".to_string(), pkg_index);
+        for (name, stanzas) in repos {
+            set.add_index(name.to_string(), index(stanzas));
+        }
         set
     }
 
-    #[test]
-    fn test_version_constraint_parsing() {
-        let constraint = VersionConstraint::try_parse(">= 2.17").unwrap();
-        assert!(constraint.is_satisfied_by(&DebianVersion::from_str("2.36").unwrap()));
-        assert!(constraint.is_satisfied_by(&DebianVersion::from_str("2.17").unwrap()));
-        assert!(!constraint.is_satisfied_by(&DebianVersion::from_str("2.16").unwrap()));
-
-        let constraint = VersionConstraint::try_parse("<< 2.0").unwrap();
-        assert!(constraint.is_satisfied_by(&DebianVersion::from_str("1.0").unwrap()));
-        assert!(!constraint.is_satisfied_by(&DebianVersion::from_str("2.0").unwrap()));
-
-        let constraint = VersionConstraint::try_parse("= 1.0").unwrap();
-        assert!(constraint.is_satisfied_by(&DebianVersion::from_str("1.0").unwrap()));
-        assert!(!constraint.is_satisfied_by(&DebianVersion::from_str("1.1").unwrap()));
-    }
-
-    #[test]
-    fn test_resolve_simple_package() {
-        let mut pkg_index = PackageIndex::new();
-        pkg_index.add(make_package("libc6", "2.36-9", "amd64"));
-        let index = make_index_set(pkg_index);
-
-        let pkg = index.resolve("libc6", None, Architecture::Amd64);
-
-        assert!(pkg.is_some());
-        let pkg = pkg.unwrap();
-        assert_eq!(pkg.package.name, "libc6");
-        assert_eq!(pkg.repository, "test");
-    }
-
-    #[test]
-    fn test_resolve_with_version_constraint() {
-        let mut pkg_index = PackageIndex::new();
-        pkg_index.add(make_package("libc6", "2.35-1", "amd64"));
-        pkg_index.add(make_package("libc6", "2.36-9", "amd64"));
-        let index = make_index_set(pkg_index);
-
-        // Should find 2.36-9 (satisfies >= 2.36)
-        let constraint = VersionConstraint::try_parse(">= 2.36").unwrap();
-        let pkg = index.resolve("libc6", Some(&constraint), Architecture::Amd64);
-        assert!(pkg.is_some());
-        assert_eq!(pkg.unwrap().package.version.to_string(), "2.36-9");
-
-        // Should find either (both satisfy >= 2.30)
-        let constraint = VersionConstraint::try_parse(">= 2.30").unwrap();
-        let pkg = index.resolve("libc6", Some(&constraint), Architecture::Amd64);
-        assert!(pkg.is_some());
-    }
-
-    #[test]
-    fn test_resolve_virtual_package() {
-        let mut pkg_index = PackageIndex::new();
-        let mut mawk = make_package("mawk", "1.3.4", "amd64");
-        mawk.provides = provides(&["awk"]);
-        pkg_index.add(mawk);
-        let index = make_index_set(pkg_index);
-
-        let pkg = index.resolve("awk", None, Architecture::Amd64);
-
-        assert!(pkg.is_some());
-        assert_eq!(pkg.unwrap().package.name, "mawk");
-    }
-
-    #[test]
-    fn test_resolve_fallback_to_all_arch() {
-        let mut pkg_index = PackageIndex::new();
-        pkg_index.add(make_package("ca-certificates", "20230311", "all"));
-        let index = make_index_set(pkg_index);
-
-        let pkg = index.resolve("ca-certificates", None, Architecture::Amd64);
-
-        assert!(pkg.is_some());
-        assert_eq!(pkg.unwrap().package.architecture, Some(Architecture::All));
-    }
-
-    #[test]
-    fn test_resolve_all_includes_repository() {
-        let mut pkg_index = PackageIndex::new();
-        pkg_index.add(make_package_with_deps(
-            "app",
-            "1.0",
-            "amd64",
-            vec!["libfoo"],
-        ));
-        pkg_index.add(make_package("libfoo", "2.0", "amd64"));
-        let index = make_index_set(pkg_index);
-
-        let result = index
-            .resolve_all("app", None, Architecture::Amd64)
-            .execute()
-            .unwrap();
-
-        assert_eq!(result.root.package.name, "app");
-        assert_eq!(result.root.repository, "test");
-        assert_eq!(result.dependencies.len(), 1);
-        assert_eq!(result.dependencies[0].package.name, "libfoo");
-        assert_eq!(result.dependencies[0].repository, "test");
-    }
-
-    #[test]
-    fn test_resolve_all_simple() {
-        let mut pkg_index = PackageIndex::new();
-        pkg_index.add(make_package_with_deps(
-            "app",
-            "1.0",
-            "amd64",
-            vec!["libfoo"],
-        ));
-        pkg_index.add(make_package("libfoo", "2.0", "amd64"));
-        let index = make_index_set(pkg_index);
-
-        let result = index
-            .resolve_all("app", None, Architecture::Amd64)
-            .execute()
-            .unwrap();
-
-        assert_eq!(result.root.package.name, "app");
-        assert_eq!(result.dependencies.len(), 1);
-        assert_eq!(result.dependencies[0].package.name, "libfoo");
-        assert!(result.unmet.is_empty());
-    }
-
-    #[test]
-    fn test_resolve_all_transitive() {
-        let mut pkg_index = PackageIndex::new();
-        pkg_index.add(make_package_with_deps(
-            "app",
-            "1.0",
-            "amd64",
-            vec!["libfoo"],
-        ));
-        pkg_index.add(make_package_with_deps(
-            "libfoo",
-            "2.0",
-            "amd64",
-            vec!["libbar"],
-        ));
-        pkg_index.add(make_package("libbar", "3.0", "amd64"));
-        let index = make_index_set(pkg_index);
-
-        let result = index
-            .resolve_all("app", None, Architecture::Amd64)
-            .execute()
-            .unwrap();
-
-        assert_eq!(result.root.package.name, "app");
-        assert_eq!(result.dependencies.len(), 2);
-
-        let names: Vec<_> = result
-            .dependencies
+    fn requests(names: &[&str]) -> Vec<Request> {
+        names
             .iter()
-            .map(|p| p.package.name.as_str())
-            .collect();
-        assert!(names.contains(&"libfoo"));
-        assert!(names.contains(&"libbar"));
+            .map(|n| match n.split_once(' ') {
+                Some((name, constraint)) => {
+                    let constraint = constraint.trim_matches(['(', ')']);
+                    Request::new(name).version(constraint.parse().unwrap())
+                }
+                None => Request::new(*n),
+            })
+            .collect()
+    }
+
+    fn run<'a>(
+        set: &'a PackageIndexSet,
+        requests: &[Request],
+    ) -> Result<Resolution<'a>, ResolveError> {
+        resolve(set, requests, Architecture::Amd64)
+    }
+
+    /// `name=version` for every selected package, sorted.
+    fn selected(resolution: &Resolution<'_>) -> Vec<String> {
+        resolution
+            .packages
+            .iter()
+            .map(|r| format!("{}={}", r.package.name, r.package.version))
+            .collect()
+    }
+
+    fn resolves_to(set: &PackageIndexSet, asked: &[&str]) -> Vec<String> {
+        selected(&run(set, &requests(asked)).unwrap())
+    }
+
+    // ── basics ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn resolves_transitive_dependencies() {
+        let set = repos(&[(
+            "main",
+            "Package: app\nVersion: 1\nDepends: libfoo\n\n\
+             Package: libfoo\nVersion: 1\nPre-Depends: libbar\n\n\
+             Package: libbar\nVersion: 1\n\n\
+             Package: unrelated\nVersion: 1",
+        )]);
+        let resolution = run(&set, &requests(&["app"])).unwrap();
+        assert_eq!(selected(&resolution), ["app=1", "libbar=1", "libfoo=1"]);
+        assert!(resolution.unmet.is_empty());
+
+        let direct: Vec<_> = resolution.packages.iter().map(|r| r.direct).collect();
+        assert_eq!(direct, [true, false, false]);
+        assert_eq!(resolution.packages[0].repository, "main");
     }
 
     #[test]
-    fn test_resolve_all_circular_deps() {
-        let mut pkg_index = PackageIndex::new();
-        // Circular: app -> libfoo -> libbar -> libfoo
-        pkg_index.add(make_package_with_deps(
-            "app",
-            "1.0",
-            "amd64",
-            vec!["libfoo"],
-        ));
-        pkg_index.add(make_package_with_deps(
-            "libfoo",
-            "2.0",
-            "amd64",
-            vec!["libbar"],
-        ));
-        pkg_index.add(make_package_with_deps(
-            "libbar",
-            "3.0",
-            "amd64",
-            vec!["libfoo"],
-        ));
-        let index = make_index_set(pkg_index);
-
-        let result = index
-            .resolve_all("app", None, Architecture::Amd64)
-            .execute()
-            .unwrap();
-
-        // Should not infinite loop, and should include both deps once
-        assert_eq!(result.root.package.name, "app");
-        assert_eq!(result.dependencies.len(), 2);
-    }
-
-    #[test]
-    fn test_resolve_all_alternatives_picks_first() {
-        let mut pkg_index = PackageIndex::new();
-        pkg_index.add(make_package_with_deps(
-            "app",
-            "1.0",
-            "amd64",
-            vec!["libfoo | libbar | libbaz"],
-        ));
-        pkg_index.add(make_package("libfoo", "1.0", "amd64"));
-        pkg_index.add(make_package("libbar", "1.0", "amd64"));
-        pkg_index.add(make_package("libbaz", "1.0", "amd64"));
-        let index = make_index_set(pkg_index);
-
-        let result = index
-            .resolve_all("app", None, Architecture::Amd64)
-            .execute()
-            .unwrap();
-
-        // Should pick libfoo (first alternative)
-        assert_eq!(result.dependencies.len(), 1);
-        assert_eq!(result.dependencies[0].package.name, "libfoo");
-    }
-
-    #[test]
-    fn test_resolve_all_alternatives_fallback() {
-        let mut pkg_index = PackageIndex::new();
-        pkg_index.add(make_package_with_deps(
-            "app",
-            "1.0",
-            "amd64",
-            vec!["libfoo | libbar"],
-        ));
-        // libfoo not available, only libbar
-        pkg_index.add(make_package("libbar", "1.0", "amd64"));
-        let index = make_index_set(pkg_index);
-
-        let result = index
-            .resolve_all("app", None, Architecture::Amd64)
-            .execute()
-            .unwrap();
-
-        // libfoo not found, so it's unmet (we currently only try first alternative)
-        assert_eq!(result.unmet.len(), 1);
-        assert_eq!(result.unmet[0].name, "libfoo");
-    }
-
-    #[test]
-    fn test_resolve_all_unmet_dependency() {
-        let mut pkg_index = PackageIndex::new();
-        pkg_index.add(make_package_with_deps(
-            "app",
-            "1.0",
-            "amd64",
-            vec!["libmissing"],
-        ));
-        let index = make_index_set(pkg_index);
-
-        let result = index
-            .resolve_all("app", None, Architecture::Amd64)
-            .execute()
-            .unwrap();
-
-        assert!(result.dependencies.is_empty());
-        assert_eq!(result.unmet.len(), 1);
-        assert_eq!(result.unmet[0].name, "libmissing");
-        assert_eq!(result.unmet[0].required_by, "app");
-    }
-
-    #[test]
-    fn test_resolve_all_with_version_constraint_in_dep() {
-        let mut pkg_index = PackageIndex::new();
-        pkg_index.add(make_package_with_deps(
-            "app",
-            "1.0",
-            "amd64",
-            vec!["libc6 (>= 2.36)"],
-        ));
-        pkg_index.add(make_package("libc6", "2.35-1", "amd64"));
-        pkg_index.add(make_package("libc6", "2.36-9", "amd64"));
-        let index = make_index_set(pkg_index);
-
-        let result = index
-            .resolve_all("app", None, Architecture::Amd64)
-            .execute()
-            .unwrap();
-
-        assert_eq!(result.dependencies.len(), 1);
-        assert_eq!(result.dependencies[0].package.version.to_string(), "2.36-9");
-    }
-
-    #[test]
-    fn test_resolve_not_found() {
-        let index = PackageIndexSet::new();
-
-        let result = index
-            .resolve_all("notexist", None, Architecture::Amd64)
-            .execute();
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_graph_direct_dependency() {
-        let mut pkg_index = PackageIndex::new();
-        pkg_index.add(make_package_with_deps(
-            "app",
-            "1.0",
-            "amd64",
-            vec!["libfoo"],
-        ));
-        pkg_index.add(make_package("libfoo", "2.0", "amd64"));
-        let index = make_index_set(pkg_index);
-
-        let result = index
-            .resolve_all("app", None, Architecture::Amd64)
-            .execute()
-            .unwrap();
-
-        let children = result.graph.get("app").expect("app should have children");
-        assert!(
-            children.contains(&"libfoo".to_string()),
-            "app → libfoo missing from graph"
+    fn records_the_graph_including_cycles() {
+        let set = repos(&[(
+            "main",
+            "Package: app\nVersion: 1\nDepends: libfoo\n\n\
+             Package: libfoo\nVersion: 1\nDepends: libbar\n\n\
+             Package: libbar\nVersion: 1\nDepends: libfoo",
+        )]);
+        let resolution = run(&set, &requests(&["app"])).unwrap();
+        assert_eq!(selected(&resolution), ["app=1", "libbar=1", "libfoo=1"]);
+        let graph: Vec<_> = resolution.graph.iter().collect();
+        assert_eq!(
+            format!("{graph:?}"),
+            r#"[("app", ["libfoo"]), ("libbar", ["libfoo"]), ("libfoo", ["libbar"])]"#
         );
     }
 
     #[test]
-    fn test_graph_transitive() {
-        // app → libfoo → libbar
-        let mut pkg_index = PackageIndex::new();
-        pkg_index.add(make_package_with_deps(
-            "app",
-            "1.0",
-            "amd64",
-            vec!["libfoo"],
-        ));
-        pkg_index.add(make_package_with_deps(
-            "libfoo",
-            "2.0",
-            "amd64",
-            vec!["libbar"],
-        ));
-        pkg_index.add(make_package("libbar", "3.0", "amd64"));
-        let index = make_index_set(pkg_index);
+    fn picks_the_highest_version_that_satisfies() {
+        let set = repos(&[(
+            "main",
+            "Package: app\nVersion: 1\nDepends: libfoo (<< 3)\n\n\
+             Package: libfoo\nVersion: 1\n\n\
+             Package: libfoo\nVersion: 2\n\n\
+             Package: libfoo\nVersion: 3",
+        )]);
+        assert_eq!(resolves_to(&set, &["app"]), ["app=1", "libfoo=2"]);
+        assert_eq!(resolves_to(&set, &["libfoo"]), ["libfoo=3"]);
+    }
 
-        let result = index
-            .resolve_all("app", None, Architecture::Amd64)
-            .execute()
-            .unwrap();
+    #[test]
+    fn falls_back_to_arch_all() {
+        let set = repos(&[(
+            "main",
+            "Package: app\nVersion: 1\nDepends: data\n\n\
+             Package: data\nVersion: 1\nArchitecture: all",
+        )]);
+        assert_eq!(resolves_to(&set, &["app"]), ["app=1", "data=1"]);
+    }
 
-        assert!(result.graph["app"].contains(&"libfoo".to_string()));
-        assert!(result.graph["libfoo"].contains(&"libbar".to_string()));
-        assert!(
-            !result.graph.contains_key("libbar"),
-            "leaf should have no children"
+    #[test]
+    fn reports_unmet_dependencies() {
+        let set = repos(&[(
+            "main",
+            "Package: app\nVersion: 1\nDepends: libmissing (>= 1), libfoo (>= 2)\n\n\
+             Package: libfoo\nVersion: 1",
+        )]);
+        let resolution = run(&set, &requests(&["app"])).unwrap();
+        assert_eq!(selected(&resolution), ["app=1"]);
+        let unmet: Vec<_> = resolution.unmet.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            unmet,
+            [
+                "libmissing (>= 1) (required by app)",
+                "libfoo (>= 2) (required by app)"
+            ]
         );
     }
 
     #[test]
-    fn test_graph_circular_no_infinite_loop_and_edges_recorded() {
-        // app → libfoo → libbar → libfoo (cycle)
-        let mut pkg_index = PackageIndex::new();
-        pkg_index.add(make_package_with_deps(
-            "app",
-            "1.0",
-            "amd64",
-            vec!["libfoo"],
-        ));
-        pkg_index.add(make_package_with_deps(
-            "libfoo",
-            "2.0",
-            "amd64",
-            vec!["libbar"],
-        ));
-        pkg_index.add(make_package_with_deps(
-            "libbar",
-            "3.0",
-            "amd64",
-            vec!["libfoo"],
-        ));
-        let index = make_index_set(pkg_index);
+    fn fails_when_a_request_matches_nothing() {
+        let set = repos(&[("main", "Package: app\nVersion: 1")]);
+        let err = run(&set, &requests(&["nope"])).unwrap_err();
+        assert_eq!(err.to_string(), "no package matches 'nope' for amd64");
+        let err = run(&set, &requests(&["app (>= 2)"])).unwrap_err();
+        assert_eq!(err.to_string(), "no package matches 'app (>= 2)' for amd64");
+    }
 
-        let result = index
-            .resolve_all("app", None, Architecture::Amd64)
-            .execute()
-            .unwrap();
+    // ── alternatives ────────────────────────────────────────────────────
 
-        // All edges must be present even though libfoo is visited twice
-        assert!(result.graph["app"].contains(&"libfoo".to_string()));
-        assert!(result.graph["libfoo"].contains(&"libbar".to_string()));
-        // The back-edge libbar → libfoo must also be recorded
-        assert!(result.graph["libbar"].contains(&"libfoo".to_string()));
+    #[test]
+    fn alternatives_take_the_first_available() {
+        let set = repos(&[(
+            "main",
+            "Package: app\nVersion: 1\nDepends: libmissing | libbar | libfoo\n\n\
+             Package: libfoo\nVersion: 1\n\n\
+             Package: libbar\nVersion: 1",
+        )]);
+        assert_eq!(resolves_to(&set, &["app"]), ["app=1", "libbar=1"]);
+    }
+
+    #[test]
+    fn alternatives_prefer_what_is_already_selected() {
+        let set = repos(&[(
+            "main",
+            "Package: app\nVersion: 1\nDepends: libfoo | libbar\n\n\
+             Package: libfoo\nVersion: 1\n\n\
+             Package: libbar\nVersion: 1",
+        )]);
+        assert_eq!(resolves_to(&set, &["libbar", "app"]), ["app=1", "libbar=1"]);
+    }
+
+    #[test]
+    fn alternatives_skip_a_version_that_does_not_fit() {
+        let set = repos(&[(
+            "main",
+            "Package: app\nVersion: 1\nDepends: libfoo (>= 2) | libbar\n\n\
+             Package: libfoo\nVersion: 1\n\n\
+             Package: libbar\nVersion: 1",
+        )]);
+        assert_eq!(resolves_to(&set, &["app"]), ["app=1", "libbar=1"]);
+    }
+
+    // ── virtual packages ────────────────────────────────────────────────
+
+    #[test]
+    fn a_real_package_beats_a_virtual_one() {
+        let set = repos(&[(
+            "main",
+            "Package: app\nVersion: 1\nDepends: awk\n\n\
+             Package: mawk\nVersion: 1\nProvides: awk\nPriority: required\n\n\
+             Package: awk\nVersion: 1",
+        )]);
+        assert_eq!(resolves_to(&set, &["app"]), ["app=1", "awk=1"]);
+    }
+
+    #[test]
+    fn an_unversioned_provides_does_not_satisfy_a_versioned_dependency() {
+        let set = repos(&[(
+            "main",
+            "Package: app\nVersion: 1\nDepends: libssl (>= 3)\n\n\
+             Package: fakessl\nVersion: 9\nProvides: libssl",
+        )]);
+        let resolution = run(&set, &requests(&["app"])).unwrap();
+        assert_eq!(selected(&resolution), ["app=1"]);
+        assert_eq!(resolution.unmet.len(), 1);
+    }
+
+    #[test]
+    fn a_versioned_provides_satisfies_by_its_provided_version() {
+        let set = repos(&[(
+            "main",
+            "Package: app\nVersion: 1\nDepends: libssl (>= 3)\n\n\
+             Package: old\nVersion: 9\nProvides: libssl (= 2)\n\n\
+             Package: new\nVersion: 1\nProvides: libssl (= 3.1)",
+        )]);
+        assert_eq!(resolves_to(&set, &["app"]), ["app=1", "new=1"]);
+    }
+
+    #[test]
+    fn providers_are_ranked_by_priority_with_none_last_then_name() {
+        let set = repos(&[(
+            "main",
+            "Package: app\nVersion: 1\nDepends: awk\n\n\
+             Package: aawk\nVersion: 1\nProvides: awk\n\n\
+             Package: zawk\nVersion: 1\nProvides: awk\nPriority: optional\n\n\
+             Package: mawk\nVersion: 1\nProvides: awk\nPriority: required\n\n\
+             Package: gawk\nVersion: 1\nProvides: awk\nPriority: optional",
+        )]);
+        assert_eq!(resolves_to(&set, &["app"]), ["app=1", "mawk=1"]);
+
+        let set = repos(&[(
+            "main",
+            "Package: app\nVersion: 1\nDepends: awk\n\n\
+             Package: aawk\nVersion: 1\nProvides: awk\n\n\
+             Package: zawk\nVersion: 1\nProvides: awk\nPriority: optional\n\n\
+             Package: gawk\nVersion: 1\nProvides: awk\nPriority: optional",
+        )]);
+        assert_eq!(resolves_to(&set, &["app"]), ["app=1", "gawk=1"]);
+    }
+
+    #[test]
+    fn finds_arch_all_providers() {
+        let set = repos(&[(
+            "main",
+            "Package: app\nVersion: 1\nDepends: debconf-2.0\n\n\
+             Package: debconf\nVersion: 1\nArchitecture: all\nProvides: debconf-2.0",
+        )]);
+        assert_eq!(resolves_to(&set, &["app"]), ["app=1", "debconf=1"]);
+    }
+
+    #[test]
+    fn a_selected_provider_satisfies_later_dependencies() {
+        let set = repos(&[(
+            "main",
+            "Package: app\nVersion: 1\nDepends: awk\n\n\
+             Package: mawk\nVersion: 1\nProvides: awk\nPriority: required\n\n\
+             Package: gawk\nVersion: 1\nProvides: awk\nPriority: optional",
+        )]);
+        assert_eq!(resolves_to(&set, &["gawk", "app"]), ["app=1", "gawk=1"]);
+    }
+
+    #[test]
+    fn a_request_for_an_ambiguous_virtual_package_fails() {
+        let set = repos(&[(
+            "main",
+            "Package: mawk\nVersion: 1\nProvides: awk\n\n\
+             Package: gawk\nVersion: 1\nProvides: awk",
+        )]);
+        assert_eq!(
+            run(&set, &requests(&["awk"])).unwrap_err(),
+            ResolveError::AmbiguousVirtual {
+                name: "awk".into(),
+                providers: vec!["gawk".into(), "mawk".into()],
+            }
+        );
+
+        let set = repos(&[("main", "Package: mawk\nVersion: 1\nProvides: awk")]);
+        let resolution = run(&set, &requests(&["awk"])).unwrap();
+        assert_eq!(selected(&resolution), ["mawk=1"]);
+        assert!(resolution.packages[0].direct);
+    }
+
+    // ── consistency ─────────────────────────────────────────────────────
+
+    /// Each request used to be resolved alone, so `app` got libfoo 2 and
+    /// `legacy`'s `<< 2` was silently lost when the results were merged.
+    #[test]
+    fn requirements_from_different_requests_are_combined() {
+        let set = repos(&[(
+            "main",
+            "Package: app\nVersion: 1\nDepends: libfoo\n\n\
+             Package: legacy\nVersion: 1\nDepends: libfoo (<< 2)\n\n\
+             Package: libfoo\nVersion: 1\n\n\
+             Package: libfoo\nVersion: 2",
+        )]);
+        assert_eq!(
+            resolves_to(&set, &["app", "legacy"]),
+            ["app=1", "legacy=1", "libfoo=1"]
+        );
+    }
+
+    #[test]
+    fn requirements_deep_in_the_tree_are_combined() {
+        let set = repos(&[(
+            "main",
+            "Package: app\nVersion: 1\nDepends: libfoo, mid\n\n\
+             Package: mid\nVersion: 1\nDepends: libfoo (<< 2)\n\n\
+             Package: libfoo\nVersion: 1\nDepends: libone\n\n\
+             Package: libfoo\nVersion: 2\nDepends: libtwo\n\n\
+             Package: libone\nVersion: 1\n\n\
+             Package: libtwo\nVersion: 1",
+        )]);
+        // libfoo 2's dependency is gone once libfoo 1 is chosen.
+        assert_eq!(
+            resolves_to(&set, &["app"]),
+            ["app=1", "libfoo=1", "libone=1", "mid=1"]
+        );
+    }
+
+    #[test]
+    fn unsatisfiable_requirements_are_a_conflict() {
+        let set = repos(&[(
+            "main",
+            "Package: app\nVersion: 1\nDepends: libfoo (>= 2)\n\n\
+             Package: legacy\nVersion: 1\nDepends: libfoo (<< 2)\n\n\
+             Package: libfoo\nVersion: 1\n\n\
+             Package: libfoo\nVersion: 2",
+        )]);
+        let err = run(&set, &requests(&["app", "legacy"])).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "no version of 'libfoo' satisfies every requirement: \
+             (>= 2) from app, (<< 2) from legacy"
+        );
+    }
+
+    #[test]
+    fn a_requested_version_wins_or_conflicts() {
+        let set = repos(&[(
+            "main",
+            "Package: app\nVersion: 1\nDepends: libfoo (>= 1)\n\n\
+             Package: libfoo\nVersion: 1\n\n\
+             Package: libfoo\nVersion: 2",
+        )]);
+        assert_eq!(
+            resolves_to(&set, &["app", "libfoo (= 1)"]),
+            ["app=1", "libfoo=1"]
+        );
+
+        let err = run(&set, &requests(&["app", "libfoo (<< 1)"])).unwrap_err();
+        assert!(matches!(
+            err,
+            ResolveError::Conflict { .. } | ResolveError::NotFound { .. }
+        ));
+    }
+
+    // ── Conflicts and Breaks ────────────────────────────────────────────
+
+    #[test]
+    fn conflicting_packages_fail() {
+        let set = repos(&[(
+            "main",
+            "Package: app\nVersion: 1\nDepends: libfoo, libbar\n\n\
+             Package: libfoo\nVersion: 1\nConflicts: libbar\n\n\
+             Package: libbar\nVersion: 1",
+        )]);
+        assert_eq!(
+            run(&set, &requests(&["app"])).unwrap_err().to_string(),
+            "'libfoo' Conflicts 'libbar', but 'libbar' is also needed"
+        );
+    }
+
+    #[test]
+    fn breaks_respect_versions_and_provides() {
+        let stanzas = "Package: app\nVersion: 1\nDepends: libfoo, libbar\n\n\
+                       Package: libbar\nVersion: 2\nProvides: libbaz (= 2)\n\n\
+                       Package: libfoo\nVersion: 1\nBreaks: ";
+        let breaks = |relation: &str| {
+            let set = repos(&[("main", &format!("{stanzas}{relation}"))]);
+            run(&set, &requests(&["app"])).map(|r| selected(&r))
+        };
+        assert!(breaks("libbar (<< 2)").is_ok());
+        assert!(breaks("libbar (<< 3)").is_err());
+        assert!(breaks("libbaz (<< 2)").is_ok());
+        assert!(breaks("libbaz (<< 3)").is_err());
+        assert!(breaks("libbaz").is_err());
+    }
+
+    #[test]
+    fn a_package_may_conflict_with_what_it_provides() {
+        let set = repos(&[(
+            "main",
+            "Package: mawk\nVersion: 1\nProvides: awk\nConflicts: awk",
+        )]);
+        assert_eq!(resolves_to(&set, &["mawk"]), ["mawk=1"]);
+    }
+
+    // ── repositories ────────────────────────────────────────────────────
+
+    #[test]
+    fn ties_go_to_the_earlier_repository() {
+        let set = repos(&[
+            ("first", "Package: bash\nVersion: 5"),
+            ("second", "Package: bash\nVersion: 5"),
+            ("third", "Package: bash\nVersion: 6"),
+        ]);
+        let resolution = run(&set, &requests(&["bash"])).unwrap();
+        assert_eq!(resolution.packages[0].repository, "third");
+
+        let set = repos(&[
+            ("first", "Package: bash\nVersion: 5"),
+            ("second", "Package: bash\nVersion: 5"),
+        ]);
+        let resolution = run(&set, &requests(&["bash"])).unwrap();
+        assert_eq!(resolution.packages[0].repository, "first");
+    }
+
+    /// A pin used to only relabel the package: it was still resolved from
+    /// every repository, so its download URL could point at the wrong one.
+    #[test]
+    fn a_pinned_package_comes_from_its_repository() {
+        let set = repos(&[
+            (
+                "debian",
+                "Package: app\nVersion: 1\nDepends: libfoo\n\nPackage: libfoo\nVersion: 1",
+            ),
+            ("backports", "Package: libfoo\nVersion: 2"),
+        ]);
+        let pinned = [
+            Request::new("app"),
+            Request::new("libfoo").repository("debian"),
+        ];
+        let resolution = run(&set, &pinned).unwrap();
+        assert_eq!(selected(&resolution), ["app=1", "libfoo=1"]);
+        assert_eq!(resolution.packages[1].repository, "debian");
+
+        let missing = [Request::new("app").repository("backports")];
+        assert_eq!(
+            run(&set, &missing).unwrap_err().to_string(),
+            "no package matches 'app from repository 'backports'' for amd64"
+        );
+    }
+
+    #[test]
+    fn is_deterministic() {
+        let set = repos(&[(
+            "main",
+            "Package: app\nVersion: 1\nDepends: a | b, c, awk\n\n\
+             Package: a\nVersion: 1\nDepends: c (>= 1)\n\n\
+             Package: c\nVersion: 1\n\n\
+             Package: c\nVersion: 2\n\n\
+             Package: x\nVersion: 1\nProvides: awk\n\n\
+             Package: y\nVersion: 1\nProvides: awk",
+        )]);
+        let first = resolves_to(&set, &["app"]);
+        for _ in 0..20 {
+            assert_eq!(resolves_to(&set, &["app"]), first);
+        }
+        assert_eq!(first, ["a=1", "app=1", "c=2", "x=1"]);
     }
 }

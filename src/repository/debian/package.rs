@@ -2,10 +2,8 @@ use std::str::FromStr;
 
 use thiserror::Error;
 
-use crate::repository::*;
-
 use super::architecture::Architecture;
-use super::dependency::{PackageDependency, parse_relations};
+use super::dependency::{DependencySpec, PackageDependency, parse_relations};
 use super::priority::Priority;
 use super::provides::ProvidesEntry;
 use super::version::DebianVersion;
@@ -48,6 +46,8 @@ pub struct DebianPackage {
     pub depends: Vec<PackageDependency>,
     pub pre_depends: Vec<PackageDependency>,
     pub provides: Vec<ProvidesEntry>,
+    pub conflicts: Vec<DependencySpec>,
+    pub breaks: Vec<DependencySpec>,
     pub filename: String,
     pub size: u64,
     pub md5sum: String,
@@ -56,25 +56,19 @@ pub struct DebianPackage {
     pub description: Option<String>,
 }
 
-impl Package for DebianPackage {
-    fn dependencies(&self) -> Vec<&DependencySpec> {
-        let mut deps = Vec::new();
+impl DebianPackage {
+    /// Everything that must be installed alongside this package:
+    /// `Pre-Depends`, then `Depends`.
+    pub fn dependencies(&self) -> impl Iterator<Item = &PackageDependency> {
+        self.pre_depends.iter().chain(&self.depends)
+    }
 
-        // Pre-Depends are required
-        for dep in &self.pre_depends {
-            if let Some(resolved) = dep.resolve() {
-                deps.push(resolved);
-            }
-        }
-
-        // Depends are required
-        for dep in &self.depends {
-            if let Some(resolved) = dep.resolve() {
-                deps.push(resolved);
-            }
-        }
-
-        deps
+    /// Packages that must not be installed alongside this one: `Conflicts`,
+    /// then `Breaks`. In an image nothing is ever half-configured, so the
+    /// two mean the same thing.
+    pub fn conflicts(&self) -> impl Iterator<Item = (&'static str, &DependencySpec)> {
+        let conflicts = self.conflicts.iter().map(|c| ("Conflicts", c));
+        conflicts.chain(self.breaks.iter().map(|b| ("Breaks", b)))
     }
 }
 
@@ -154,6 +148,8 @@ impl FromStr for DebianPackage {
                     pkg.pre_depends = parse_field("Pre-Depends", &value, parse_relations)?;
                 }
                 "Provides" => pkg.provides = parse_field("Provides", &value, parse_relations)?,
+                "Conflicts" => pkg.conflicts = parse_field("Conflicts", &value, parse_relations)?,
+                "Breaks" => pkg.breaks = parse_field("Breaks", &value, parse_relations)?,
                 "Filename" => pkg.filename = value,
                 "Size" => pkg.size = parse_field("Size", &value, str::parse)?,
                 "MD5sum" => pkg.md5sum = value,
@@ -300,6 +296,8 @@ Priority: required"#;
             ("Depends: libc6, libfoo [amd64]", "Depends"),
             ("Pre-Depends: libc6 (>= 2.17", "Pre-Depends"),
             ("Provides: awk (>= 1)", "Provides"),
+            ("Conflicts: foo | bar", "Conflicts"),
+            ("Breaks: foo (> 1)", "Breaks"),
             ("Size: lots", "Size"),
             ("Installed-Size: -1", "Installed-Size"),
         ] {
