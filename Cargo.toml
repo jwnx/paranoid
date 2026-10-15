@@ -2,6 +2,9 @@
 name = "paranoid"
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/jwnx/paranoid"
+description = "Build reproducible OCI images from Debian packages"
 
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }

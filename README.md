@@ -365,10 +365,22 @@ src/
   cli/         one module per subcommand, each a wrapper over the library
 ```
 
+## INSTALL
+
+Binaries for Linux (static, amd64 and arm64) and macOS (arm64 and x86_64)
+are on the [releases page](https://github.com/jwnx/paranoid/releases), with
+a `SHA256SUMS` file and build provenance you can check with
+`gh attestation verify <archive> -R jwnx/paranoid`. Or build from source
+with `cargo install --path .`.
+
 ## STATUS
 
 paranoid is early in development. The lock format and the library API will
 change.
+
+## LICENSE
+
+Apache License 2.0. See [`LICENSE`](LICENSE).
 
 ```
                                                                   PARANOID(1)
