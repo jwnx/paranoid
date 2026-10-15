@@ -461,7 +461,11 @@ name = "ca-certificates"
     assert!(ca_certs.is_some(), "Should have resolved ca-certificates");
 
     let ca_certs = ca_certs.unwrap();
-    assert!(!ca_certs.sha256.is_empty(), "Should have SHA256 checksum");
+    assert_eq!(
+        ca_certs.sha256.to_string().len(),
+        64,
+        "Should have SHA256 checksum"
+    );
     assert!(!ca_certs.filename.is_empty(), "Should have filename");
 
     println!(

@@ -4,8 +4,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use sha2::{Digest, Sha256};
-
+use crate::hash::Sha256;
 use crate::lock::LockedPackage;
 
 use super::DownloadError;
@@ -45,8 +44,8 @@ impl PackageCache {
     ///
     /// Returns the path where the package would be stored based on its SHA256 hash.
     pub fn path_for(&self, package: &LockedPackage) -> PathBuf {
-        let hash = package.sha256.as_str();
-        let prefix = &hash[..2]; // SHA256Hash guarantees 64 chars
+        let hash = package.sha256.to_string();
+        let prefix = &hash[..2];
         self.base_dir
             .join("sha256")
             .join(prefix)
@@ -72,11 +71,11 @@ impl PackageCache {
     }
 
     fn verify(package: &LockedPackage, data: &[u8]) -> Result<(), DownloadError> {
-        let actual = Self::compute_sha256(data);
-        if actual != package.sha256.as_str() {
+        let actual = Sha256::of(data);
+        if actual != package.sha256 {
             return Err(DownloadError::ChecksumMismatch {
                 package: package.name.clone(),
-                expected: package.sha256.to_string(),
+                expected: package.sha256,
                 actual,
             });
         }
@@ -112,14 +111,6 @@ impl PackageCache {
         Ok(target_path)
     }
 
-    /// Compute the SHA256 hash of data.
-    fn compute_sha256(data: &[u8]) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(data);
-        let result = hasher.finalize();
-        hex::encode(result)
-    }
-
     /// Get the base directory of the cache.
     pub fn base_dir(&self) -> &Path {
         &self.base_dir
@@ -139,7 +130,9 @@ mod tests {
 
         let package = make_test_package(
             "test-pkg",
-            "abc123def456abc123def456abc123def456abc123def456abc123def456abc1",
+            "abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+                .parse()
+                .unwrap(),
         );
         let path = cache.path_for(&package);
 
@@ -151,16 +144,12 @@ mod tests {
         );
     }
 
-    // Note: test_path_for_short_hash was removed because Sha256Hash now
-    // guarantees all hashes are exactly 64 hex characters. Short hashes
-    // are no longer representable.
-
     #[test]
     fn test_get_nonexistent() {
         let dir = TempDir::new().unwrap();
         let cache = PackageCache::with_base_dir(dir.path().to_path_buf()).unwrap();
 
-        let package = make_test_package("test-pkg", "abc123");
+        let package = make_test_package("test-pkg", Sha256::of(b"missing"));
         assert!(cache.get(&package).is_none());
     }
 
@@ -171,9 +160,9 @@ mod tests {
 
         // Create test data
         let data = b"test package content";
-        let hash = PackageCache::compute_sha256(data);
+        let hash = Sha256::of(data);
 
-        let mut package = make_test_package("test-pkg", &hash);
+        let mut package = make_test_package("test-pkg", hash);
         package.size = data.len() as u64;
 
         // Store the package
@@ -196,7 +185,7 @@ mod tests {
         let cache = PackageCache::with_base_dir(dir.path().to_path_buf()).unwrap();
 
         let data = b"test package content";
-        let mut package = make_test_package("test-pkg", &PackageCache::compute_sha256(data));
+        let mut package = make_test_package("test-pkg", Sha256::of(data));
         package.size = data.len() as u64;
         let path = cache.store(&package, data).unwrap();
 
@@ -210,7 +199,7 @@ mod tests {
         let cache = PackageCache::with_base_dir(dir.path().to_path_buf()).unwrap();
 
         let data = b"test package content";
-        let mut package = make_test_package("test-pkg", &PackageCache::compute_sha256(data));
+        let mut package = make_test_package("test-pkg", Sha256::of(data));
         package.size = data.len() as u64;
         let path = cache.store(&package, data).unwrap();
         assert_eq!(PackageCache::read(&path, &package).unwrap(), data);
@@ -228,7 +217,8 @@ mod tests {
         let cache = PackageCache::with_base_dir(dir.path().to_path_buf()).unwrap();
 
         let data = b"test package content";
-        let package = make_test_package("test-pkg", "wrong_hash");
+        let wrong = Sha256::of(b"something else");
+        let package = make_test_package("test-pkg", wrong);
 
         let result = cache.store(&package, data);
         assert!(result.is_err());
@@ -240,20 +230,9 @@ mod tests {
                 actual: _,
             } => {
                 assert_eq!(name, "test-pkg");
-                assert_eq!(expected, "wrong_hash");
+                assert_eq!(expected, wrong);
             }
             other => panic!("Expected ChecksumMismatch, got {:?}", other),
         }
-    }
-
-    #[test]
-    fn test_compute_sha256() {
-        let data = b"hello world";
-        let hash = PackageCache::compute_sha256(data);
-        // Known SHA256 of "hello world"
-        assert_eq!(
-            hash,
-            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
-        );
     }
 }

@@ -293,7 +293,7 @@ async fn run_build(args: BuildArgs, quiet: bool) -> Result<(), CliError> {
             report.cached,
             st::fmt_size(report.image.total_size),
         );
-        st::footer(output, report.image.manifest_digest.as_str());
+        st::footer(output, &report.image.manifest_digest.to_string());
     }
 
     Ok(())
@@ -548,13 +548,13 @@ fn inspect_image(path: &Path) -> Result<(), CliError> {
     // ── Step 3: parse manifest ────────────────────────────────────────────────
 
     let manifest_desc = &index.manifests[0];
-    let manifest_bytes = read_blob(manifest_desc.digest.as_str())?;
+    let manifest_bytes = read_blob(&manifest_desc.digest.to_string())?;
     let manifest: ImageManifest = serde_json::from_slice(&manifest_bytes)
         .map_err(|e| err(format!("cannot parse image manifest: {}", e)))?;
 
     // ── Step 4: parse image config ────────────────────────────────────────────
 
-    let config_bytes = read_blob(manifest.config.digest.as_str())?;
+    let config_bytes = read_blob(&manifest.config.digest.to_string())?;
     let image_config: ImageConfig = serde_json::from_slice(&config_bytes)
         .map_err(|e| err(format!("cannot parse image config: {}", e)))?;
 
@@ -627,7 +627,7 @@ fn inspect_image(path: &Path) -> Result<(), CliError> {
 
     // ── Footer ────────────────────────────────────────────────────────────────
     println!();
-    st::footer_stdout(path, manifest_desc.digest.as_str());
+    st::footer_stdout(path, &manifest_desc.digest.to_string());
 
     Ok(())
 }

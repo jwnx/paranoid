@@ -4,14 +4,13 @@ use std::path::Path;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::arch::Architecture;
 use crate::config::{Manifest, PackageSpec, RepositoryConfig};
+use crate::hash::Sha256;
+use crate::oci::Digest;
 use crate::resolve::ResolvedManifest;
-
-use super::Sha256Hash;
 
 /// A locked package entry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -19,7 +18,7 @@ pub struct LockedPackage {
     pub name: String,
     pub version: String,
     pub architecture: Architecture,
-    pub sha256: Sha256Hash,
+    pub sha256: Sha256,
     pub filename: String,
     pub size: u64,
     pub repository: String,
@@ -75,12 +74,6 @@ pub enum LockFileError {
     Serialize(#[from] toml::ser::Error),
 }
 
-/// Format a SHA256 digest as a full hex string.
-fn format_sha256_hash(digest: &[u8]) -> String {
-    let hex: String = digest.iter().map(|b| format!("{:02x}", b)).collect();
-    format!("sha256:{}", hex)
-}
-
 impl LockFile {
     /// Create a new lock file from a resolved manifest.
     ///
@@ -96,8 +89,7 @@ impl LockFile {
                 name: p.name,
                 version: p.version,
                 architecture: p.architecture,
-                // SHA256 comes from Debian Packages file (trusted source)
-                sha256: Sha256Hash::from_trusted(p.sha256),
+                sha256: p.sha256,
                 filename: p.filename,
                 size: p.size,
                 repository: p.repository,
@@ -166,10 +158,7 @@ impl LockFile {
     /// Returns an error if the lock file cannot be serialized.
     pub fn content_hash(&self) -> Result<String, LockFileError> {
         let content = toml::to_string(self)?;
-        let mut hasher = Sha256::new();
-        hasher.update(content.as_bytes());
-        let result = hasher.finalize();
-        Ok(format_sha256_hash(&result))
+        Ok(Digest::from_bytes(content.as_bytes()).to_string())
     }
 
     /// Check if this lock file matches a manifest's config hash.
@@ -208,7 +197,7 @@ impl LockFile {
         };
 
         let json = serde_json::to_vec(&inputs).expect("resolution inputs always serialize");
-        format_sha256_hash(&Sha256::digest(&json))
+        Digest::from_bytes(&json).to_string()
     }
 
     /// Get a package by name.
@@ -276,7 +265,7 @@ name = "coreutils"
                     name: "bash".to_string(),
                     version: "5.2.15-2".to_string(),
                     architecture: Architecture::Amd64,
-                    sha256: TEST_HASH_1.to_string(),
+                    sha256: TEST_HASH_1.parse().unwrap(),
                     filename: "pool/main/b/bash/bash_5.2.15-2_amd64.deb".to_string(),
                     size: 1234567,
                     repository: "debian".to_string(),
@@ -286,7 +275,7 @@ name = "coreutils"
                     name: "coreutils".to_string(),
                     version: "9.1-1".to_string(),
                     architecture: Architecture::Amd64,
-                    sha256: TEST_HASH_2.to_string(),
+                    sha256: TEST_HASH_2.parse().unwrap(),
                     filename: "pool/main/c/coreutils/coreutils_9.1-1_amd64.deb".to_string(),
                     size: 2345678,
                     repository: "debian".to_string(),

@@ -1,8 +1,12 @@
-//! Content-addressable digest types and utilities.
+//! OCI content digests.
+
+use std::fmt;
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as Sha2Digest, Sha256};
 use thiserror::Error;
+
+use crate::hash::Sha256;
 
 /// Error constructing a [`Digest`].
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -13,80 +17,62 @@ pub enum DigestError {
     InvalidHash { value: String, len: usize },
 }
 
-/// A content-addressable digest in the format `"sha256:<64-hex>"`.
-///
-/// # Invariants
-///
-/// - Always starts with `"sha256:"`.
-/// - The hash portion is exactly 64 lowercase hexadecimal characters.
-///
-/// # Construction
-///
-/// - [`Digest::from_bytes`] — compute a digest by hashing data (always valid).
-/// - [`Digest::try_from`] / [`str::parse`] — parse and validate a full `"sha256:..."` string.
+/// A content-addressable digest, written `sha256:<64 lowercase hex>`.
 ///
 /// # Example
 ///
 /// ```
 /// use paranoid::oci::Digest;
-/// use std::convert::TryFrom;
 ///
-/// // Compute from data — always valid.
 /// let d = Digest::from_bytes(b"hello world");
-/// assert!(d.as_str().starts_with("sha256:"));
+/// assert!(d.to_string().starts_with("sha256:"));
 ///
-/// // Parse from a full digest string.
 /// let hash = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
-/// let d = Digest::try_from(format!("sha256:{}", hash)).unwrap();
+/// let d: Digest = format!("sha256:{hash}").parse().unwrap();
 /// assert_eq!(d.hash(), hash);
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Digest(String);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Digest(Sha256);
 
 impl Digest {
-    /// Create a digest by hashing the given data.
-    ///
-    /// This is the primary way to create a `Digest` from raw bytes.
-    /// The resulting digest is always valid.
+    /// The digest of `data`.
     pub fn from_bytes(data: &[u8]) -> Self {
-        // Safety: hex::encode(Sha256::digest(...)) always produces 64 lowercase hex chars.
-        Self(format!("sha256:{}", hex::encode(Sha256::digest(data))))
+        Self(Sha256::of(data))
     }
 
-    /// Get the full digest string including the `"sha256:"` prefix.
-    pub fn as_str(&self) -> &str {
+    /// The underlying hash.
+    pub fn sha256(&self) -> &Sha256 {
         &self.0
     }
 
-    /// Get the raw 64-character hex hash without the `"sha256:"` prefix.
-    pub fn hash(&self) -> &str {
-        // SAFETY: the invariant guarantees "sha256:" (7 bytes) is always present.
-        &self.0["sha256:".len()..]
+    /// The 64-character hex hash, without the `sha256:` prefix.
+    pub fn hash(&self) -> String {
+        self.0.to_string()
     }
 }
 
-/// Validate a full `"sha256:<64-hex>"` string.
-fn validate_digest(s: &str) -> Result<(), DigestError> {
-    let hash = s
-        .strip_prefix("sha256:")
-        .ok_or_else(|| DigestError::MissingPrefix(s.to_string()))?;
+impl From<Sha256> for Digest {
+    fn from(hash: Sha256) -> Self {
+        Self(hash)
+    }
+}
 
-    let len = hash.len();
-    if len != 64 || !hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
-        return Err(DigestError::InvalidHash {
+impl FromStr for Digest {
+    type Err = DigestError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let hex = s
+            .strip_prefix("sha256:")
+            .ok_or_else(|| DigestError::MissingPrefix(s.to_string()))?;
+        // The OCI spec allows only lowercase hex in digests.
+        let invalid = || DigestError::InvalidHash {
             value: s.to_string(),
-            len,
-        });
-    }
-    Ok(())
-}
-
-impl TryFrom<String> for Digest {
-    type Error = DigestError;
-
-    fn try_from(s: String) -> Result<Self, Self::Error> {
-        validate_digest(&s)?;
-        Ok(Self(s))
+            len: hex.len(),
+        };
+        if hex.bytes().any(|b| b.is_ascii_uppercase()) {
+            return Err(invalid());
+        }
+        hex.parse().map(Self).map_err(|_| invalid())
     }
 }
 
@@ -94,47 +80,35 @@ impl TryFrom<&str> for Digest {
     type Error = DigestError;
 
     fn try_from(s: &str) -> Result<Self, Self::Error> {
-        validate_digest(s)?;
-        Ok(Self(s.to_string()))
+        s.parse()
     }
 }
 
-impl std::str::FromStr for Digest {
-    type Err = DigestError;
+impl TryFrom<String> for Digest {
+    type Error = DigestError;
 
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::try_from(s)
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        s.parse()
     }
 }
 
-impl From<Digest> for String {
-    fn from(d: Digest) -> String {
-        d.0
-    }
-}
-
-impl std::fmt::Display for Digest {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl AsRef<str> for Digest {
-    fn as_ref(&self) -> &str {
-        &self.0
+impl fmt::Display for Digest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "sha256:{}", self.0)
     }
 }
 
 impl Serialize for Digest {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.0)
+        serializer.collect_str(self)
     }
 }
 
 impl<'de> Deserialize<'de> for Digest {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(deserializer)?;
-        Self::try_from(s).map_err(serde::de::Error::custom)
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -147,7 +121,7 @@ mod tests {
         let digest = Digest::from_bytes(b"hello world");
         // Known SHA-256 of "hello world"
         assert_eq!(
-            digest.as_str(),
+            digest.to_string(),
             "sha256:b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
         );
     }
@@ -204,7 +178,7 @@ mod tests {
     #[test]
     fn test_digest_display() {
         let digest = Digest::from_bytes(b"test");
-        assert_eq!(format!("{}", digest), digest.as_str());
+        assert_eq!(format!("{}", digest), digest.to_string());
     }
 
     #[test]
@@ -222,9 +196,8 @@ mod tests {
     }
 
     #[test]
-    fn test_digest_into_string() {
+    fn test_digest_display_roundtrip() {
         let d = Digest::from_bytes(b"x");
-        let s: String = d.clone().into();
-        assert_eq!(s, d.as_str());
+        assert_eq!(d.to_string().parse::<Digest>().unwrap(), d);
     }
 }

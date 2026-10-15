@@ -163,7 +163,7 @@ mod tests {
 
     #[test]
     fn test_build_download_url() {
-        let package = make_test_package("bash", "abc123");
+        let package = make_test_package("bash", crate::hash::Sha256::of(b"bash"));
         let repo_config = RepositoryConfig {
             url: url::Url::parse("https://deb.debian.org/debian").unwrap(),
             distribution: "bookworm".to_string(),
@@ -179,7 +179,7 @@ mod tests {
 
     #[test]
     fn test_build_download_url_trailing_slash() {
-        let package = make_test_package("bash", "abc123");
+        let package = make_test_package("bash", crate::hash::Sha256::of(b"bash"));
         let repo_config = RepositoryConfig {
             url: url::Url::parse("https://deb.debian.org/debian/").unwrap(),
             distribution: "bookworm".to_string(),

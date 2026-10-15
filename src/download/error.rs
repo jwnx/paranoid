@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+use crate::hash::Sha256;
 use crate::http::ClientError;
 use crate::lock::LockedPackage;
 
@@ -20,8 +21,8 @@ pub enum DownloadError {
     #[error("checksum mismatch for {package}: expected {expected}, got {actual}")]
     ChecksumMismatch {
         package: String,
-        expected: String,
-        actual: String,
+        expected: Sha256,
+        actual: Sha256,
     },
 
     #[error("failed to create cache directory: {0}")]

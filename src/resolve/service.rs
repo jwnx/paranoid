@@ -6,6 +6,7 @@ use thiserror::Error;
 
 use crate::arch::Architecture;
 use crate::config::Manifest;
+use crate::hash::{ParseSha256Error, Sha256};
 use crate::http::{Client, ClientError};
 use crate::repository::debian::{
     DebianPackage, DebianRepository, DebianRepositoryError, DebianVersion, PackageIndexSet,
@@ -25,6 +26,13 @@ pub enum ResolveServiceError {
     #[error("resolve error: {0}")]
     Resolve(#[from] ResolveError),
 
+    #[error("package '{package}' has an invalid SHA256 in the repository index")]
+    InvalidChecksum {
+        package: String,
+        #[source]
+        source: ParseSha256Error,
+    },
+
     #[error("invalid version constraint for package '{package}': {source}")]
     InvalidVersionConstraint {
         package: String,
@@ -40,7 +48,7 @@ pub struct ResolvedPackage {
     pub name: String,
     pub version: String,
     pub architecture: Architecture,
-    pub sha256: String,
+    pub sha256: Sha256,
     pub filename: String,
     pub size: u64,
     /// The repository this package came from.
@@ -52,22 +60,31 @@ pub struct ResolvedPackage {
 
 impl ResolvedPackage {
     /// Create a ResolvedPackage from a DebianPackage and repository name.
-    #[must_use]
+    ///
+    /// This is where a package's checksum leaves the repository index and
+    /// heads for the lock file, so we parse it here.
     pub fn from_debian_package(
         pkg: &DebianPackage,
         repository: impl Into<String>,
         direct: bool,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, ResolveServiceError> {
+        let sha256 = pkg
+            .sha256
+            .parse()
+            .map_err(|source| ResolveServiceError::InvalidChecksum {
+                package: pkg.name.clone(),
+                source,
+            })?;
+        Ok(Self {
             name: pkg.name.clone(),
             version: pkg.version.to_string(),
             architecture: pkg.architecture.unwrap_or(Architecture::All),
-            sha256: pkg.sha256.clone(),
+            sha256,
             filename: pkg.filename.clone(),
             size: pkg.size,
             repository: repository.into(),
             direct,
-        }
+        })
     }
 }
 
@@ -149,16 +166,17 @@ impl ResolveService {
 
             all_packages.insert(
                 result.root.package.name.clone(),
-                ResolvedPackage::from_debian_package(&result.root.package, root_repo, true),
+                ResolvedPackage::from_debian_package(&result.root.package, root_repo, true)?,
             );
 
             // Add dependencies (repository comes directly from resolution)
             for dep in &result.dependencies {
-                all_packages
-                    .entry(dep.package.name.clone())
-                    .or_insert_with(|| {
-                        ResolvedPackage::from_debian_package(&dep.package, &dep.repository, false)
-                    });
+                if !all_packages.contains_key(&dep.package.name) {
+                    all_packages.insert(
+                        dep.package.name.clone(),
+                        ResolvedPackage::from_debian_package(&dep.package, &dep.repository, false)?,
+                    );
+                }
             }
 
             // Merge dependency graph (union of all per-root graphs)
