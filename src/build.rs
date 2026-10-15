@@ -13,7 +13,7 @@ use crate::deb::{DebArchive, DebError};
 use crate::download::{
     DownloadConfig, DownloadError, DownloadFailures, DownloadService, Fetched, PackageCache,
 };
-use crate::dpkg::{DpkgDatabase, DpkgError};
+use crate::dpkg::{DpkgDatabase, DpkgError, PackageState};
 use crate::lock::LockFile;
 use crate::oci::{ImageOutput, OciConfig, OciConfigError, OciError, OciImageResult, Timestamp};
 use crate::report::{Event, Phase, Reporter};
@@ -108,7 +108,12 @@ pub async fn build(
         .download_all(lock, &manifest.repositories, reporter)
         .await?;
 
-    let rootfs = assemble(&fetched, reporter)?;
+    let state = if manifest.image.as_ref().is_some_and(|i| i.unconfigured) {
+        PackageState::Unpacked
+    } else {
+        PackageState::Installed
+    };
+    let rootfs = assemble(&fetched, state, reporter)?;
     let image = crate::oci::write_image(&config, &rootfs, &options.output, reporter)?;
 
     let cached = fetched.iter().filter(|f| f.from_cache).count();
@@ -122,14 +127,18 @@ pub async fn build(
 
 /// Apply packages to a fresh rootfs in the given (lock) order, verifying
 /// each one against the lock as it's read.
-pub fn assemble(packages: &[Fetched<'_>], reporter: &dyn Reporter) -> Result<Rootfs, BuildError> {
+pub fn assemble(
+    packages: &[Fetched<'_>],
+    state: PackageState,
+    reporter: &dyn Reporter,
+) -> Result<Rootfs, BuildError> {
     reporter.report(Event::Begin {
         phase: Phase::Assemble,
         total: packages.len() as u64,
     });
 
     let mut rootfs = Rootfs::new();
-    let mut dpkg = DpkgDatabase::new();
+    let mut dpkg = DpkgDatabase::new(state);
     for fetched in packages {
         let name = &fetched.package.name;
         let result = PackageCache::read(&fetched.path, fetched.package)
@@ -150,7 +159,7 @@ pub fn assemble(packages: &[Fetched<'_>], reporter: &dyn Reporter) -> Result<Roo
                         package: name.clone(),
                         source,
                     })?;
-                dpkg.add(control, &stats.paths, &rootfs)
+                dpkg.add(control, &stats.paths, &mut rootfs)
                     .map_err(|source| BuildError::Dpkg {
                         package: name.clone(),
                         source,

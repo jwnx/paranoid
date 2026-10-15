@@ -38,6 +38,12 @@ pub struct ImageConfig {
     pub description: Option<String>,
     pub authors: Option<String>,
     pub source: Option<String>,
+    /// Leave every package unpacked but not configured, as `dpkg --unpack`
+    /// would, with its maintainer scripts in place, for `dpkg --configure`
+    /// to run later in the image (say, in a Dockerfile). paranoid itself
+    /// never runs them.
+    #[serde(default)]
+    pub unconfigured: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

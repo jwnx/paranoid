@@ -100,6 +100,7 @@ architecture = "arm64"           # required; amd64, arm64, armhf, ...
 description  = "..."             # optional, OCI label
 authors      = "..."             # optional, OCI label
 source       = "..."             # optional, OCI label
+unconfigured = false             # optional, see BUILD
 
 [repositories.debian]            # on a tie, the first repository wins
 url          = "https://deb.debian.org/debian"
@@ -275,10 +276,31 @@ the same flag.
   signed it are in `signed_by` any more. `--allow-stale` builds from it
   anyway.
 
-Maintainer scripts (`preinst`, `postinst`, ...) are never run. Packages
-that rely on their `postinst` to finish setting themselves up (creating
-users, generating config, running `update-alternatives`) won't be fully set
-up in the image, and you'll need to do that work some other way.
+paranoid never runs maintainer scripts (`preinst`, `postinst`, ...). By
+default every package is marked installed anyway, so packages that rely on
+their `postinst` to finish setting up (creating users, generating config,
+running `update-alternatives`) won't be fully set up.
+
+With `unconfigured = true` under `[image]`, the image is left the way `dpkg
+--unpack` leaves a system: every package unpacked, its maintainer scripts in
+`/var/lib/dpkg/info`, and its conffiles waiting at `<path>.dpkg-new`. dpkg
+can then configure everything inside the image, the way debootstrap's
+second stage does, for instance in a Dockerfile `RUN`:
+
+```sh
+printf '#!/bin/sh\nexit 101\n' >/usr/sbin/policy-rc.d   # start no services
+chmod 755 /usr/sbin/policy-rc.d
+dpkg --configure --force-depends base-passwd           # users and groups first
+dpkg --configure --pending --force-configure-any --force-depends
+test -z "$(dpkg --audit)"
+rm /usr/sbin/policy-rc.d
+```
+
+Essential packages depend on each other in cycles, hence the `--force`
+flags; debootstrap uses them too. The scripts then run in the image, as
+root, the same as with apt. The image needs whatever they call (a shell,
+Perl for debconf), and since nothing pulls Essential packages in, you
+list them in the manifest.
 
 ## GUARANTEES
 

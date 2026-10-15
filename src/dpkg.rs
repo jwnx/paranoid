@@ -31,6 +31,9 @@ pub enum DpkgError {
 
     #[error("conffile {0} is not a regular file the package installed")]
     MissingConffile(String),
+
+    #[error("failed to set a conffile aside")]
+    Rootfs(#[source] crate::rootfs::RootfsError),
 }
 
 /// The fields dpkg knows, in the order it writes them to `status`. Any
@@ -84,26 +87,43 @@ struct Installed {
     paths: Vec<String>,
 }
 
+/// How far each package got, as far as dpkg is concerned.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum PackageState {
+    /// `install ok installed`: done. Nothing ran the maintainer scripts.
+    #[default]
+    Installed,
+    /// `install ok unpacked`, exactly as `dpkg --unpack` leaves a package:
+    /// files in place except conffiles, which wait at `<path>.dpkg-new`.
+    /// `dpkg --configure` then runs each `postinst` and moves the conffiles
+    /// into place, like debootstrap's second stage.
+    Unpacked,
+}
+
 /// The dpkg database for a set of installed packages.
 #[derive(Debug, Default, Clone)]
 pub struct DpkgDatabase {
+    state: PackageState,
     /// By package name, so `status` comes out sorted like dpkg writes it.
     packages: BTreeMap<String, Installed>,
 }
 
 impl DpkgDatabase {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(state: PackageState) -> Self {
+        Self {
+            state,
+            packages: BTreeMap::new(),
+        }
     }
 
-    /// Record a package as installed, given its control files, the paths
-    /// it installed, and the rootfs right after installing it, which holds
-    /// its conffiles as shipped.
+    /// Record a package, given its control files, the paths it installed,
+    /// and the rootfs right after installing it, which holds its conffiles
+    /// as shipped. An unpacked package's conffiles move to `.dpkg-new`.
     pub fn add(
         &mut self,
         control: ControlFiles,
         paths: &[InstalledPath],
-        rootfs: &Rootfs,
+        rootfs: &mut Rootfs,
     ) -> Result<(), DpkgError> {
         let fields = fields(&control.control);
         let name = value(&fields, "Package")
@@ -116,10 +136,23 @@ impl DpkgDatabase {
             name.clone()
         };
 
-        let conffiles = conffile_hashes(control.conffiles.as_deref(), paths, rootfs)?;
+        let mut conffiles = conffiles(control.conffiles.as_deref(), paths, rootfs)?;
+        let status = match self.state {
+            PackageState::Installed => "install ok installed",
+            PackageState::Unpacked => {
+                for conffile in &mut conffiles {
+                    let key = &conffile.key;
+                    rootfs
+                        .rename_file(key, &format!("{key}.dpkg-new"))
+                        .map_err(DpkgError::Rootfs)?;
+                    conffile.hash = "newconffile".to_string();
+                }
+                "install ok unpacked"
+            }
+        };
         let installed = Installed {
             info_name,
-            stanza: status_stanza(fields, "install ok installed", &conffiles),
+            stanza: status_stanza(fields, status, &conffiles),
             paths: paths.iter().map(|p| p.listed.clone()).collect(),
             control,
         };
@@ -208,12 +241,23 @@ fn value<'a>(fields: &'a [(&str, String)], name: &str) -> Option<&'a str> {
         .map(|(_, value)| value.trim())
 }
 
-/// `(path, md5)` for each conffile, as dpkg records them once installed.
-fn conffile_hashes(
+/// A conffile as `status` records it.
+struct Conffile {
+    /// Where it is in the rootfs.
+    key: String,
+    /// Its path as the package names it.
+    path: String,
+    /// The MD5 of its contents as installed, or `newconffile` while it
+    /// waits to be configured.
+    hash: String,
+}
+
+/// The package's conffiles, hashed as installed.
+fn conffiles(
     conffiles: Option<&str>,
     paths: &[InstalledPath],
     rootfs: &Rootfs,
-) -> Result<Vec<(String, String)>, DpkgError> {
+) -> Result<Vec<Conffile>, DpkgError> {
     let Some(conffiles) = conffiles else {
         return Ok(Vec::new());
     };
@@ -224,32 +268,32 @@ fn conffile_hashes(
         // ships, for dpkg to remove on upgrade. There's nothing to record.
         .filter(|line| line.starts_with('/'))
         .map(|path| {
-            let data = paths
+            let (key, data) = paths
                 .iter()
                 .find(|p| p.listed == path)
                 .and_then(|p| p.key.as_deref())
                 .and_then(|key| match rootfs.get(key) {
-                    Some(Node::File(_, data) | Node::Hardlink { data, .. }) => Some(data),
+                    Some(Node::File(_, data) | Node::Hardlink { data, .. }) => Some((key, data)),
                     _ => None,
                 })
                 .ok_or_else(|| DpkgError::MissingConffile(path.to_string()))?;
-            Ok((path.to_string(), hex::encode(Md5::digest(data))))
+            Ok(Conffile {
+                key: key.to_string(),
+                path: path.to_string(),
+                hash: hex::encode(Md5::digest(data)),
+            })
         })
         .collect()
 }
 
 /// A control stanza as dpkg keeps it in `status`: with `Status` and
 /// `Conffiles` added, and fields in dpkg's order.
-fn status_stanza(
-    mut fields: Vec<(&str, String)>,
-    status: &str,
-    conffiles: &[(String, String)],
-) -> String {
+fn status_stanza(mut fields: Vec<(&str, String)>, status: &str, conffiles: &[Conffile]) -> String {
     fields.push(("Status", format!("Status: {status}")));
     if !conffiles.is_empty() {
         let mut raw = "Conffiles:".to_string();
-        for (path, md5) in conffiles {
-            raw.push_str(&format!("\n {path} {md5}"));
+        for Conffile { path, hash, .. } in conffiles {
+            raw.push_str(&format!("\n {path} {hash}"));
         }
         fields.push(("Conffiles", raw));
     }
@@ -329,8 +373,8 @@ mod tests {
 
     #[test]
     fn writes_status_sorted_by_name_in_dpkgs_field_order() {
-        let mut db = DpkgDatabase::new();
-        let empty = Rootfs::new();
+        let mut db = DpkgDatabase::new(PackageState::Installed);
+        let mut empty = Rootfs::new();
         db.add(
             control(
                 "Package: zlib1g\nVersion: 1\nArchitecture: amd64\nMaintainer: m\n\
@@ -338,13 +382,13 @@ mod tests {
                  Description: z\n more\n  indented\n .\nHomepage: https://zlib.net\n",
             ),
             &[],
-            &empty,
+            &mut empty,
         )
         .unwrap();
         db.add(
             control("Package: bash\nVersion: 5.2\nArchitecture: amd64\nEssential: yes\n\n"),
             &[],
-            &empty,
+            &mut empty,
         )
         .unwrap();
 
@@ -361,15 +405,15 @@ mod tests {
 
     #[test]
     fn records_conffiles_with_their_md5() {
-        let (fs, paths) = installed(&[
+        let (mut fs, paths) = installed(&[
             ("etc/protocols", b"ip 0 IP\n"),
             ("usr/share/doc/netbase/copyright", b"c"),
         ]);
         let mut netbase = control("Package: netbase\nArchitecture: all\nVersion: 6.4\n");
         netbase.conffiles = Some("/etc/protocols\nremove-on-upgrade /etc/gone\n".into());
 
-        let mut db = DpkgDatabase::new();
-        db.add(netbase, &paths, &fs).unwrap();
+        let mut db = DpkgDatabase::new(PackageState::Installed);
+        db.add(netbase, &paths, &mut fs).unwrap();
         let md5 = hex::encode(Md5::digest(b"ip 0 IP\n"));
         let db = database(&db);
         assert_eq!(
@@ -385,27 +429,65 @@ mod tests {
         );
     }
 
+    /// What `dpkg --unpack netbase` leaves, checked against dpkg 1.21.
+    #[test]
+    fn unpacked_packages_wait_for_dpkg_configure() {
+        let (mut fs, paths) = installed(&[
+            ("etc/protocols", b"ip 0 IP\n"),
+            ("usr/share/doc/netbase/copyright", b"c"),
+        ]);
+        let mut netbase = control("Package: netbase\nArchitecture: all\nVersion: 6.4\n");
+        netbase.conffiles = Some("/etc/protocols\n".into());
+        netbase.scripts = vec![
+            ("postinst".into(), b"#!/bin/sh\n".to_vec()),
+            ("templates".into(), b"Template: t\n".to_vec()),
+        ];
+
+        let mut db = DpkgDatabase::new(PackageState::Unpacked);
+        db.add(netbase, &paths, &mut fs).unwrap();
+
+        // The conffile waits beside its final path.
+        assert!(fs.get("etc/protocols").is_none());
+        assert_eq!(file(&fs, "etc/protocols.dpkg-new"), "ip 0 IP\n");
+
+        let db = database(&db);
+        assert_eq!(
+            file(&db, "var/lib/dpkg/status"),
+            "Package: netbase\nStatus: install ok unpacked\nArchitecture: all\n\
+             Version: 6.4\nConffiles:\n /etc/protocols newconffile\n\n"
+        );
+        // The list names the final path, as dpkg's does. (The test tar has no
+        // directory entries; real packages list their directories too.)
+        assert_eq!(
+            file(&db, "var/lib/dpkg/info/netbase.list"),
+            "/etc/protocols\n/usr/share/doc/netbase/copyright\n"
+        );
+        let mode = |path| db.get(path).unwrap().meta().mode & 0o7777;
+        assert_eq!(mode("var/lib/dpkg/info/netbase.postinst"), 0o755);
+        assert_eq!(mode("var/lib/dpkg/info/netbase.templates"), 0o644);
+    }
+
     #[test]
     fn a_conffile_the_package_didnt_install_is_an_error() {
-        let (fs, paths) = installed(&[("etc/other", b"x")]);
+        let (mut fs, paths) = installed(&[("etc/other", b"x")]);
         let mut pkg = control("Package: p\nArchitecture: all\n");
         pkg.conffiles = Some("/etc/missing\n".into());
         assert!(matches!(
-            DpkgDatabase::new().add(pkg, &paths, &fs),
+            DpkgDatabase::new(PackageState::Installed).add(pkg, &paths, &mut fs),
             Err(DpkgError::MissingConffile(path)) if path == "/etc/missing"
         ));
     }
 
     #[test]
     fn writes_info_files_under_the_multiarch_name() {
-        let mut db = DpkgDatabase::new();
-        let empty = Rootfs::new();
+        let mut db = DpkgDatabase::new(PackageState::Installed);
+        let mut empty = Rootfs::new();
         let mut libc = control("Package: libc6\nArchitecture: amd64\nMulti-Arch: same\n");
         libc.md5sums = Some(b"abc  usr/lib/libc.so.6\n".to_vec());
         db.add(
             libc,
             &[path("/."), path("/usr"), path("/usr/lib/libc.so.6")],
-            &empty,
+            &mut empty,
         )
         .unwrap();
 
@@ -423,12 +505,20 @@ mod tests {
 
     #[test]
     fn rejects_a_package_installed_twice() {
-        let mut db = DpkgDatabase::new();
-        let empty = Rootfs::new();
-        db.add(control("Package: bash\nArchitecture: amd64\n"), &[], &empty)
-            .unwrap();
+        let mut db = DpkgDatabase::new(PackageState::Installed);
+        let mut empty = Rootfs::new();
+        db.add(
+            control("Package: bash\nArchitecture: amd64\n"),
+            &[],
+            &mut empty,
+        )
+        .unwrap();
         assert!(matches!(
-            db.add(control("Package: bash\nArchitecture: amd64\n"), &[], &empty),
+            db.add(
+                control("Package: bash\nArchitecture: amd64\n"),
+                &[],
+                &mut empty
+            ),
             Err(DpkgError::Duplicate(_))
         ));
     }
@@ -436,7 +526,11 @@ mod tests {
     #[test]
     fn rejects_a_control_file_without_package() {
         assert!(matches!(
-            DpkgDatabase::new().add(control("Architecture: amd64\n"), &[], &Rootfs::new()),
+            DpkgDatabase::new(PackageState::Installed).add(
+                control("Architecture: amd64\n"),
+                &[],
+                &mut Rootfs::new()
+            ),
             Err(DpkgError::MissingField("Package"))
         ));
     }

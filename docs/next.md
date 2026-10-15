@@ -22,6 +22,13 @@ check them against dpkg and apt. What's left:
   does the same on an empty system, but it's easy to trip over: apt itself
   needs dpkg's data files to run. Consider a warning, or an opt-in.
 
+- On bookworm, an `unconfigured` image that has `usrmerge` (it satisfies
+  `init-system-helpers`' dependency on merged `/usr`) fails to configure
+  it: `usrmerge`'s postinst refuses to convert under overlayfs. debootstrap
+  avoids it by creating the merged-`/usr` links before installing anything.
+  Consider doing the same for distributions that expect it, or picking
+  `usr-is-merged` when the links are there.
+
 ## 2. Trust chain
 
 Every repository names its keys with `signed_by`. `lock` verifies
