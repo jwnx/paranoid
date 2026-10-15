@@ -9,10 +9,9 @@ use crate::config::Manifest;
 use crate::hash::{ParseSha256Error, Sha256};
 use crate::http::{Client, ClientError};
 use crate::repository::debian::{
-    DebianPackage, DebianRepository, DebianRepositoryError, DebianVersion, PackageIndexSet,
-    Request, ResolveError, UnmetDependency, resolve,
+    DebianPackage, DebianRepository, DebianRepositoryError, PackageIndexSet, Request, ResolveError,
+    UnmetDependency, resolve,
 };
-use crate::version::VersionConstraint;
 
 /// Errors that can occur during resolution.
 #[derive(Debug, Error)]
@@ -31,14 +30,6 @@ pub enum ResolveServiceError {
         package: String,
         #[source]
         source: ParseSha256Error,
-    },
-
-    #[error("invalid version constraint for package '{package}': {source}")]
-    InvalidVersionConstraint {
-        package: String,
-        #[source]
-        source:
-            crate::version::ParseVersionConstraintError<<DebianVersion as std::str::FromStr>::Err>,
     },
 }
 
@@ -136,24 +127,15 @@ impl ResolveService {
             index_set.add_index(repo_name.clone(), index);
         }
 
-        let requests = manifest
+        let requests: Vec<Request> = manifest
             .packages
             .iter()
-            .map(|spec| {
-                let mut request = Request::new(&spec.name);
-                request.repository = spec.repository.clone();
-                if let Some(version) = &spec.version {
-                    let constraint = version
-                        .parse::<VersionConstraint<DebianVersion>>()
-                        .map_err(|source| ResolveServiceError::InvalidVersionConstraint {
-                            package: spec.name.clone(),
-                            source,
-                        })?;
-                    request = request.version(constraint);
-                }
-                Ok(request)
+            .map(|spec| Request {
+                name: spec.name.clone(),
+                version: spec.version.clone(),
+                repository: spec.repository.clone(),
             })
-            .collect::<Result<Vec<_>, ResolveServiceError>>()?;
+            .collect();
 
         let resolution = resolve(&index_set, &requests, arch)?;
         let packages = resolution
@@ -177,12 +159,5 @@ mod tests {
     #[test]
     fn test_resolve_service_creation() {
         let _service = ResolveService::new().expect("Should create service");
-    }
-
-    #[test]
-    fn test_invalid_version_string_returns_error() {
-        // A version with an invalid epoch (non-numeric) must fail.
-        let result = "= abc:1.0".parse::<VersionConstraint<DebianVersion>>();
-        assert!(result.is_err(), "invalid epoch should fail to parse");
     }
 }

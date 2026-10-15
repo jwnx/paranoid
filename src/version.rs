@@ -171,6 +171,21 @@ impl<V: Version + std::fmt::Display> std::fmt::Display for VersionConstraint<V> 
     }
 }
 
+/// Serializes in its normal form, `">= 1.0"`, however it was written.
+impl<V: Version + std::fmt::Display> serde::Serialize for VersionConstraint<V> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de, V: Version> serde::Deserialize<'de> for VersionConstraint<V> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        <String as serde::Deserialize>::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -12,8 +12,6 @@ Version comparison, relation parsing and package selection were rewritten
 after the tidy-up. `scripts/dpkg-oracle.sh` and `scripts/apt-oracle.sh`
 check them against dpkg and apt. What's left:
 
-- Parse `PackageSpec.version` into a constraint when the manifest is
-  loaded. It's still parsed late, in the resolve service.
 - The resolver is greedy, with restarts when a requirement needs a
   different version of something already chosen (see `resolver.rs`). If a
   real manifest hits a conflict apt gets around, reach for `pubgrub` or

@@ -7,6 +7,8 @@ use thiserror::Error;
 use url::Url;
 
 use crate::arch::Architecture;
+use crate::repository::DebianVersion;
+use crate::version::VersionConstraint;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -75,7 +77,8 @@ where
 #[serde(deny_unknown_fields)]
 pub struct PackageSpec {
     pub name: String,
-    pub version: Option<String>,
+    /// `">= 1.0"`, or a bare version meaning `"= 1.0"`.
+    pub version: Option<VersionConstraint<DebianVersion>>,
     /// Optional repository name to pin this package to.
     /// If not specified, the package will be searched in all repositories.
     pub repository: Option<String>,
@@ -103,7 +106,7 @@ pub enum ManifestError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("TOML parse error: {0}")]
+    #[error("{0}")]
     ParseToml(#[from] toml::de::Error),
 
     #[error("YAML parse error: {0}")]
@@ -364,7 +367,13 @@ PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
         assert_eq!(manifest.packages[0].name, "nginx");
         assert!(manifest.packages[0].version.is_none());
         assert_eq!(manifest.packages[1].name, "curl");
-        assert_eq!(manifest.packages[1].version, Some("7.88.1-10".to_string()));
+        assert_eq!(
+            manifest.packages[1]
+                .version
+                .as_ref()
+                .map(ToString::to_string),
+            Some("= 7.88.1-10".to_string())
+        );
 
         assert!(manifest.entrypoint.is_some());
         let entrypoint = manifest.entrypoint.unwrap();
@@ -548,7 +557,13 @@ packages:
 
         assert_eq!(manifest.packages.len(), 2);
         assert_eq!(manifest.packages[0].name, "nginx");
-        assert_eq!(manifest.packages[1].version, Some("7.88.1-10".to_string()));
+        assert_eq!(
+            manifest.packages[1]
+                .version
+                .as_ref()
+                .map(ToString::to_string),
+            Some("= 7.88.1-10".to_string())
+        );
     }
 
     #[test]
@@ -798,5 +813,24 @@ name = "bash"
         let manifest = Manifest::from_str(config).unwrap();
         let names: Vec<_> = manifest.repositories.keys().map(String::as_str).collect();
         assert_eq!(names, ["zeta", "alpha"]);
+    }
+
+    /// A bad version constraint is a manifest error, not a resolve error.
+    #[test]
+    fn rejects_invalid_version_constraints() {
+        for version in ["> 1.0", ">= ", "1.0-", "abc:1"] {
+            let config = format!(
+                "[repositories.debian]\nurl = \"https://deb.debian.org/debian\"\n\
+                 distribution = \"bookworm\"\ncomponents = [\"main\"]\n\n\
+                 [[packages]]\nname = \"bash\"\nversion = \"{version}\"\n"
+            );
+            assert!(
+                matches!(
+                    Manifest::from_str(&config),
+                    Err(ManifestError::ParseToml(_))
+                ),
+                "accepted {version:?}"
+            );
+        }
     }
 }

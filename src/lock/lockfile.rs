@@ -470,6 +470,22 @@ name = "vim"
         assert_ne!(hash1, hash2);
     }
 
+    /// The hash covers what the constraint means, not how it was spelled.
+    #[test]
+    fn test_config_hash_normalizes_versions() {
+        let with_version = |version: &str| {
+            let config = format!(
+                "[repositories.debian]\nurl = \"https://deb.debian.org/debian\"\n\
+                 distribution = \"bookworm\"\ncomponents = [\"main\"]\n\n\
+                 [[packages]]\nname = \"bash\"\nversion = \"{version}\"\n"
+            );
+            LockFile::compute_config_hash(&Manifest::from_str(&config).unwrap())
+        };
+        assert_eq!(with_version(">=5.2"), with_version(">= 5.2"));
+        assert_eq!(with_version("5.2"), with_version("= 5.2"));
+        assert_ne!(with_version(">= 5.2"), with_version(">= 5.3"));
+    }
+
     #[test]
     fn test_matches_config() {
         let manifest = make_manifest();
