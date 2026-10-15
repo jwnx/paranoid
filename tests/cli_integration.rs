@@ -511,6 +511,29 @@ fn inspect_lock_shows_package_count_and_size() {
     assert!(out_str.contains("MB"), "expected size in MB: {out_str}");
 }
 
+/// `paranoid inspect lock | head` must stop quietly, not panic.
+#[cfg(unix)]
+#[test]
+fn inspect_lock_stops_quietly_on_a_closed_pipe() {
+    use std::process::Stdio;
+
+    let mut child = Command::new(paranoid_bin())
+        .args(["inspect", "lock"])
+        .arg(hello_world_dir().join("paranoid.lock"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Close the reading end before anything is read.
+    drop(child.stdout.take());
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        !stderr(&out).contains("panicked"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
 #[test]
 fn inspect_lock_fails_on_missing_file() {
     let out = paranoid(&["inspect", "lock", "/nonexistent/path/paranoid.lock"]);

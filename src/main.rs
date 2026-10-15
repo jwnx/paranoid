@@ -46,6 +46,7 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    restore_sigpipe();
     let Cli { quiet, command } = Cli::parse();
 
     let result = match command {
@@ -60,5 +61,17 @@ async fn main() -> ExitCode {
             st::error(&e);
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Let a closed pipe end the process quietly, as it does for other command
+/// line tools, instead of making `println!` panic: `paranoid inspect lock |
+/// head` should just stop. Rust ignores SIGPIPE by default.
+fn restore_sigpipe() {
+    #[cfg(unix)]
+    // SAFETY: SIG_DFL is a valid disposition for SIGPIPE, and nothing else
+    // in the process installs a SIGPIPE handler for this to race with.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
 }

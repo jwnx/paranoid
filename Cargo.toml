@@ -26,6 +26,7 @@ tar = "0.4"
 zstd = "0.13"
 indexmap = { version = "2", features = ["serde"] }
 pgp = { version = "0.20", default-features = false }
+libc = "0.2"
 
 [dev-dependencies]
 proptest = "1.6"
