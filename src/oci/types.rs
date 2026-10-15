@@ -525,6 +525,12 @@ impl Timestamp {
         Self(DateTime::UNIX_EPOCH)
     }
 
+    /// A timestamp from seconds since the Unix epoch, as used by
+    /// `SOURCE_DATE_EPOCH`. Returns `None` if out of range.
+    pub fn from_unix(secs: i64) -> Option<Self> {
+        DateTime::from_timestamp(secs, 0).map(Self)
+    }
+
     /// The inner [`DateTime<Utc>`].
     pub fn as_datetime(&self) -> &DateTime<Utc> {
         &self.0

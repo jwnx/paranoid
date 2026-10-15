@@ -1,8 +1,9 @@
 //! Download service for parallel package downloads.
 
-use std::collections::HashMap;
+use std::num::NonZeroUsize;
 
 use futures::stream::{self, StreamExt};
+use indexmap::IndexMap;
 
 use crate::config::RepositoryConfig;
 use crate::http::Client;
@@ -16,16 +17,17 @@ use super::progress::DownloadProgress;
 ///
 /// Use the builder methods for ergonomic construction:
 /// ```
+/// use std::num::NonZeroUsize;
 /// use paranoid::download::DownloadConfig;
 ///
 /// let config = DownloadConfig::new()
-///     .with_max_concurrent(8)
+///     .with_max_concurrent(NonZeroUsize::new(8).unwrap())
 ///     .with_force_download(true);
 /// ```
 #[derive(Debug, Clone)]
 pub struct DownloadConfig {
     /// Maximum number of concurrent downloads.
-    max_concurrent: usize,
+    max_concurrent: NonZeroUsize,
     /// Force re-download even if cached.
     force_download: bool,
 }
@@ -37,7 +39,7 @@ impl DownloadConfig {
     }
 
     /// Set the maximum number of concurrent downloads.
-    pub fn with_max_concurrent(mut self, n: usize) -> Self {
+    pub fn with_max_concurrent(mut self, n: NonZeroUsize) -> Self {
         self.max_concurrent = n;
         self
     }
@@ -50,7 +52,7 @@ impl DownloadConfig {
 
     /// Get the maximum number of concurrent downloads.
     #[must_use]
-    pub fn max_concurrent(&self) -> usize {
+    pub fn max_concurrent(&self) -> NonZeroUsize {
         self.max_concurrent
     }
 
@@ -64,7 +66,7 @@ impl DownloadConfig {
 impl Default for DownloadConfig {
     fn default() -> Self {
         Self {
-            max_concurrent: 4,
+            max_concurrent: NonZeroUsize::new(4).unwrap(),
             force_download: false,
         }
     }
@@ -111,7 +113,7 @@ impl DownloadService {
     pub async fn download_all<P: DownloadProgress>(
         &self,
         lock_file: &LockFile,
-        repositories: &HashMap<String, RepositoryConfig>,
+        repositories: &IndexMap<String, RepositoryConfig>,
         progress: &P,
     ) -> DownloadResult {
         let total_bytes: u64 = lock_file.packages.iter().map(|p| p.size).sum();
@@ -126,7 +128,7 @@ impl DownloadService {
         // Execute with bounded concurrency
         let results: Vec<Result<DownloadedPackage, DownloadFailure>> =
             stream::iter(download_futures)
-                .buffer_unordered(self.config.max_concurrent())
+                .buffer_unordered(self.config.max_concurrent().get())
                 .collect()
                 .await;
 
@@ -232,16 +234,16 @@ mod tests {
     #[test]
     fn test_download_config_default() {
         let config = DownloadConfig::default();
-        assert_eq!(config.max_concurrent(), 4);
+        assert_eq!(config.max_concurrent().get(), 4);
         assert!(!config.force_download());
     }
 
     #[test]
     fn test_download_config_builder() {
         let config = DownloadConfig::new()
-            .with_max_concurrent(8)
+            .with_max_concurrent(NonZeroUsize::new(8).unwrap())
             .with_force_download(true);
-        assert_eq!(config.max_concurrent(), 8);
+        assert_eq!(config.max_concurrent().get(), 8);
         assert!(config.force_download());
     }
 

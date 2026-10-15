@@ -5,6 +5,7 @@
 //!   build    Download, extract, and build an OCI image
 //!   inspect  Show the contents of a lock file or built image
 
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -21,10 +22,10 @@ use cli::progress::{DotsDownloadProgress, DotsExtractionProgress, DotsOciProgres
 use cli::style as st;
 
 use paranoid::config::Manifest;
-use paranoid::download::{DownloadConfig, DownloadService};
+use paranoid::download::{DownloadConfig, DownloadService, PackageCache};
 use paranoid::extract::{ExtractionConfig, ExtractionMode, ExtractionService};
 use paranoid::lock::LockFile;
-use paranoid::oci::{OciConfig, OciImageService};
+use paranoid::oci::{OciConfig, OciImageService, Timestamp};
 use paranoid::resolve::ResolveService;
 
 // ── Top-level CLI ─────────────────────────────────────────────────────────────
@@ -108,8 +109,8 @@ struct BuildArgs {
     force_download: bool,
 
     /// Maximum number of parallel downloads.
-    #[arg(long, value_name = "N", default_value_t = 4)]
-    jobs: usize,
+    #[arg(long, value_name = "N", default_value = "4")]
+    jobs: NonZeroUsize,
 }
 
 // ── inspect ───────────────────────────────────────────────────────────────────
@@ -265,8 +266,12 @@ async fn run_build(args: BuildArgs, quiet: bool) -> Result<(), CliError> {
         .with_max_concurrent(args.jobs)
         .with_force_download(args.force_download);
 
-    let download_service =
-        DownloadService::with_config(download_config).map_err(CliError::download)?;
+    let download_service = match args.cache_dir {
+        Some(dir) => PackageCache::with_base_dir(dir)
+            .and_then(|cache| DownloadService::with_cache(cache, download_config)),
+        None => DownloadService::with_config(download_config),
+    }
+    .map_err(CliError::download)?;
 
     let download_progress = DotsDownloadProgress::new(quiet);
     let download_result = download_service
@@ -275,10 +280,8 @@ async fn run_build(args: BuildArgs, quiet: bool) -> Result<(), CliError> {
 
     download_progress.finish();
 
+    // Individual failures were already reported by the progress reporter.
     if !download_result.failed.is_empty() {
-        for failure in &download_result.failed {
-            st::error(format!("{}: {}", failure.name, failure.error));
-        }
         return Err(CliError::download_failures(download_result.failed.len()));
     }
 
@@ -299,14 +302,12 @@ async fn run_build(args: BuildArgs, quiet: bool) -> Result<(), CliError> {
     extract_progress.finish();
 
     if !extract_result.failed.is_empty() {
-        for failure in &extract_result.failed {
-            st::error(format!("{}: {}", failure.name, failure.error));
-        }
         return Err(CliError::extract_failures(extract_result.failed.len()));
     }
 
     // ── OCI ───────────────────────────────────────────────────────────────────
-    let oci_config = build_oci_config(&manifest)?;
+    let oci_config = OciConfig::from_manifest(&manifest, source_date_epoch()?)
+        .map_err(|e| CliError::config(e.to_string()))?;
 
     // Capture name+tag before moving config into the service.
     let image_ref: Option<String> = oci_config
@@ -645,7 +646,7 @@ fn inspect_image(path: &Path) -> Result<(), CliError> {
     }
     st::dots_row(
         "Architecture",
-        image_config.architecture.oci_name(),
+        image_config.architecture.as_str(),
         LABEL_W,
         TOTAL_W,
     );
@@ -760,54 +761,19 @@ fn load_manifest(path: &Path) -> Result<Manifest, CliError> {
     }
 }
 
-fn build_oci_config(manifest: &Manifest) -> Result<OciConfig, CliError> {
-    let mut config = OciConfig::new();
-
-    if let Some(image) = &manifest.image {
-        let arch: paranoid::arch::Architecture = image
-            .architecture
-            .parse()
-            .map_err(|_| CliError::invalid_arch(&image.architecture))?;
-        config = config.architecture(arch);
-
-        if let Some(ref name) = image.name {
-            config = config
-                .try_image_name(name.as_str())
-                .map_err(|e| CliError::config(format!("invalid image name '{}': {}", name, e)))?;
-        }
-
-        if let Some(ref tag) = image.tag {
-            config = config
-                .try_image_tag(tag.as_str())
-                .map_err(|e| CliError::config(format!("invalid image tag '{}': {}", tag, e)))?;
-        }
-
-        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        config = config.label("org.opencontainers.image.created", now);
-
-        if let Some(ref name) = image.name {
-            config = config.label("org.opencontainers.image.title", name);
-        }
-        if let Some(ref desc) = image.description {
-            config = config.label("org.opencontainers.image.description", desc);
-        }
-        if let Some(ref authors) = image.authors {
-            config = config.label("org.opencontainers.image.authors", authors);
-        }
-        if let Some(ref source) = image.source {
-            config = config.label("org.opencontainers.image.source", source);
-        }
-
-        if let Some(rev) = git_revision() {
-            config = config.label("org.opencontainers.image.revision", rev);
-        }
-    }
-
-    if let Some(ref ep) = manifest.entrypoint {
-        config = config.entrypoint(ep.cmd.iter().cloned());
-    }
-
-    Ok(config)
+/// The image creation time: `SOURCE_DATE_EPOCH` when set, the Unix epoch
+/// otherwise, so that building the same lock twice yields the same digest.
+///
+/// See <https://reproducible-builds.org/docs/source-date-epoch/>.
+fn source_date_epoch() -> Result<Timestamp, CliError> {
+    let Ok(raw) = std::env::var("SOURCE_DATE_EPOCH") else {
+        return Ok(Timestamp::epoch());
+    };
+    raw.trim()
+        .parse()
+        .ok()
+        .and_then(Timestamp::from_unix)
+        .ok_or_else(|| CliError::config(format!("invalid SOURCE_DATE_EPOCH '{raw}'")))
 }
 
 /// Compute package diff counts between two lock files.
@@ -877,16 +843,4 @@ fn print_lock_diff(old: &LockFile, new: &LockFile) {
     for (_, sigil, name, detail) in entries {
         st::diff_line(sigil, name, &detail);
     }
-}
-
-/// Attempt to read the current git HEAD commit SHA.
-fn git_revision() -> Option<String> {
-    std::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
 }

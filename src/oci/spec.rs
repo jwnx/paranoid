@@ -481,7 +481,17 @@ impl Serialize for ImageConfig {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
 
+        let platform = self.architecture.oci_platform().ok_or_else(|| {
+            serde::ser::Error::custom(format!(
+                "architecture '{}' has no OCI equivalent",
+                self.architecture
+            ))
+        })?;
+
         let mut len = 3; // architecture, os, rootfs
+        if platform.variant.is_some() {
+            len += 1;
+        }
         if self.created.is_some() {
             len += 1;
         }
@@ -504,7 +514,10 @@ impl Serialize for ImageConfig {
             map.serialize_entry("author", author)?;
         }
 
-        map.serialize_entry("architecture", self.architecture.oci_name())?;
+        map.serialize_entry("architecture", platform.architecture)?;
+        if let Some(variant) = platform.variant {
+            map.serialize_entry("variant", variant)?;
+        }
         map.serialize_entry("os", OS)?;
 
         if let Some(ref config) = self.config {
@@ -531,6 +544,7 @@ impl<'de> Deserialize<'de> for ImageConfig {
             created: Option<Timestamp>,
             author: Option<String>,
             architecture: String,
+            variant: Option<String>,
             #[allow(dead_code)]
             os: String,
             config: Option<ContainerConfig>,
@@ -540,12 +554,13 @@ impl<'de> Deserialize<'de> for ImageConfig {
 
         let helper = ImageConfigHelper::deserialize(deserializer)?;
 
-        let architecture = helper.architecture.parse().map_err(|_| {
-            serde::de::Error::custom(format!(
-                "unknown OCI architecture: {:?}",
-                helper.architecture
-            ))
-        })?;
+        let architecture = Architecture::from_oci(&helper.architecture, helper.variant.as_deref())
+            .ok_or_else(|| {
+                serde::de::Error::custom(format!(
+                    "unknown OCI architecture: {:?} (variant {:?})",
+                    helper.architecture, helper.variant
+                ))
+            })?;
 
         Ok(ImageConfig {
             created: helper.created,

@@ -516,7 +516,7 @@ name = "ca-certificates"
     let cache =
         PackageCache::with_base_dir(temp_dir.path().to_path_buf()).expect("Should create cache");
     let download_config = DownloadConfig::new()
-        .with_max_concurrent(4)
+        .with_max_concurrent(std::num::NonZeroUsize::new(4).unwrap())
         .with_force_download(false);
     let download_service = DownloadService::with_cache(cache, download_config)
         .expect("Should create download service");
@@ -581,7 +581,7 @@ name = "base-files"
     let cache =
         PackageCache::with_base_dir(temp_dir.path().to_path_buf()).expect("Should create cache");
     let download_config = DownloadConfig::new()
-        .with_max_concurrent(4)
+        .with_max_concurrent(std::num::NonZeroUsize::new(4).unwrap())
         .with_force_download(false);
     let download_service = DownloadService::with_cache(cache, download_config)
         .expect("Should create download service");

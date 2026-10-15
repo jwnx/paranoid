@@ -25,15 +25,6 @@ pub enum ResolveServiceError {
     #[error("resolve error: {0}")]
     Resolve(#[from] ResolveError),
 
-    #[error("unknown architecture: {0}")]
-    UnknownArchitecture(String),
-
-    #[error("unknown repository: {0}")]
-    UnknownRepository(String),
-
-    #[error("no repositories configured")]
-    NoRepositories,
-
     #[error("invalid version constraint for package '{package}': {source}")]
     InvalidVersionConstraint {
         package: String,
@@ -113,25 +104,12 @@ impl ResolveService {
         &self,
         manifest: &Manifest,
     ) -> Result<ResolvedManifest, ResolveServiceError> {
-        if manifest.repositories.is_empty() {
-            return Err(ResolveServiceError::NoRepositories);
-        }
-
-        // Validate that all referenced repositories exist
-        for pkg in &manifest.packages {
-            if let Some(ref repo_name) = pkg.repository
-                && !manifest.repositories.contains_key(repo_name)
-            {
-                return Err(ResolveServiceError::UnknownRepository(repo_name.clone()));
-            }
-        }
-
+        // Repository presence, pins and architecture were validated when
+        // the manifest was parsed.
         let arch = manifest
             .image
             .as_ref()
-            .map(|i| i.architecture.parse::<Architecture>())
-            .unwrap_or(Ok(Architecture::Amd64))
-            .map_err(|e| ResolveServiceError::UnknownArchitecture(e.to_string()))?;
+            .map_or(Architecture::Amd64, |i| i.architecture);
 
         // Build the index set from all repositories
         let mut index_set = PackageIndexSet::new();

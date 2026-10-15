@@ -1,9 +1,7 @@
 //! Multi-repository index with provenance tracking.
 //!
-//! `PackagePackageIndexSet` wraps multiple `PackageIndex` instances and provides lookups
+//! `PackageIndexSet` wraps multiple `PackageIndex` instances and provides lookups
 //! that return both the package and its source repository.
-
-use std::collections::HashMap;
 
 use super::architecture::Architecture;
 use super::package::DebianPackage;
@@ -27,6 +25,11 @@ pub struct SourcedPackage<'a> {
 /// Provides unified lookups across all repositories while tracking
 /// which repository each package comes from.
 ///
+/// Repositories are kept in insertion order, which is the order they are
+/// declared in the manifest. When several repositories carry a matching
+/// package, the highest version wins and ties go to the earlier repository,
+/// so the same inputs always resolve to the same package.
+///
 /// # Example
 ///
 /// ```ignore
@@ -46,19 +49,39 @@ pub struct SourcedPackage<'a> {
 ///     .with_recommends(true)
 ///     .execute()?;
 /// ```
+#[derive(Default)]
 pub struct PackageIndexSet {
-    indices: HashMap<String, PackageIndex>,
+    indices: Vec<(String, PackageIndex)>,
 }
 
 impl PackageIndexSet {
     pub fn new() -> Self {
-        Self {
-            indices: HashMap::new(),
-        }
+        Self::default()
     }
 
+    /// Add a repository's index. Earlier repositories win version ties.
     pub fn add_index(&mut self, name: String, index: PackageIndex) {
-        self.indices.insert(name, index);
+        self.indices.push((name, index));
+    }
+
+    /// Pick the best match across repositories: highest version first, then
+    /// the earliest repository.
+    fn best<'a>(
+        &'a self,
+        find: impl Fn(&'a PackageIndex) -> Option<&'a DebianPackage>,
+    ) -> Option<SourcedPackage<'a>> {
+        self.indices
+            .iter()
+            .filter_map(|(repo, index)| {
+                find(index).map(|package| SourcedPackage {
+                    package,
+                    repository: repo,
+                })
+            })
+            // `max_by` keeps the last of equal elements, so iterate in reverse
+            // to let the earliest repository win ties.
+            .rev()
+            .max_by(|a, b| a.package.version.cmp(&b.package.version))
     }
 
     /// Resolve a single package by name, optionally with a version constraint.
@@ -102,50 +125,24 @@ impl PackageIndexSet {
     }
 
     /// Find a virtual package provider across all repositories.
-    ///
-    /// Returns the first provider found that satisfies the constraint.
     fn find_virtual_provider(
         &self,
         name: &str,
         version_constraint: Option<&VersionConstraint<DebianVersion>>,
         arch: Architecture,
     ) -> Option<SourcedPackage<'_>> {
-        for (repo_name, index) in &self.indices {
-            if let Some(pkg) = index.find_virtual_provider(name, version_constraint, arch) {
-                return Some(SourcedPackage {
-                    package: pkg,
-                    repository: repo_name,
-                });
-            }
-        }
-        None
+        self.best(|index| index.find_virtual_provider(name, version_constraint, arch))
     }
 
-    /// Find a package that matches the given criteria across all repositories.
-    ///
-    /// If `version_constraint` is `None`, returns the latest version.
-    /// Otherwise, returns the first version that satisfies the constraint.
+    /// Find the highest version matching the given criteria across all
+    /// repositories.
     fn find_package(
         &self,
         name: &str,
         version_constraint: Option<&VersionConstraint<DebianVersion>>,
         arch: Architecture,
     ) -> Option<SourcedPackage<'_>> {
-        for (repo_name, index) in &self.indices {
-            if let Some(pkg) = index.find_package(name, version_constraint, arch) {
-                return Some(SourcedPackage {
-                    package: pkg,
-                    repository: repo_name,
-                });
-            }
-        }
-        None
-    }
-}
-
-impl Default for PackageIndexSet {
-    fn default() -> Self {
-        Self::new()
+        self.best(|index| index.find_package(name, version_constraint, arch))
     }
 }
 
@@ -179,6 +176,28 @@ mod tests {
         let sourced = result.unwrap();
         assert_eq!(sourced.package.name, "bash");
         assert_eq!(sourced.repository, "debian");
+    }
+
+    #[test]
+    fn test_resolve_prefers_highest_version_across_repositories() {
+        let set = make_index_set();
+
+        let sourced = set.resolve("libc6", None, Architecture::Amd64).unwrap();
+        assert_eq!(sourced.package.version.to_string(), "2.36-10");
+        assert_eq!(sourced.repository, "security");
+    }
+
+    #[test]
+    fn test_resolve_breaks_version_ties_by_repository_order() {
+        let mut set = PackageIndexSet::new();
+        for repo in ["first", "second", "third"] {
+            let mut index = PackageIndex::new();
+            index.add(make_package("bash", "5.2.15", "amd64"));
+            set.add_index(repo.to_string(), index);
+        }
+
+        let sourced = set.resolve("bash", None, Architecture::Amd64).unwrap();
+        assert_eq!(sourced.repository, "first");
     }
 
     #[test]

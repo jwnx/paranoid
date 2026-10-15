@@ -1,37 +1,58 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use serde::Deserialize;
+use indexmap::IndexMap;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
 
+use crate::arch::Architecture;
+
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub image: Option<ImageConfig>,
+    /// Repositories in declaration order. When several carry the same
+    /// package at the same version, the earlier one wins.
     #[serde(default)]
-    pub repositories: HashMap<String, RepositoryConfig>,
+    pub repositories: IndexMap<String, RepositoryConfig>,
     #[serde(default)]
     pub packages: Vec<PackageSpec>,
     pub entrypoint: Option<EntrypointConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImageConfig {
     pub name: Option<String>,
     pub tag: Option<String>,
-    pub architecture: String,
+    #[serde(deserialize_with = "deserialize_from_str")]
+    pub architecture: Architecture,
     pub description: Option<String>,
     pub authors: Option<String>,
     pub source: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RepositoryConfig {
     #[serde(deserialize_with = "deserialize_http_url")]
     pub url: Url,
     pub distribution: String,
     pub components: Vec<String>,
+}
+
+/// Deserialize any `FromStr` type from a string, so aliases and validation
+/// live in one place.
+fn deserialize_from_str<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: FromStr,
+    T::Err: std::fmt::Display,
+{
+    String::deserialize(deserializer)?
+        .parse()
+        .map_err(serde::de::Error::custom)
 }
 
 /// Custom deserializer that validates URLs are http or https.
@@ -50,7 +71,8 @@ where
     Ok(url)
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PackageSpec {
     pub name: String,
     pub version: Option<String>,
@@ -60,9 +82,12 @@ pub struct PackageSpec {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EntrypointConfig {
     pub cmd: Vec<String>,
-    pub env: Option<HashMap<String, String>>,
+    /// Environment variables, kept in declaration order so the image config
+    /// is stable across builds.
+    pub env: Option<IndexMap<String, String>>,
     pub workdir: Option<String>,
 }
 
@@ -206,6 +231,18 @@ impl Manifest {
             });
         }
 
+        if let Some(image) = &self.image
+            && !image.architecture.is_concrete()
+        {
+            return Err(ManifestError::Validation {
+                field: "image.architecture",
+                message: format!(
+                    "'{}' is not a concrete CPU architecture",
+                    image.architecture
+                ),
+            });
+        }
+
         for (name, repo) in &self.repositories {
             // URL validation is handled by serde deserializer (deserialize_http_url)
 
@@ -236,6 +273,17 @@ impl Manifest {
                 return Err(ManifestError::Validation {
                     field: "packages",
                     message: "package name cannot be empty".to_string(),
+                });
+            }
+            if let Some(repo) = &pkg.repository
+                && !self.repositories.contains_key(repo)
+            {
+                return Err(ManifestError::Validation {
+                    field: "packages",
+                    message: format!(
+                        "package '{}' is pinned to unknown repository '{}'",
+                        pkg.name, repo
+                    ),
                 });
             }
         }
@@ -280,7 +328,7 @@ PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
         assert!(manifest.image.is_some());
         let image = manifest.image.unwrap();
         assert_eq!(image.name, Some("my-container".to_string()));
-        assert_eq!(image.architecture, "amd64");
+        assert_eq!(image.architecture, Architecture::Amd64);
         assert!(image.tag.is_none());
         assert!(image.description.is_none());
         assert!(image.authors.is_none());
@@ -416,7 +464,7 @@ name = "vim"
 
         let image = manifest.image.unwrap();
         assert!(image.name.is_none());
-        assert_eq!(image.architecture, "arm64");
+        assert_eq!(image.architecture, Architecture::Arm64);
     }
 
     #[test]
@@ -654,5 +702,81 @@ packages:
             }
             other => panic!("Expected MultipleFound, got {:?}", other),
         }
+    }
+
+    const REPO_AND_PACKAGE: &str = r#"
+[repositories.debian]
+url = "https://deb.debian.org/debian"
+distribution = "bookworm"
+components = ["main"]
+
+[[packages]]
+name = "bash"
+"#;
+
+    #[test]
+    fn error_on_meta_architecture() {
+        let config = format!("[image]\narchitecture = \"all\"\n{REPO_AND_PACKAGE}");
+        let err = Manifest::from_str(&config).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ManifestError::Validation {
+                    field: "image.architecture",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn architecture_accepts_aliases() {
+        let config = format!("[image]\narchitecture = \"x86_64\"\n{REPO_AND_PACKAGE}");
+        let manifest = Manifest::from_str(&config).unwrap();
+        assert_eq!(manifest.image.unwrap().architecture, Architecture::Amd64);
+    }
+
+    #[test]
+    fn error_on_unknown_field() {
+        let config = format!("{REPO_AND_PACKAGE}recommends = true\n");
+        assert!(Manifest::from_str(&config).is_err());
+    }
+
+    #[test]
+    fn error_on_pin_to_unknown_repository() {
+        let config = format!("{REPO_AND_PACKAGE}repository = \"nope\"\n");
+        let err = Manifest::from_str(&config).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ManifestError::Validation {
+                    field: "packages",
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn repositories_keep_declaration_order() {
+        let config = r#"
+[repositories.zeta]
+url = "https://deb.debian.org/debian"
+distribution = "bookworm"
+components = ["main"]
+
+[repositories.alpha]
+url = "https://deb.debian.org/debian-security"
+distribution = "bookworm-security"
+components = ["main"]
+
+[[packages]]
+name = "bash"
+"#;
+        let manifest = Manifest::from_str(config).unwrap();
+        let names: Vec<_> = manifest.repositories.keys().map(String::as_str).collect();
+        assert_eq!(names, ["zeta", "alpha"]);
     }
 }

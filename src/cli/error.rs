@@ -72,10 +72,6 @@ impl CliError {
         ))
     }
 
-    pub fn invalid_arch(arch: &str) -> Self {
-        Self::new(format!("unknown architecture '{}' in manifest", arch))
-    }
-
     pub fn config(msg: impl Into<String>) -> Self {
         Self::new(format!("manifest configuration error: {}", msg.into()))
     }

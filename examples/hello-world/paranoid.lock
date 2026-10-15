@@ -3,7 +3,7 @@
 #
 # Config hash: sha256:0fb92510ae9cea8e138261b148a9e232b7b3d01564b52826dfcc5d5c0af11c92
 
-config_hash = "sha256:0fb92510ae9cea8e138261b148a9e232b7b3d01564b52826dfcc5d5c0af11c92"
+config_hash = "sha256:3a2e130a3e3dbcd9ba5b4a9b83e306bbfdc44571dc3263915d40e73157f41dee"
 
 [[package]]
 name = "ca-certificates"

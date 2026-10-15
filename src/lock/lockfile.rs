@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::arch::Architecture;
-use crate::config::Manifest;
+use crate::config::{Manifest, PackageSpec, RepositoryConfig};
 use crate::resolve::ResolvedManifest;
 
 use super::Sha256Hash;
@@ -179,48 +179,36 @@ impl LockFile {
         self.config_hash == current_hash
     }
 
-    /// Compute a hash of the manifest's relevant fields.
+    /// Compute a hash of the manifest's resolution inputs.
     ///
-    /// This includes:
-    /// - Repository configurations
-    /// - Package specifications
-    /// - Target architecture
+    /// We hash a canonical JSON serialization of exactly the fields that
+    /// affect resolution: the target architecture, the repositories in
+    /// declaration order (order breaks version ties), and the requested
+    /// packages. Serializing rather than concatenating keeps field
+    /// boundaries, so `["ab", "c"]` and `["a", "bc"]` hash differently.
     fn compute_config_hash(manifest: &Manifest) -> String {
-        let mut hasher = Sha256::new();
-
-        // Hash architecture
-        if let Some(ref image) = manifest.image {
-            hasher.update(image.architecture.as_bytes());
+        #[derive(Serialize)]
+        struct ResolutionInputs<'a> {
+            architecture: Option<String>,
+            repositories: Vec<(&'a str, &'a RepositoryConfig)>,
+            packages: Vec<&'a PackageSpec>,
         }
 
-        // Hash repositories (sorted by name for determinism)
-        let mut repo_names: Vec<_> = manifest.repositories.keys().collect();
-        repo_names.sort();
-        for name in repo_names {
-            let repo = &manifest.repositories[name];
-            hasher.update(name.as_bytes());
-            hasher.update(repo.url.as_str().as_bytes());
-            hasher.update(repo.distribution.as_bytes());
-            for component in &repo.components {
-                hasher.update(component.as_bytes());
-            }
-        }
-
-        // Hash packages (sorted by name for determinism)
-        let mut packages = manifest.packages.clone();
+        let mut packages: Vec<_> = manifest.packages.iter().collect();
         packages.sort_by(|a, b| a.name.cmp(&b.name));
-        for pkg in packages {
-            hasher.update(pkg.name.as_bytes());
-            if let Some(ref version) = pkg.version {
-                hasher.update(version.as_bytes());
-            }
-            if let Some(ref repo) = pkg.repository {
-                hasher.update(repo.as_bytes());
-            }
-        }
 
-        let result = hasher.finalize();
-        format_sha256_hash(&result)
+        let inputs = ResolutionInputs {
+            architecture: manifest.image.as_ref().map(|i| i.architecture.to_string()),
+            repositories: manifest
+                .repositories
+                .iter()
+                .map(|(name, repo)| (name.as_str(), repo))
+                .collect(),
+            packages,
+        };
+
+        let json = serde_json::to_vec(&inputs).expect("resolution inputs always serialize");
+        format_sha256_hash(&Sha256::digest(&json))
     }
 
     /// Get a package by name.

@@ -7,6 +7,7 @@ use std::io::Write;
 use std::path::Path;
 
 use crate::arch::Architecture;
+use crate::config::Manifest;
 
 use super::blob::BlobStore;
 use super::digest::Digest;
@@ -234,6 +235,57 @@ impl OciConfig {
     pub fn image_tag(mut self, tag: ImageTag) -> Self {
         self.image_tag = tag;
         self
+    }
+
+    /// Build the image configuration a manifest describes.
+    ///
+    /// `created` is stamped into both the config and the
+    /// `org.opencontainers.image.created` label. Callers pick it (e.g. from
+    /// `SOURCE_DATE_EPOCH`) so identical inputs produce identical images.
+    pub fn from_manifest(manifest: &Manifest, created: Timestamp) -> Result<Self, OciConfigError> {
+        const LABEL_PREFIX: &str = "org.opencontainers.image.";
+
+        let mut config = Self::new()
+            .created(created.clone())
+            .label(format!("{LABEL_PREFIX}created"), created.to_string());
+
+        if let Some(image) = &manifest.image {
+            config = config.architecture(image.architecture);
+            if let Some(name) = &image.name {
+                config = config.try_image_name(name.as_str())?;
+            }
+            if let Some(tag) = &image.tag {
+                config = config.try_image_tag(tag.as_str())?;
+            }
+
+            let labels = [
+                ("title", &image.name),
+                ("description", &image.description),
+                ("authors", &image.authors),
+                ("source", &image.source),
+            ];
+            for (key, value) in labels {
+                if let Some(value) = value {
+                    config = config.label(format!("{LABEL_PREFIX}{key}"), value);
+                }
+            }
+        }
+
+        if let Some(entrypoint) = &manifest.entrypoint {
+            config = config.entrypoint(entrypoint.cmd.iter().cloned());
+            if let Some(env) = &entrypoint.env {
+                config = config.env(
+                    env.iter()
+                        .map(|(k, v)| EnvVar::new(k, v))
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+            }
+            if let Some(workdir) = &entrypoint.workdir {
+                config = config.try_workdir(workdir.as_str())?;
+            }
+        }
+
+        Ok(config)
     }
 
     /// Get the image name, if set.
@@ -634,7 +686,10 @@ mod tests {
             .try_image_tag("v1")
             .unwrap();
 
-        assert_eq!(config.architecture.oci_name(), "arm64");
+        assert_eq!(
+            config.architecture.oci_platform().unwrap().architecture,
+            "arm64"
+        );
         assert_eq!(config.image_tag.as_str(), "v1");
         assert_eq!(config.entrypoint, Some(vec!["/bin/sh".to_string()]));
         assert_eq!(
