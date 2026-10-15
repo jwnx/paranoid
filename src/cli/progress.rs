@@ -1,299 +1,328 @@
-//! Terminal progress reporters using indicatif.
+//! Minimal dots-style terminal progress reporters.
+//!
+//! Each phase prints a single line that grows dots as work completes:
+//!
+//! ```text
+//! Downloading packages ....                 curl
+//! Downloading packages .................... 20MB
+//! Extracting packages  .................... 247 files
+//! Building layer       ..................
+//! Done.
+//! ```
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::io::Write;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-
-use paranoid::download::DownloadedPackage;
-use paranoid::download::{DownloadError, DownloadProgress};
+use paranoid::download::{DownloadError, DownloadProgress, DownloadedPackage};
 use paranoid::extract::{ExtractionError, ExtractionProgress};
 use paranoid::lock::LockedPackage;
 use paranoid::oci::OciProgress;
 
-// ── shared helpers ────────────────────────────────────────────────────────────
+use super::style;
 
-fn spinner_style() -> ProgressStyle {
-    ProgressStyle::with_template("{spinner:.cyan} {wide_msg}")
-        .unwrap()
-        .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"])
+// ── Constants ────────────────────────────────────────────────────────────────
+
+/// Label column width (left-aligned, padded).
+const LABEL_WIDTH: usize = 21;
+
+/// Total line width for the dots area.
+const DOTS_WIDTH: usize = 20;
+
+// ── Shared helpers ───────────────────────────────────────────────────────────
+
+/// Rewrite the current line with label, dots proportional to progress, and a right-side message.
+fn print_dots_line(label: &str, progress_frac: f64, right_msg: &str) {
+    let filled = ((progress_frac * DOTS_WIDTH as f64).round() as usize).min(DOTS_WIDTH);
+    let dots = ".".repeat(filled);
+
+    // If there's a right message, pad between dots and message.
+    if right_msg.is_empty() {
+        eprint!(
+            "\r{:<label_w$} {:<dots_w$}",
+            label,
+            style::dim().apply_to(&dots),
+            label_w = LABEL_WIDTH,
+            dots_w = DOTS_WIDTH,
+        );
+    } else {
+        eprint!(
+            "\r{:<label_w$} {:<dots_w$} {}",
+            label,
+            style::dim().apply_to(&dots),
+            right_msg,
+            label_w = LABEL_WIDTH,
+            dots_w = DOTS_WIDTH,
+        );
+    }
+    let _ = std::io::stderr().flush();
 }
 
-fn bytes_bar_style() -> ProgressStyle {
-    ProgressStyle::with_template(
-        "{spinner:.cyan} [{bar:30.cyan/blue}] {bytes}/{total_bytes} {wide_msg}",
-    )
-    .unwrap()
-    .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"])
-    .progress_chars("█▉▊▋▌▍▎▏  ")
+/// Finalize a dots line (print newline, clear any trailing chars).
+fn finish_dots_line(label: &str, right_msg: &str) {
+    let dots = ".".repeat(DOTS_WIDTH);
+    // Clear the full line then print final state.
+    eprint!("\r\x1b[2K");
+    eprintln!(
+        "{:<label_w$} {} {}",
+        label,
+        style::dim().apply_to(&dots),
+        right_msg,
+        label_w = LABEL_WIDTH,
+    );
 }
 
-fn count_bar_style() -> ProgressStyle {
-    ProgressStyle::with_template("{spinner:.cyan} [{bar:30.cyan/blue}] {pos}/{len} {wide_msg}")
-        .unwrap()
-        .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"])
-        .progress_chars("█▉▊▋▌▍▎▏  ")
-}
+// ── Download progress ────────────────────────────────────────────────────────
 
-// ── Download progress ─────────────────────────────────────────────────────────
-
-pub struct IndicatifDownloadProgress {
+pub struct DotsDownloadProgress {
     quiet: bool,
-    multi: MultiProgress,
-    overall: ProgressBar,
-    bytes_done: AtomicU64,
-    bytes_total: AtomicU64,
+    total_bytes: AtomicU64,
+    done_bytes: AtomicU64,
+    cached_count: AtomicUsize,
+    fresh_count: AtomicUsize,
+    current_pkg: Mutex<String>,
 }
 
-impl IndicatifDownloadProgress {
+const DOWNLOAD_LABEL: &str = "Downloading packages";
+
+impl DotsDownloadProgress {
     pub fn new(quiet: bool) -> Self {
-        let multi = MultiProgress::new();
-        let overall = multi.add(ProgressBar::new(0));
-        overall.set_style(bytes_bar_style());
         Self {
             quiet,
-            multi,
-            overall,
-            bytes_done: AtomicU64::new(0),
-            bytes_total: AtomicU64::new(0),
+            total_bytes: AtomicU64::new(0),
+            done_bytes: AtomicU64::new(0),
+            cached_count: AtomicUsize::new(0),
+            fresh_count: AtomicUsize::new(0),
+            current_pkg: Mutex::new(String::new()),
         }
+    }
+
+    pub fn cached_count(&self) -> usize {
+        self.cached_count.load(Ordering::Relaxed)
+    }
+
+    pub fn fresh_count(&self) -> usize {
+        self.fresh_count.load(Ordering::Relaxed)
     }
 
     pub fn finish(&self) {
-        self.overall.finish_and_clear();
-    }
-}
-
-impl DownloadProgress for IndicatifDownloadProgress {
-    fn on_start(&self, total_packages: usize, total_bytes: u64) {
         if self.quiet {
             return;
         }
-        self.bytes_total.store(total_bytes, Ordering::Relaxed);
-        self.overall.set_length(total_bytes);
-        self.overall.set_message(format!(
-            "Downloading {} package{}",
-            total_packages,
-            if total_packages == 1 { "" } else { "s" }
-        ));
-        self.overall
-            .enable_steady_tick(std::time::Duration::from_millis(80));
+        let total = self.total_bytes.load(Ordering::Relaxed);
+        finish_dots_line(DOWNLOAD_LABEL, &style::fmt_size(total));
+    }
+}
+
+impl DownloadProgress for DotsDownloadProgress {
+    fn on_start(&self, _total_packages: usize, total_bytes: u64) {
+        if self.quiet {
+            return;
+        }
+        self.total_bytes.store(total_bytes, Ordering::Relaxed);
+        print_dots_line(DOWNLOAD_LABEL, 0.0, "");
     }
 
     fn on_package_start(&self, package: &LockedPackage) {
         if self.quiet {
             return;
         }
-        let pb = self.multi.add(ProgressBar::new_spinner());
-        pb.set_style(spinner_style());
-        pb.set_message(format!("  {} {}", package.name, package.version));
-        pb.enable_steady_tick(std::time::Duration::from_millis(80));
-        // Immediately finish the per-package spinner — progress is tracked on overall bar.
-        pb.finish_and_clear();
+        if let Ok(mut current) = self.current_pkg.lock() {
+            *current = package.name.clone();
+        }
+        let total = self.total_bytes.load(Ordering::Relaxed);
+        let done = self.done_bytes.load(Ordering::Relaxed);
+        let frac = if total > 0 {
+            done as f64 / total as f64
+        } else {
+            0.0
+        };
+        print_dots_line(DOWNLOAD_LABEL, frac, &package.name);
     }
 
     fn on_package_complete(&self, package: &LockedPackage, from_cache: bool) {
+        if from_cache {
+            self.cached_count.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.fresh_count.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let done = self.done_bytes.fetch_add(package.size, Ordering::Relaxed) + package.size;
+
         if self.quiet {
             return;
         }
-        let done = self.bytes_done.fetch_add(package.size, Ordering::Relaxed) + package.size;
-        self.overall.set_position(done);
-        let suffix = if from_cache { " (cached)" } else { "" };
-        self.overall
-            .set_message(format!("{} {}{}", package.name, package.version, suffix));
+
+        let total = self.total_bytes.load(Ordering::Relaxed);
+        let frac = if total > 0 {
+            done as f64 / total as f64
+        } else {
+            1.0
+        };
+        let current = self
+            .current_pkg
+            .lock()
+            .map(|c| c.clone())
+            .unwrap_or_default();
+        print_dots_line(DOWNLOAD_LABEL, frac, &current);
     }
 
     fn on_package_error(&self, package: &LockedPackage, error: &DownloadError) {
-        // Always print errors regardless of quiet mode.
-        self.multi
-            .println(format!(
-                "  error: {} {}: {}",
-                package.name, package.version, error
-            ))
-            .ok();
+        // Always print errors.
+        eprintln!();
+        style::error(format!("{} {}: {}", package.name, package.version, error));
     }
 
-    fn on_complete(&self, succeeded: usize, failed: usize) {
-        if self.quiet {
-            return;
-        }
-        if failed == 0 {
-            self.overall.set_message(format!(
-                "Downloaded {} package{}",
-                succeeded,
-                if succeeded == 1 { "" } else { "s" }
-            ));
-        } else {
-            self.overall
-                .set_message(format!("{} downloaded, {} failed", succeeded, failed));
-        }
+    fn on_complete(&self, _succeeded: usize, _failed: usize) {
+        // finish() handles final line.
     }
 }
 
-// ── Extraction progress ───────────────────────────────────────────────────────
+// ── Extraction progress ──────────────────────────────────────────────────────
 
-pub struct IndicatifExtractionProgress {
+pub struct DotsExtractionProgress {
     quiet: bool,
-    pb: ProgressBar,
+    total: AtomicUsize,
+    done: AtomicUsize,
+    total_files: AtomicUsize,
 }
 
-impl IndicatifExtractionProgress {
+const EXTRACT_LABEL: &str = "Extracting packages";
+
+impl DotsExtractionProgress {
     pub fn new(quiet: bool) -> Self {
-        let pb = ProgressBar::new(0);
-        pb.set_style(count_bar_style());
-        Self { quiet, pb }
+        Self {
+            quiet,
+            total: AtomicUsize::new(0),
+            done: AtomicUsize::new(0),
+            total_files: AtomicUsize::new(0),
+        }
     }
 
     pub fn finish(&self) {
-        self.pb.finish_and_clear();
+        if self.quiet {
+            return;
+        }
+        let files = self.total_files.load(Ordering::Relaxed);
+        finish_dots_line(EXTRACT_LABEL, &format!("{} files", files));
     }
 }
 
-impl ExtractionProgress for IndicatifExtractionProgress {
+impl ExtractionProgress for DotsExtractionProgress {
     fn on_start(&self, total_packages: usize) {
         if self.quiet {
             return;
         }
-        self.pb.set_length(total_packages as u64);
-        self.pb.set_message(format!(
-            "Extracting {} package{}",
-            total_packages,
-            if total_packages == 1 { "" } else { "s" }
-        ));
-        self.pb
-            .enable_steady_tick(std::time::Duration::from_millis(80));
+        self.total.store(total_packages, Ordering::Relaxed);
+        print_dots_line(EXTRACT_LABEL, 0.0, "");
     }
 
-    fn on_package_start(&self, package: &DownloadedPackage) {
+    fn on_package_start(&self, _package: &DownloadedPackage) {}
+
+    fn on_package_complete(&self, _package: &DownloadedPackage, files_extracted: usize) {
+        self.total_files
+            .fetch_add(files_extracted, Ordering::Relaxed);
+        let done = self.done.fetch_add(1, Ordering::Relaxed) + 1;
+
         if self.quiet {
             return;
         }
-        self.pb
-            .set_message(format!("  {} {}", package.name, package.version));
-    }
 
-    fn on_package_complete(&self, _package: &DownloadedPackage, _files_extracted: usize) {
-        if self.quiet {
-            return;
-        }
-        self.pb.inc(1);
+        let total = self.total.load(Ordering::Relaxed);
+        let frac = if total > 0 {
+            done as f64 / total as f64
+        } else {
+            1.0
+        };
+        print_dots_line(EXTRACT_LABEL, frac, "");
     }
 
     fn on_package_error(&self, package: &DownloadedPackage, error: &ExtractionError) {
-        self.pb.println(format!(
-            "  error: {} {}: {}",
-            package.name, package.version, error
-        ));
+        eprintln!();
+        style::error(format!("{} {}: {}", package.name, package.version, error));
     }
 
-    fn on_complete(&self, succeeded: usize, failed: usize) {
-        if self.quiet {
-            return;
-        }
-        if failed == 0 {
-            self.pb.set_message(format!(
-                "Extracted {} package{}",
-                succeeded,
-                if succeeded == 1 { "" } else { "s" }
-            ));
-        } else {
-            self.pb
-                .set_message(format!("{} extracted, {} failed", succeeded, failed));
-        }
+    fn on_complete(&self, _succeeded: usize, _failed: usize) {
+        // finish() handles final line.
     }
 }
 
-// ── OCI progress ──────────────────────────────────────────────────────────────
+// ── OCI progress ─────────────────────────────────────────────────────────────
 
-pub struct IndicatifOciProgress {
+pub struct DotsOciProgress {
     quiet: bool,
-    pb: Mutex<ProgressBar>,
+    step: AtomicUsize,
 }
 
-impl IndicatifOciProgress {
+const BUILD_LABEL: &str = "Building layer";
+/// Total number of OCI generation steps (layer, config, manifest, blobs, tarball).
+const BUILD_STEPS: usize = 5;
+
+impl DotsOciProgress {
     pub fn new(quiet: bool) -> Self {
-        let pb = ProgressBar::new_spinner();
-        pb.set_style(spinner_style());
         Self {
             quiet,
-            pb: Mutex::new(pb),
+            step: AtomicUsize::new(0),
         }
     }
 
     pub fn finish(&self) {
-        if let Ok(pb) = self.pb.lock() {
-            pb.finish_and_clear();
+        if self.quiet {
+            return;
         }
+        finish_dots_line(BUILD_LABEL, "");
     }
 
-    fn set_msg(&self, msg: &str) {
-        if let Ok(pb) = self.pb.lock() {
-            pb.set_message(msg.to_string());
+    fn advance(&self) {
+        let step = self.step.fetch_add(1, Ordering::Relaxed) + 1;
+        if self.quiet {
+            return;
         }
+        let frac = (step as f64 / BUILD_STEPS as f64).min(1.0);
+        print_dots_line(BUILD_LABEL, frac, "");
     }
 }
 
-impl OciProgress for IndicatifOciProgress {
+impl OciProgress for DotsOciProgress {
     fn on_start(&self) {
         if self.quiet {
             return;
         }
-        if let Ok(pb) = self.pb.lock() {
-            pb.enable_steady_tick(std::time::Duration::from_millis(80));
-        }
-        self.set_msg("Building OCI image...");
+        print_dots_line(BUILD_LABEL, 0.0, "");
     }
 
-    fn on_layer_start(&self) {
-        if !self.quiet {
-            self.set_msg("Creating layer...");
-        }
+    fn on_layer_start(&self) {}
+
+    fn on_layer_complete(&self, _size: u64) {
+        self.advance();
     }
 
-    fn on_layer_complete(&self, size: u64) {
-        if !self.quiet {
-            let mb = size as f64 / 1_048_576.0;
-            self.set_msg(&format!("Layer created ({:.2} MB)", mb));
-        }
+    fn on_config_start(&self) {}
+
+    fn on_config_complete(&self) {
+        self.advance();
     }
 
-    fn on_config_start(&self) {
-        if !self.quiet {
-            self.set_msg("Writing image config...");
-        }
+    fn on_manifest_start(&self) {}
+
+    fn on_manifest_complete(&self) {
+        self.advance();
     }
-
-    fn on_config_complete(&self) {}
-
-    fn on_manifest_start(&self) {
-        if !self.quiet {
-            self.set_msg("Writing manifest...");
-        }
-    }
-
-    fn on_manifest_complete(&self) {}
 
     fn on_writing_blobs(&self) {
-        if !self.quiet {
-            self.set_msg("Writing blobs...");
-        }
+        self.advance();
     }
 
     fn on_creating_tarball(&self) {
-        if !self.quiet {
-            self.set_msg("Creating tarball...");
-        }
+        self.advance();
     }
 
     fn on_complete(&self, _digest: &str, _total_size: u64) {
-        if !self.quiet {
-            self.set_msg("OCI image complete");
-        }
+        // finish() handles final line.
     }
 
     fn on_error(&self, error: &str) {
-        if let Ok(pb) = self.pb.lock() {
-            pb.println(format!("error: {}", error));
-        }
+        eprintln!();
+        style::error(error);
     }
 }

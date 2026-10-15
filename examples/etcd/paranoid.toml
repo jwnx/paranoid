@@ -1,0 +1,14 @@
+[image]
+name = "etcd"
+architecture = "arm64"
+
+[repositories.debian]
+url = "https://deb.debian.org/debian"
+distribution = "bookworm"
+components = ["main"]
+
+[[packages]]
+name = "etcd"
+
+[entrypoint]
+cmd = ["etcdctl"]
