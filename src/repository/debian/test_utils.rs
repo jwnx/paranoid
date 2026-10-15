@@ -34,7 +34,7 @@ pub fn make_package_with_deps(
     let mut pkg = make_package(name, version, arch);
     pkg.depends = depends
         .iter()
-        .filter_map(|s| PackageDependency::from_str(s).ok())
+        .map(|s| PackageDependency::from_str(s).unwrap_or_else(|e| panic!("{s:?}: {e}")))
         .collect();
     pkg
 }

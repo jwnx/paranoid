@@ -11,11 +11,6 @@ changes what the lock file contains.
 The resolver gives plausible answers for simple manifests but is wrong at
 the edges. Each item below was reproduced during the review.
 
-- **Malformed relations silently become "no dependencies"**
-  (`package.rs:130-148`). `(>=2.17)` without a space drops the constraint,
-  `(>=  2.17)` keeps a leading space, and an unknown arch restriction fails
-  the whole list, which is then swallowed. Parse failures should be errors,
-  and the three relation parsers should share one operator table.
 - **Virtual packages are chosen wrong** (`package_index.rs:187-276`):
   - an unversioned `Provides` satisfies a versioned dependency;
   - providers with no priority sort first;

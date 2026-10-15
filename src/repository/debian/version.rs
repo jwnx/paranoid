@@ -251,7 +251,10 @@ fn canonical_chunks(s: &str) -> Vec<(&[u8], &[u8])> {
         }
         chunks.push((non_digit, &s[start..k]));
     }
-    while chunks.last().is_some_and(|(n, d)| n.is_empty() && d.is_empty()) {
+    while chunks
+        .last()
+        .is_some_and(|(n, d)| n.is_empty() && d.is_empty())
+    {
         chunks.pop();
     }
     chunks
@@ -302,7 +305,10 @@ mod tests {
             ("1.0-", "revision number is empty"),
             ("0:0 0-1", "version string has embedded spaces"),
             ("-1:0-1", "epoch in version is not number"),
-            ("999999999999999999999999:0-1", "epoch in version is too big"),
+            (
+                "999999999999999999999999:0-1",
+                "epoch in version is too big",
+            ),
             ("a:0-0", "epoch in version is not number"),
             ("A:0-0", "epoch in version is not number"),
             ("-0", "version number is empty"),

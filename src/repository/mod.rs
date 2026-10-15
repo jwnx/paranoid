@@ -3,11 +3,11 @@ mod types;
 
 // Re-export debian types
 pub use debian::{
-    Architecture, ArchitectureRestriction, DebianPackage, DebianRepository, DebianRepositoryError,
-    DebianVersion, DependencyList, DependencySpec, PackageDependency, PackageIndex,
-    PackageIndexSet, ParseDebianPackageError, ParseDebianVersionError, ParsePackageIndexError,
-    Priority, ProvidesEntry, ProvidesList, ResolveBuilder, ResolveError, ResolveResult,
-    ResolvedEntry, SourcedPackage, System, UnmetDependency, VirtualPackageProvider,
+    Architecture, DebianPackage, DebianRepository, DebianRepositoryError, DebianVersion,
+    DependencySpec, PackageDependency, PackageIndex, PackageIndexSet, ParseDebianPackageError,
+    ParseDebianVersionError, ParsePackageIndexError, Priority, ProvidesEntry, ResolveBuilder,
+    ResolveError, ResolveResult, ResolvedEntry, SourcedPackage, UnmetDependency,
+    VirtualPackageProvider,
 };
 
 // Re-export common types

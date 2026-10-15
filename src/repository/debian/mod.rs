@@ -12,13 +12,16 @@ pub(crate) mod test_utils;
 mod version;
 
 // Re-export public types
-pub use architecture::{Architecture, ArchitectureRestriction, System};
-pub use dependency::{DependencyList, DependencySpec, PackageDependency};
+pub use architecture::Architecture;
+pub use dependency::{
+    DependencySpec, PackageDependency, ParseDependencySpecError, ParseRelationsError,
+    parse_relations,
+};
 pub use package::{DebianPackage, ParseDebianPackageError};
 pub use package_index::{PackageIndex, ParsePackageIndexError, VirtualPackageProvider};
 pub use package_index_set::{PackageIndexSet, SourcedPackage};
 pub use priority::Priority;
-pub use provides::{ProvidesEntry, ProvidesList};
+pub use provides::ProvidesEntry;
 pub use repository::{DebianRepository, DebianRepositoryError};
 pub use resolver::{ResolveBuilder, ResolveError, ResolveResult, ResolvedEntry, UnmetDependency};
 pub use version::{DebianVersion, ParseDebianVersionError};

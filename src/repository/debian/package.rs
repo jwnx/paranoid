@@ -5,9 +5,9 @@ use thiserror::Error;
 use crate::repository::*;
 
 use super::architecture::Architecture;
-use super::dependency::{DependencyList, PackageDependency};
+use super::dependency::{PackageDependency, parse_relations};
 use super::priority::Priority;
-use super::provides::{ProvidesEntry, ProvidesList};
+use super::provides::ProvidesEntry;
 use super::version::DebianVersion;
 
 /// Error parsing a Debian package stanza.
@@ -15,6 +15,28 @@ use super::version::DebianVersion;
 pub enum ParseDebianPackageError {
     #[error("missing required field: {0}")]
     MissingField(&'static str),
+
+    #[error("invalid {field} field: {source}")]
+    InvalidField {
+        field: &'static str,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
+
+/// Parse a field's value, naming the field in the error.
+fn parse_field<T, E>(
+    field: &'static str,
+    value: &str,
+    parse: impl FnOnce(&str) -> Result<T, E>,
+) -> Result<T, ParseDebianPackageError>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    parse(value).map_err(|e| ParseDebianPackageError::InvalidField {
+        field,
+        source: Box::new(e),
+    })
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -112,44 +134,32 @@ impl FromStr for DebianPackage {
         let mut pkg = DebianPackage::default();
         let mut version: Option<DebianVersion> = None;
 
+        // Fields that decide what gets installed, or what the lock records,
+        // must parse. A package that silently lost its dependencies would
+        // produce a broken image.
         for (key, value) in fields {
             match key.as_str() {
                 "Package" => pkg.name = value,
-                "Version" => {
-                    if let Ok(v) = DebianVersion::from_str(&value) {
-                        version = Some(v);
-                    }
-                }
+                "Version" => version = Some(parse_field("Version", &value, str::parse)?),
                 "Architecture" => {
-                    pkg.architecture = Architecture::from_str(&value).ok();
+                    pkg.architecture = Some(parse_field("Architecture", &value, str::parse)?);
                 }
                 "Installed-Size" => {
-                    // Installed-Size is in KB
-                    pkg.installed_size = value.parse().unwrap_or(0) * 1024;
+                    // Installed-Size is in KiB.
+                    let kib: u64 = parse_field("Installed-Size", &value, str::parse)?;
+                    pkg.installed_size = kib * 1024;
                 }
-                "Depends" => {
-                    // Lenient: skip packages with malformed dependencies
-                    pkg.depends = DependencyList::from_str(&value)
-                        .ok()
-                        .map(Into::into)
-                        .unwrap_or_default();
-                }
+                "Depends" => pkg.depends = parse_field("Depends", &value, parse_relations)?,
                 "Pre-Depends" => {
-                    pkg.pre_depends = DependencyList::from_str(&value)
-                        .ok()
-                        .map(Into::into)
-                        .unwrap_or_default();
+                    pkg.pre_depends = parse_field("Pre-Depends", &value, parse_relations)?;
                 }
-                "Provides" => {
-                    pkg.provides = ProvidesList::from_str(&value)
-                        .ok()
-                        .map(Into::into)
-                        .unwrap_or_default();
-                }
+                "Provides" => pkg.provides = parse_field("Provides", &value, parse_relations)?,
                 "Filename" => pkg.filename = value,
-                "Size" => pkg.size = value.parse().unwrap_or(0),
+                "Size" => pkg.size = parse_field("Size", &value, str::parse)?,
                 "MD5sum" => pkg.md5sum = value,
                 "SHA256" => pkg.sha256 = value,
+                // Priority only breaks ties between providers, so an unknown
+                // one shouldn't make a whole repository unusable.
                 "Priority" => pkg.priority = Priority::from_str(&value).ok(),
                 "Description" => {
                     // Only take the first line of the description
@@ -277,5 +287,52 @@ Priority: required"#;
             result,
             Err(ParseDebianPackageError::MissingField("Filename"))
         ));
+    }
+
+    /// A field that would change what gets installed must parse, or the
+    /// whole stanza fails. These used to become "no dependencies", size 0 or
+    /// a missing version.
+    #[test]
+    fn test_debian_package_from_str_invalid_fields() {
+        let base = "Package: foo\nVersion: 1.0\nArchitecture: amd64\nFilename: foo.deb";
+        for (line, field) in [
+            ("Depends: libc6 (> 2.17)", "Depends"),
+            ("Depends: libc6, libfoo [amd64]", "Depends"),
+            ("Pre-Depends: libc6 (>= 2.17", "Pre-Depends"),
+            ("Provides: awk (>= 1)", "Provides"),
+            ("Size: lots", "Size"),
+            ("Installed-Size: -1", "Installed-Size"),
+        ] {
+            let stanza = format!("{base}\n{line}");
+            match DebianPackage::from_str(&stanza) {
+                Err(ParseDebianPackageError::InvalidField { field: f, .. }) => {
+                    assert_eq!(f, field, "{line}")
+                }
+                other => panic!("{line}: expected an invalid {field}, got {other:?}"),
+            }
+        }
+
+        let bad_version = base.replace("Version: 1.0", "Version: 1.0-");
+        assert!(matches!(
+            DebianPackage::from_str(&bad_version),
+            Err(ParseDebianPackageError::InvalidField {
+                field: "Version",
+                ..
+            })
+        ));
+        let bad_arch = base.replace("amd64", "pdp11");
+        assert!(matches!(
+            DebianPackage::from_str(&bad_arch),
+            Err(ParseDebianPackageError::InvalidField {
+                field: "Architecture",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_debian_package_from_str_tolerates_unknown_priority() {
+        let stanza = "Package: foo\nVersion: 1.0\nArchitecture: amd64\nFilename: foo.deb\nPriority: whenever";
+        assert_eq!(DebianPackage::from_str(stanza).unwrap().priority, None);
     }
 }

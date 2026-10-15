@@ -38,6 +38,36 @@ pub enum VersionRelation {
     StrictlyLater,
 }
 
+impl VersionRelation {
+    /// Every relation and its operator. Longer operators come first, so the
+    /// first prefix match is the right one.
+    const OPERATORS: [(&'static str, VersionRelation); 5] = [
+        ("<<", VersionRelation::StrictlyEarlier),
+        ("<=", VersionRelation::EarlierOrEqual),
+        (">=", VersionRelation::LaterOrEqual),
+        (">>", VersionRelation::StrictlyLater),
+        ("=", VersionRelation::Equal),
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        Self::OPERATORS
+            .iter()
+            .find(|(_, relation)| *relation == self)
+            .map(|(op, _)| *op)
+            .expect("every VersionRelation has an operator")
+    }
+
+    /// Split a leading operator off `s`: `">= 2.17"` gives
+    /// `(LaterOrEqual, " 2.17")`. Returns `None` if `s` doesn't start with
+    /// one. The obsolete `<` and `>` operators are not accepted.
+    pub fn split_prefix(s: &str) -> Option<(Self, &str)> {
+        Self::OPERATORS
+            .iter()
+            .find_map(|(op, relation)| s.strip_prefix(op).map(|rest| (*relation, rest)))
+            .filter(|(_, rest)| !rest.starts_with(['<', '>', '=']))
+    }
+}
+
 /// Error parsing a version relation.
 #[derive(Debug, Error)]
 #[error("unknown version relation: {unknown_relation}")]
@@ -48,6 +78,8 @@ pub struct ParseVersionRelationError {
 /// Error parsing a version constraint.
 #[derive(Debug, Error)]
 pub enum ParseVersionConstraintError<E: std::error::Error> {
+    #[error("unknown version relation in '{0}'")]
+    Relation(String),
     #[error("invalid version: {0}")]
     InvalidVersion(#[source] E),
 }
@@ -56,28 +88,19 @@ impl FromStr for VersionRelation {
     type Err = ParseVersionRelationError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "<<" => Ok(VersionRelation::StrictlyEarlier),
-            "<=" => Ok(VersionRelation::EarlierOrEqual),
-            "=" => Ok(VersionRelation::Equal),
-            ">=" => Ok(VersionRelation::LaterOrEqual),
-            ">>" => Ok(VersionRelation::StrictlyLater),
-            _ => Err(ParseVersionRelationError {
+        Self::OPERATORS
+            .iter()
+            .find(|(op, _)| *op == s)
+            .map(|(_, relation)| *relation)
+            .ok_or_else(|| ParseVersionRelationError {
                 unknown_relation: s.to_string(),
-            }),
-        }
+            })
     }
 }
 
 impl std::fmt::Display for VersionRelation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            VersionRelation::StrictlyEarlier => write!(f, "<<"),
-            VersionRelation::EarlierOrEqual => write!(f, "<="),
-            VersionRelation::Equal => write!(f, "="),
-            VersionRelation::LaterOrEqual => write!(f, ">="),
-            VersionRelation::StrictlyLater => write!(f, ">>"),
-        }
+        f.write_str(self.as_str())
     }
 }
 
@@ -121,30 +144,30 @@ impl<V: Version> VersionConstraint<V> {
 impl<V: Version> FromStr for VersionConstraint<V> {
     type Err = ParseVersionConstraintError<V::ParseError>;
 
+    /// Parse `"<op> <version>"`, or a bare version meaning `= <version>`.
+    /// The space after the operator is optional.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let s = s.trim();
-
-        let (relation, version_str) = if let Some(rest) = s.strip_prefix("<<") {
-            (VersionRelation::StrictlyEarlier, rest)
-        } else if let Some(rest) = s.strip_prefix("<=") {
-            (VersionRelation::EarlierOrEqual, rest)
-        } else if let Some(rest) = s.strip_prefix(">=") {
-            (VersionRelation::LaterOrEqual, rest)
-        } else if let Some(rest) = s.strip_prefix(">>") {
-            (VersionRelation::StrictlyLater, rest)
-        } else if let Some(rest) = s.strip_prefix('=') {
-            (VersionRelation::Equal, rest)
-        } else {
-            // No relation prefix, treat as exact match
-            (VersionRelation::Equal, s)
+        let (relation, version) = match VersionRelation::split_prefix(s) {
+            Some(split) => split,
+            None if s.starts_with(['<', '>', '=']) => {
+                return Err(ParseVersionConstraintError::Relation(s.to_string()));
+            }
+            None => (VersionRelation::Equal, s),
         };
 
-        let version = version_str
+        let version = version
             .trim()
             .parse()
             .map_err(ParseVersionConstraintError::InvalidVersion)?;
 
         Ok(Self { relation, version })
+    }
+}
+
+impl<V: Version + std::fmt::Display> std::fmt::Display for VersionConstraint<V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} {}", self.relation, self.version)
     }
 }
 
@@ -181,5 +204,38 @@ mod tests {
         assert!(VersionRelation::from_str("<").is_err());
         assert!(VersionRelation::from_str(">").is_err());
         assert!(VersionRelation::from_str("==").is_err());
+    }
+
+    #[test]
+    fn test_relation_roundtrips_through_operator() {
+        for (op, relation) in VersionRelation::OPERATORS {
+            assert_eq!(relation.as_str(), op);
+            assert_eq!(VersionRelation::from_str(op).unwrap(), relation);
+        }
+    }
+
+    #[test]
+    fn test_split_prefix() {
+        use VersionRelation::*;
+
+        assert_eq!(
+            VersionRelation::split_prefix(">= 1"),
+            Some((LaterOrEqual, " 1"))
+        );
+        assert_eq!(
+            VersionRelation::split_prefix(">=1"),
+            Some((LaterOrEqual, "1"))
+        );
+        assert_eq!(
+            VersionRelation::split_prefix("<<1"),
+            Some((StrictlyEarlier, "1"))
+        );
+        assert_eq!(VersionRelation::split_prefix("= 1"), Some((Equal, " 1")));
+        assert_eq!(VersionRelation::split_prefix("1.0"), None);
+        // Obsolete or malformed operators.
+        assert_eq!(VersionRelation::split_prefix("< 1"), None);
+        assert_eq!(VersionRelation::split_prefix("> 1"), None);
+        assert_eq!(VersionRelation::split_prefix("== 1"), None);
+        assert_eq!(VersionRelation::split_prefix(">>= 1"), None);
     }
 }
