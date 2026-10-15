@@ -8,11 +8,16 @@ use super::package::DebianPackage;
 use super::package_index::PackageIndex;
 use super::version::DebianVersion;
 
+/// apt's pin priority for a repository that doesn't say otherwise.
+pub const DEFAULT_PIN_PRIORITY: i32 = 500;
+
 /// A package found in an index set, with the repository it came from.
 #[derive(Debug, Clone, Copy)]
 pub struct SourcedPackage<'a> {
     pub package: &'a DebianPackage,
     pub repository: &'a str,
+    /// The repository's pin priority.
+    pub pin_priority: i32,
 }
 
 /// A package that provides a virtual package, and the version it provides
@@ -24,15 +29,22 @@ pub struct SourcedProvider<'a> {
 }
 
 /// The package indexes of every repository in a manifest, in declaration
-/// order.
+/// order, each with its pin priority.
 ///
 /// Lookups cover both the target architecture and `all`, and list
 /// repositories in order, so callers that pick "the first best" get the
-/// earliest repository on ties. See [`super::resolver`] for how packages are
+/// earliest repository on ties. A repository with a negative priority is
+/// never used, as in apt. See [`super::resolver`] for how packages are
 /// chosen.
 #[derive(Default)]
 pub struct PackageIndexSet {
-    indices: Vec<(String, PackageIndex)>,
+    repositories: Vec<Repository>,
+}
+
+struct Repository {
+    name: String,
+    pin_priority: i32,
+    index: PackageIndex,
 }
 
 impl PackageIndexSet {
@@ -40,9 +52,29 @@ impl PackageIndexSet {
         Self::default()
     }
 
-    /// Add a repository's index. Earlier repositories win version ties.
+    /// Add a repository's index at the default pin priority. Earlier
+    /// repositories win ties.
     pub fn add_index(&mut self, name: String, index: PackageIndex) {
-        self.indices.push((name, index));
+        self.add_index_with_priority(name, DEFAULT_PIN_PRIORITY, index);
+    }
+
+    /// Add a repository's index at a pin priority.
+    pub fn add_index_with_priority(
+        &mut self,
+        name: String,
+        pin_priority: i32,
+        index: PackageIndex,
+    ) {
+        self.repositories.push(Repository {
+            name,
+            pin_priority,
+            index,
+        });
+    }
+
+    /// The repositories that may be used, in order.
+    fn usable(&self) -> impl Iterator<Item = &Repository> {
+        self.repositories.iter().filter(|r| r.pin_priority >= 0)
     }
 
     /// Every real package called `name` for `arch` or `all`, in repository
@@ -55,13 +87,14 @@ impl PackageIndexSet {
     where
         'a: 'n,
     {
-        self.indices.iter().flat_map(move |(repo, index)| {
+        self.usable().flat_map(move |repo| {
             [arch, Architecture::All]
                 .into_iter()
-                .flat_map(move |arch| index.versions(name, arch))
+                .flat_map(move |arch| repo.index.versions(name, arch))
                 .map(move |package| SourcedPackage {
                     package,
-                    repository: repo,
+                    repository: &repo.name,
+                    pin_priority: repo.pin_priority,
                 })
         })
     }
@@ -76,14 +109,15 @@ impl PackageIndexSet {
     where
         'a: 'n,
     {
-        self.indices.iter().flat_map(move |(repo, index)| {
+        self.usable().flat_map(move |repo| {
             [arch, Architecture::All]
                 .into_iter()
-                .flat_map(move |arch| index.virtual_providers(name, arch))
+                .flat_map(move |arch| repo.index.virtual_providers(name, arch))
                 .map(move |p| SourcedProvider {
                     provider: SourcedPackage {
                         package: &p.provider,
-                        repository: repo,
+                        repository: &repo.name,
+                        pin_priority: repo.pin_priority,
                     },
                     provided_version: p.provided_version.as_ref(),
                 })

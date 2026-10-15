@@ -101,11 +101,12 @@ description  = "..."             # optional, OCI label
 authors      = "..."             # optional, OCI label
 source       = "..."             # optional, OCI label
 
-[repositories.debian]            # order matters: on a tie, first repo wins
+[repositories.debian]            # on a tie, the first repository wins
 url          = "https://deb.debian.org/debian"
 distribution = "bookworm"
 components   = ["main"]
 signed_by    = "keys/debian-archive-bookworm-automatic.asc"
+priority     = 500               # optional, apt's pin priority
 
 [[packages]]
 name       = "nodejs"
@@ -133,6 +134,15 @@ pub   rsa4096 2023-01-21 [SC] [expires: 2031-01-19]
       ...
 uid                      Debian Archive Automatic Signing Key (12/bookworm) <ftpmaster@debian.org>
 ```
+
+When several repositories carry a package, the one with the highest
+`priority` wins, then the highest version, the way apt picks a candidate.
+A negative priority means the repository is never used. Without
+`priority` you get apt's default: 500, or 100 for a repository whose
+Release says `NotAutomatic` and `ButAutomaticUpgrades` (backports), or 1 for
+one that only says `NotAutomatic` (experimental). A low priority is how you
+keep an archive of old versions around for the few packages you hold back,
+without its newer or pre-release versions creeping in.
 
 To lock against a fixed point in a repository's history, point `url` at a
 snapshot service and add `snapshot`. The repository becomes `url/snapshot`,
@@ -287,7 +297,8 @@ $ cargo test                    # unit + offline integration tests
 $ cargo test -- --ignored       # network tests: real mirrors, real builds,
                                 #   including build-twice-and-compare
 $ cargo clippy --all-targets
-$ scripts/apt-oracle.sh         # compare resolution with apt (needs podman)
+$ scripts/apt-oracle.sh         # compare resolution with apt (needs podman);
+                                #   BACKPORTS=default|<n> adds backports
 $ scripts/dpkg-oracle.sh        # regenerate dpkg's version-order test data
 $ scripts/trust-oracle.sh       # break a signed repo ten ways, ask apt too
 ```

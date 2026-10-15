@@ -287,6 +287,7 @@ mod tests {
             components: vec!["main".to_string()],
             signed_by: "keys/debian.asc".into(),
             snapshot: None,
+            priority: None,
         }
     }
 

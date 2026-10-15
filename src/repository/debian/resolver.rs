@@ -413,8 +413,10 @@ impl<'a> Pass<'a, '_> {
             .map_or(Choice::Nothing, Choice::Package))
     }
 
-    /// The highest version of `name` that meets `requirements`, everything
-    /// learned about `name`, and its pin. Ties go to the earliest repository.
+    /// The best version of `name` that meets `requirements`, everything
+    /// learned about `name`, and its pin: like apt, from the repository with
+    /// the highest pin priority, then the highest version. Ties go to the
+    /// earliest repository.
     fn best_package(&self, name: &str, requirements: &[Requirement]) -> Option<SourcedPackage<'a>> {
         let learned = self.learned.get(name).map_or(&[][..], Vec::as_slice);
         let mut best: Option<SourcedPackage<'a>> = None;
@@ -425,7 +427,9 @@ impl<'a> Pass<'a, '_> {
                 .chain(learned)
                 .all(|r| r.allows(version))
                 && self.allowed(name, &candidate)
-                && best.is_none_or(|b| *version > b.package.version)
+                && best.is_none_or(|b| {
+                    (candidate.pin_priority, version) > (b.pin_priority, &b.package.version)
+                })
             {
                 best = Some(candidate);
             }
@@ -992,6 +996,71 @@ mod tests {
         ]);
         let resolution = run(&set, &requests(&["bash"])).unwrap();
         assert_eq!(resolution.packages[0].repository, "first");
+    }
+
+    fn prioritized(repos: &[(&str, i32, &str)]) -> PackageIndexSet {
+        let mut set = PackageIndexSet::new();
+        for (name, priority, stanzas) in repos {
+            set.add_index_with_priority(name.to_string(), *priority, index(stanzas));
+        }
+        set
+    }
+
+    /// PGDG's apt-archive carries every version PGDG ever published, betas
+    /// included. At a low priority it only serves what PGDG no longer has.
+    #[test]
+    fn a_higher_priority_repository_beats_a_higher_version() {
+        let set = prioritized(&[
+            (
+                "pgdg-archive",
+                100,
+                "Package: libpq5\nVersion: 19~beta4-1\n\n\
+                 Package: libpq5\nVersion: 18.6-1\n\n\
+                 Package: pgbackrest\nVersion: 2.58.0-1\nDepends: libpq5\n\n\
+                 Package: pgbackrest\nVersion: 2.59.0-1\nDepends: libpq5",
+            ),
+            (
+                "pgdg",
+                500,
+                "Package: libpq5\nVersion: 18.6-1\n\n\
+                 Package: pgbackrest\nVersion: 2.59.0-1\nDepends: libpq5",
+            ),
+        ]);
+
+        // Only the archive has 2.58.0, so it comes from there; libpq5 comes
+        // from PGDG even though the archive has a higher version.
+        let resolution = run(&set, &requests(&["pgbackrest (= 2.58.0-1)"])).unwrap();
+        assert_eq!(
+            selected(&resolution),
+            ["libpq5=18.6-1", "pgbackrest=2.58.0-1"]
+        );
+        assert_eq!(resolution.packages[0].repository, "pgdg");
+        assert_eq!(resolution.packages[1].repository, "pgdg-archive");
+
+        // Same version in both: the higher priority wins, not the order.
+        let resolution = run(&set, &requests(&["pgbackrest"])).unwrap();
+        assert_eq!(
+            selected(&resolution),
+            ["libpq5=18.6-1", "pgbackrest=2.59.0-1"]
+        );
+        assert_eq!(resolution.packages[1].repository, "pgdg");
+    }
+
+    #[test]
+    fn a_negative_priority_repository_is_never_used() {
+        let set = prioritized(&[
+            ("debian", 500, "Package: bash\nVersion: 5.2"),
+            (
+                "never",
+                -1,
+                "Package: bash\nVersion: 9.9\n\nPackage: zsh\nVersion: 5.9",
+            ),
+        ]);
+        assert_eq!(resolves_to(&set, &["bash"]), ["bash=5.2"]);
+        assert!(matches!(
+            run(&set, &requests(&["zsh"])),
+            Err(ResolveError::NotFound { .. })
+        ));
     }
 
     /// A pin used to only relabel the package: it was still resolved from

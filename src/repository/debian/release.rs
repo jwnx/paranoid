@@ -11,6 +11,7 @@ use chrono::{DateTime, Utc};
 use thiserror::Error;
 
 use super::deb822::parse_stanza;
+use super::package_index_set::DEFAULT_PIN_PRIORITY;
 use crate::hash::Sha256;
 
 /// Error parsing a `Release` file.
@@ -74,6 +75,10 @@ pub struct Release {
     pub codename: Option<String>,
     pub date: DateTime<Utc>,
     pub valid_until: Option<DateTime<Utc>>,
+    /// `NotAutomatic: yes`: apt installs from here only when asked to.
+    pub not_automatic: bool,
+    /// `ButAutomaticUpgrades: yes`: but upgrades what came from here.
+    pub but_automatic_upgrades: bool,
     /// Indexes may be fetched by their hash, which keeps a mirror update
     /// between fetching `InRelease` and the indexes from mixing snapshots.
     pub acquire_by_hash: bool,
@@ -119,6 +124,17 @@ impl Release {
             }
             (None, Some(until)) if until <= now => Err(ReleaseError::Expired(until)),
             _ => Ok(()),
+        }
+    }
+
+    /// The pin priority apt gives this repository unless told otherwise:
+    /// 1 for `NotAutomatic` (experimental), 100 if it also has
+    /// `ButAutomaticUpgrades` (backports), 500 for everything else.
+    pub fn default_pin_priority(&self) -> i32 {
+        match (self.not_automatic, self.but_automatic_upgrades) {
+            (true, false) => 1,
+            (true, true) => 100,
+            (false, _) => DEFAULT_PIN_PRIORITY,
         }
     }
 
@@ -192,6 +208,8 @@ impl FromStr for Release {
         let mut date = None;
         let mut valid_until = None;
         let mut acquire_by_hash = false;
+        let mut not_automatic = false;
+        let mut but_automatic_upgrades = false;
         let mut files = None;
 
         for (key, value) in parse_stanza(s) {
@@ -201,6 +219,8 @@ impl FromStr for Release {
                 "Date" => date = Some(parse_date("Date", &value)?),
                 "Valid-Until" => valid_until = Some(parse_date("Valid-Until", &value)?),
                 "Acquire-By-Hash" => acquire_by_hash = value == "yes",
+                "NotAutomatic" => not_automatic = value == "yes",
+                "ButAutomaticUpgrades" => but_automatic_upgrades = value == "yes",
                 "SHA256" => files = Some(parse_files(&value)?),
                 _ => {}
             }
@@ -211,6 +231,8 @@ impl FromStr for Release {
             codename,
             date: date.ok_or(ParseReleaseError::MissingField("Date"))?,
             valid_until,
+            not_automatic,
+            but_automatic_upgrades,
             acquire_by_hash,
             // Without it nothing the Release signs reaches the packages.
             files: files.ok_or(ParseReleaseError::MissingField("SHA256"))?,
@@ -331,6 +353,23 @@ SHA256:
             ),
             Err(ReleaseError::WrongDistribution { .. })
         ));
+    }
+
+    #[test]
+    fn defaults_the_pin_priority_like_apt() {
+        let priority = |extra: &str| {
+            format!("{extra}{RELEASE}")
+                .parse::<Release>()
+                .unwrap()
+                .default_pin_priority()
+        };
+        assert_eq!(priority(""), 500);
+        assert_eq!(priority("NotAutomatic: yes\n"), 1);
+        assert_eq!(
+            priority("NotAutomatic: yes\nButAutomaticUpgrades: yes\n"),
+            100
+        );
+        assert_eq!(priority("ButAutomaticUpgrades: yes\n"), 500);
     }
 
     #[test]

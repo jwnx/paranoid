@@ -169,6 +169,7 @@ mod tests {
             components: vec!["main".to_string()],
             signed_by: "keys/debian.asc".into(),
             snapshot: None,
+            priority: None,
         };
 
         let url = DownloadService::build_download_url(&package, &repo_config);
@@ -187,6 +188,7 @@ mod tests {
             components: vec!["main".to_string()],
             signed_by: "keys/debian.asc".into(),
             snapshot: None,
+            priority: None,
         };
 
         let url = DownloadService::build_download_url(&package, &repo_config);

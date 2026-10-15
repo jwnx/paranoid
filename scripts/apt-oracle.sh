@@ -6,6 +6,11 @@
 #
 # Usage: scripts/apt-oracle.sh [package...]
 #
+# BACKPORTS=default adds bookworm-backports to both sides at apt's default
+# priority for it (100, since its Release says NotAutomatic and
+# ButAutomaticUpgrades). BACKPORTS=<n> adds it at priority n: `priority` in
+# the manifest, a Pin-Priority for apt.
+#
 # Needs podman and a built paranoid. The image holding apt is built by
 # paranoid itself. Exits non-zero if any package resolves differently.
 
@@ -40,9 +45,26 @@ distribution = "bookworm"
 components = ["main"]
 signed_by = "$root/examples/keys/debian-archive-bookworm-automatic.asc"
 TOML
+    backports
     for package in "$@"; do
         printf '\n[[packages]]\nname = "%s"\n' "$package"
     done
+}
+
+# The backports repository for a manifest, per $BACKPORTS.
+backports() {
+    [ -n "${BACKPORTS:-}" ] || return 0
+    cat <<TOML
+
+[repositories.backports]
+url = "https://deb.debian.org/debian"
+distribution = "bookworm-backports"
+components = ["main"]
+signed_by = "$root/examples/keys/debian-archive-bookworm-automatic.asc"
+TOML
+    if [ "$BACKPORTS" != default ]; then
+        printf 'priority = %s\n' "$BACKPORTS"
+    fi
 }
 
 # apt needs dpkg's data files, which it never declares since dpkg is
@@ -50,7 +72,7 @@ TOML
 # only asking apt's resolver, not checking signatures.
 mkdir "$work/image"
 {
-    manifest apt-oracle apt gpgv debian-archive-keyring dpkg bash coreutils
+    BACKPORTS= manifest apt-oracle apt gpgv debian-archive-keyring dpkg bash coreutils
     printf '\n[entrypoint]\ncmd = ["/bin/bash", "-c"]\n'
 } >"$work/image/paranoid.toml"
 "$paranoid" lock -q -f "$work/image"
@@ -58,12 +80,22 @@ mkdir "$work/image"
 podman load -q -i "$work/image.tar" >/dev/null
 
 printf '%s\n' "$@" >"$work/packages"
-podman run --rm -v "$work:/w" localhost/apt-oracle:latest '
+podman run --rm -v "$work:/w" -e BACKPORTS="${BACKPORTS:-}" localhost/apt-oracle:latest '
     mkdir -p /etc/apt/apt.conf.d /var/lib/apt/lists/partial \
         /var/cache/apt/archives/partial /var/lib/dpkg /var/log/apt /tmp
     : >/var/lib/dpkg/status
     echo "deb [trusted=yes] http://deb.debian.org/debian bookworm main" \
         >/etc/apt/sources.list
+    mkdir -p /etc/apt/preferences.d
+    if [ -n "$BACKPORTS" ]; then
+        echo "deb [trusted=yes] http://deb.debian.org/debian bookworm-backports main" \
+            >>/etc/apt/sources.list
+    fi
+    case $BACKPORTS in
+    "" | default) ;;
+    *) printf "Package: *\nPin: release n=bookworm-backports\nPin-Priority: %s\n" \
+        "$BACKPORTS" >/etc/apt/preferences.d/backports ;;
+    esac
     printf "%s\n" "APT::Sandbox::User \"root\";" \
         "APT::Architecture \"$(dpkg --print-architecture)\";" \
         "APT::Install-Recommends \"false\";" >/etc/apt/apt.conf.d/oracle

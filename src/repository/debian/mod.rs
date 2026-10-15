@@ -23,7 +23,9 @@ pub use dependency::{
 pub use keyring::{Fingerprint, Keyring, KeyringError, Verified, VerifyError};
 pub use package::{DebianPackage, ParseDebianPackageError};
 pub use package_index::{PackageIndex, ParsePackageIndexError, VirtualPackageProvider};
-pub use package_index_set::{PackageIndexSet, SourcedPackage, SourcedProvider};
+pub use package_index_set::{
+    DEFAULT_PIN_PRIORITY, PackageIndexSet, SourcedPackage, SourcedProvider,
+};
 pub use priority::Priority;
 pub use provides::ProvidesEntry;
 pub use release::{IndexFile, ParseReleaseError, Release, ReleaseError};

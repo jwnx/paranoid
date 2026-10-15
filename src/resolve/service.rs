@@ -173,7 +173,10 @@ impl ResolveService {
                 .fetch_index(&snapshot, arch)
                 .await
                 .map_err(repository_error)?;
-            index_set.add_index(name.clone(), index);
+            let priority = config
+                .priority
+                .unwrap_or_else(|| snapshot.release.default_pin_priority());
+            index_set.add_index_with_priority(name.clone(), priority, index);
             repositories.push(ResolvedRepository {
                 name: name.clone(),
                 date: snapshot.release.date,

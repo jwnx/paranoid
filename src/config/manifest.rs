@@ -55,6 +55,12 @@ pub struct RepositoryConfig {
     /// been valid at that time rather than now.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<SnapshotTime>,
+    /// apt's pin priority: when several repositories carry a package, the
+    /// highest priority wins, then the highest version, and a negative one
+    /// is never used. Defaults to what apt would use: 500, or 1 or 100 for
+    /// a repository whose Release says `NotAutomatic` (like backports).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i32>,
 }
 
 impl RepositoryConfig {
