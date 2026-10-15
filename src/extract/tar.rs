@@ -242,10 +242,7 @@ impl TarArchive {
                     if !resolved.starts_with(dest) {
                         return Err(ExtractionError::PathTraversal {
                             path: full_path.to_path_buf(),
-                            reason: format!(
-                                "symlink escapes destination: -> {}",
-                                target.display()
-                            ),
+                            reason: format!("symlink escapes destination: -> {}", target.display()),
                         });
                     }
                 }

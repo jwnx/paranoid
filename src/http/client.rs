@@ -47,10 +47,7 @@ impl Client {
     ///
     /// Handles 404 specially (returns `ClientError::NotFound`) and converts
     /// other HTTP errors via `error_for_status()`.
-    async fn fetch_response(
-        &self,
-        url: &str,
-    ) -> Result<reqwest::Response, ClientError> {
+    async fn fetch_response(&self, url: &str) -> Result<reqwest::Response, ClientError> {
         let response = self.inner.get(url).send().await?;
 
         if response.status() == reqwest::StatusCode::NOT_FOUND {

@@ -5,7 +5,7 @@
 
 use std::str::FromStr;
 
-use paranoid::repository::debian::{Architecture, PackageIndexSet, PackageIndex, Priority};
+use paranoid::repository::debian::{Architecture, PackageIndex, PackageIndexSet, Priority};
 
 /// Load the test fixture containing real Debian packages.
 fn load_fixture() -> PackageIndex {
@@ -168,7 +168,8 @@ fn test_resolver_with_real_packages() {
     let awk = index.resolve("awk", None, Architecture::Amd64);
     assert!(awk.is_some(), "Should resolve virtual package awk");
     assert_eq!(
-        awk.unwrap().package.name, "mawk",
+        awk.unwrap().package.name,
+        "mawk",
         "awk should resolve to mawk (priority: required) over gawk (priority: optional)"
     );
 }
@@ -225,14 +226,21 @@ fn test_parse_empty_packages_file() {
     let empty = "";
     let result = PackageIndex::from_str(empty);
     assert!(result.is_ok(), "Empty file should parse successfully");
-    assert_eq!(result.unwrap().len(), 0, "Empty file should have 0 packages");
+    assert_eq!(
+        result.unwrap().len(),
+        0,
+        "Empty file should have 0 packages"
+    );
 }
 
 #[test]
 fn test_parse_packages_with_only_whitespace() {
     let whitespace = "   \n\n   \n\t\n   ";
     let result = PackageIndex::from_str(whitespace);
-    assert!(result.is_ok(), "Whitespace-only file should parse successfully");
+    assert!(
+        result.is_ok(),
+        "Whitespace-only file should parse successfully"
+    );
     assert_eq!(result.unwrap().len(), 0);
 }
 
@@ -365,7 +373,10 @@ async fn test_debian_repository_fetch_release() {
         "Should contain Components field"
     );
 
-    println!("Successfully fetched Release file ({} bytes)", release_content.len());
+    println!(
+        "Successfully fetched Release file ({} bytes)",
+        release_content.len()
+    );
 }
 
 /// Test the full flow from manifest to lock file.
@@ -446,10 +457,7 @@ name = "ca-certificates"
     assert!(!result.packages.is_empty(), "Should have resolved packages");
 
     // Find ca-certificates in the result
-    let ca_certs = result
-        .packages
-        .iter()
-        .find(|p| p.name == "ca-certificates");
+    let ca_certs = result.packages.iter().find(|p| p.name == "ca-certificates");
     assert!(ca_certs.is_some(), "Should have resolved ca-certificates");
 
     let ca_certs = ca_certs.unwrap();
@@ -505,8 +513,8 @@ name = "ca-certificates"
 
     // Use a temporary cache directory
     let temp_dir = TempDir::new().expect("Should create temp dir");
-    let cache = PackageCache::with_base_dir(temp_dir.path().to_path_buf())
-        .expect("Should create cache");
+    let cache =
+        PackageCache::with_base_dir(temp_dir.path().to_path_buf()).expect("Should create cache");
     let download_config = DownloadConfig::new()
         .with_max_concurrent(4)
         .with_force_download(false);
@@ -524,7 +532,11 @@ name = "ca-certificates"
     );
 
     for pkg in &result.succeeded {
-        assert!(pkg.path.exists(), "Downloaded file should exist: {:?}", pkg.path);
+        assert!(
+            pkg.path.exists(),
+            "Downloaded file should exist: {:?}",
+            pkg.path
+        );
         println!(
             "  {} {} -> {} (cached: {})",
             pkg.name,
@@ -566,8 +578,8 @@ name = "base-files"
 
     // Use a temporary cache directory
     let temp_dir = TempDir::new().expect("Should create temp dir");
-    let cache = PackageCache::with_base_dir(temp_dir.path().to_path_buf())
-        .expect("Should create cache");
+    let cache =
+        PackageCache::with_base_dir(temp_dir.path().to_path_buf()).expect("Should create cache");
     let download_config = DownloadConfig::new()
         .with_max_concurrent(4)
         .with_force_download(false);
@@ -581,7 +593,10 @@ name = "base-files"
 
     assert!(result1.failed.is_empty(), "First download should succeed");
     let first_download = result1.succeeded.iter().find(|p| p.name == "base-files");
-    assert!(first_download.is_some(), "Should have downloaded base-files");
+    assert!(
+        first_download.is_some(),
+        "Should have downloaded base-files"
+    );
     assert!(
         !first_download.unwrap().from_cache,
         "First download should NOT be from cache"

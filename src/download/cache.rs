@@ -127,9 +127,10 @@ mod tests {
 
         assert!(path.to_string_lossy().contains("sha256"));
         assert!(path.to_string_lossy().contains("ab")); // first 2 chars of hash
-        assert!(path
-            .to_string_lossy()
-            .ends_with("abc123def456abc123def456abc123def456abc123def456abc123def456abc1.deb"));
+        assert!(
+            path.to_string_lossy()
+                .ends_with("abc123def456abc123def456abc123def456abc123def456abc123def456abc1.deb")
+        );
     }
 
     // Note: test_path_for_short_hash was removed because Sha256Hash now

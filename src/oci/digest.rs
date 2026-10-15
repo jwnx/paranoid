@@ -172,10 +172,12 @@ mod tests {
     fn test_digest_from_bytes_hash_accessor() {
         let digest = Digest::from_bytes(b"hello world");
         assert_eq!(digest.hash().len(), 64);
-        assert!(digest
-            .hash()
-            .bytes()
-            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+        assert!(
+            digest
+                .hash()
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        );
     }
 
     #[test]

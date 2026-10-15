@@ -65,10 +65,7 @@ impl DownloadProgress for StderrProgress {
         if failed == 0 {
             eprintln!("Downloaded {} packages successfully.", succeeded);
         } else {
-            eprintln!(
-                "Downloaded {} packages, {} failed.",
-                succeeded, failed
-            );
+            eprintln!("Downloaded {} packages, {} failed.", succeeded, failed);
         }
     }
 }

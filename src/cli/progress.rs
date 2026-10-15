@@ -11,8 +11,8 @@
 //! ```
 
 use std::io::Write;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use paranoid::download::{DownloadError, DownloadProgress, DownloadedPackage};
 use paranoid::extract::{ExtractionError, ExtractionProgress};

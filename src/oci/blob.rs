@@ -6,7 +6,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use super::digest::{sha256_hex, Digest};
+use super::digest::{Digest, sha256_hex};
 use super::error::OciError;
 
 /// Content-addressable blob storage.

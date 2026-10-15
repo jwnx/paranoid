@@ -328,13 +328,15 @@ mod tests {
     #[test]
     fn test_lookup_nonexistent_package() {
         let index = PackageIndex::new();
-        assert!(index
-            .get(
-                "notexist",
-                DebianVersion::from_str("1.0").unwrap(),
-                Architecture::Amd64
-            )
-            .is_none());
+        assert!(
+            index
+                .get(
+                    "notexist",
+                    DebianVersion::from_str("1.0").unwrap(),
+                    Architecture::Amd64
+                )
+                .is_none()
+        );
     }
 
     #[test]

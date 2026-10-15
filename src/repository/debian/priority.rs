@@ -113,7 +113,10 @@ mod tests {
     #[test]
     fn test_priority_from_str() {
         assert_eq!(Priority::from_str("required").unwrap(), Priority::Required);
-        assert_eq!(Priority::from_str("important").unwrap(), Priority::Important);
+        assert_eq!(
+            Priority::from_str("important").unwrap(),
+            Priority::Important
+        );
         assert_eq!(Priority::from_str("standard").unwrap(), Priority::Standard);
         assert_eq!(Priority::from_str("optional").unwrap(), Priority::Optional);
         assert_eq!(Priority::from_str("extra").unwrap(), Priority::Extra);

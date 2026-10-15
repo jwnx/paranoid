@@ -10,8 +10,8 @@ use std::fs::{self, Metadata};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use flate2::write::GzEncoder;
 use flate2::Compression as GzipLevel;
+use flate2::write::GzEncoder;
 
 use super::digest::Digest;
 use super::error::OciError;

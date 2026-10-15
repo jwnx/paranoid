@@ -83,7 +83,9 @@ impl Architecture {
             // Callers must resolve them to a concrete architecture before serializing
             // an OCI image config. Reaching this branch is a programming error.
             Architecture::All | Architecture::Any => {
-                panic!("`All`/`Any` architecture has no OCI representation; resolve to a concrete architecture first")
+                panic!(
+                    "`All`/`Any` architecture has no OCI representation; resolve to a concrete architecture first"
+                )
             }
         }
     }

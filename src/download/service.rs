@@ -139,7 +139,10 @@ impl DownloadService {
             }
         }
 
-        progress.on_complete(download_result.succeeded.len(), download_result.failed.len());
+        progress.on_complete(
+            download_result.succeeded.len(),
+            download_result.failed.len(),
+        );
         download_result
     }
 
@@ -152,9 +155,7 @@ impl DownloadService {
     ) -> Result<DownloadedPackage, DownloadFailure> {
         progress.on_package_start(package);
 
-        let result = self
-            .download_package_inner(package, repo_config)
-            .await;
+        let result = self.download_package_inner(package, repo_config).await;
 
         match &result {
             Ok(downloaded) => {

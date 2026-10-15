@@ -90,7 +90,9 @@ pub enum ManifestError {
     #[error("unknown config format: '{extension}'. Supported: .toml, .yaml, .yml, .json")]
     UnknownFormat { extension: String },
 
-    #[error("no config file found in '{dir}'. Expected paranoid.toml, paranoid.yaml, paranoid.yml, or paranoid.json")]
+    #[error(
+        "no config file found in '{dir}'. Expected paranoid.toml, paranoid.yaml, paranoid.yml, or paranoid.json"
+    )]
     NotFound { dir: PathBuf },
 
     #[error("multiple config files found: {files:?}. Please keep only one.")]

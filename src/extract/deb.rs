@@ -24,13 +24,18 @@ impl TryFrom<ArArchive> for DebArchive {
     type Error = ExtractionError;
 
     fn try_from(ar: ArArchive) -> Result<Self, Self::Error> {
-        ar.find_member(|m| m.name == "debian-binary").ok_or_else(|| {
-            ExtractionError::InvalidArchive("not a deb package (missing debian-binary)".to_string())
-        })?;
+        ar.find_member(|m| m.name == "debian-binary")
+            .ok_or_else(|| {
+                ExtractionError::InvalidArchive(
+                    "not a deb package (missing debian-binary)".to_string(),
+                )
+            })?;
 
-        let (_, data) = ar.find_member(|m| m.name.starts_with("data.tar")).ok_or_else(|| {
-            ExtractionError::InvalidArchive("not a deb package (missing data.tar)".to_string())
-        })?;
+        let (_, data) = ar
+            .find_member(|m| m.name.starts_with("data.tar"))
+            .ok_or_else(|| {
+                ExtractionError::InvalidArchive("not a deb package (missing data.tar)".to_string())
+            })?;
 
         Ok(Self {
             data_tar: TarArchive::new(data)?,

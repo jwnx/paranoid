@@ -38,9 +38,8 @@ pub enum ResolveServiceError {
     InvalidVersionConstraint {
         package: String,
         #[source]
-        source: crate::version::ParseVersionConstraintError<
-            <DebianVersion as std::str::FromStr>::Err,
-        >,
+        source:
+            crate::version::ParseVersionConstraintError<<DebianVersion as std::str::FromStr>::Err>,
     },
 }
 
