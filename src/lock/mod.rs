@@ -5,4 +5,4 @@
 
 mod lockfile;
 
-pub use lockfile::{LockFile, LockFileError, LockedPackage};
+pub use lockfile::{Change, LockFile, LockFileError, LockedPackage};

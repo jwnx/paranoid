@@ -148,6 +148,26 @@ const CONFIG_FILE_NAMES: &[&str] = &[
 ];
 
 impl Manifest {
+    /// Load a manifest from a file, or find one in a directory.
+    pub fn load(path: &Path) -> Result<Self, ManifestError> {
+        if path.is_dir() {
+            Self::from_dir(path)
+        } else {
+            Self::from_file(path)
+        }
+    }
+
+    /// Where the lock file for the manifest at `path` lives by default:
+    /// `paranoid.lock` in the manifest's directory.
+    pub fn default_lock_path(path: &Path) -> PathBuf {
+        let dir = if path.is_dir() {
+            path
+        } else {
+            path.parent().unwrap_or(Path::new("."))
+        };
+        dir.join("paranoid.lock")
+    }
+
     /// Finds and loads a manifest from a directory.
     ///
     /// Looks for `paranoid.toml`, `paranoid.yaml`, `paranoid.yml`, or `paranoid.json`.

@@ -104,33 +104,6 @@ pub fn warning(msg: impl std::fmt::Display) {
     eprintln!("{} {}", accent().apply_to("warning:"), msg);
 }
 
-/// Format a diff line for package changes.
-///
-/// `+` added, `~` changed, `-` removed.
-pub fn diff_line(sigil: char, name: &str, detail: impl std::fmt::Display) {
-    match sigil {
-        '+' => eprintln!(
-            "  {} {} {}",
-            added().apply_to("+"),
-            added().apply_to(name),
-            detail,
-        ),
-        '-' => eprintln!(
-            "  {} {} {}",
-            removed().apply_to("-"),
-            removed().apply_to(name),
-            detail,
-        ),
-        '~' => eprintln!(
-            "  {} {} {}",
-            changed().apply_to("~"),
-            changed().apply_to(name),
-            detail,
-        ),
-        _ => eprintln!("  {} {} {}", sigil, name, detail),
-    }
-}
-
 /// Format a byte count as a human-readable size string.
 pub fn fmt_size(bytes: u64) -> String {
     if bytes >= 1_073_741_824 {

@@ -31,6 +31,7 @@
 mod digest;
 mod error;
 mod layer;
+mod layout;
 mod service;
 mod spec;
 pub mod types;
@@ -38,6 +39,7 @@ pub mod types;
 pub use digest::{Digest, DigestError};
 pub use error::{OciError, OciImageResult};
 pub use layer::{Compression, Layer};
+pub use layout::{ImageInfo, read_image};
 pub use service::{ImageOutput, OciConfig, OciConfigError, write_image};
 pub use spec::{
     ContainerConfig, Descriptor, History, ImageConfig, ImageIndex, ImageManifest, MediaType,

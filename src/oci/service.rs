@@ -365,12 +365,12 @@ pub fn write_image(
     let manifest = serde_json::to_vec_pretty(&ImageManifest::new(
         Descriptor::new(
             MediaType::ImageConfig,
-            config_digest.clone(),
+            config_digest,
             image_config.len() as u64,
         ),
         vec![Descriptor::new(
             layer.media_type(),
-            layer.digest().clone(),
+            *layer.digest(),
             layer.size(),
         )],
     ))?;
@@ -379,7 +379,7 @@ pub fn write_image(
     step("manifest");
 
     let total_size = layer.size() + image_config.len() as u64 + manifest.len() as u64;
-    let layer_digest = layer.digest().clone();
+    let layer_digest = *layer.digest();
     let blob = |digest: &Digest| format!("blobs/sha256/{}", digest.hash());
     let mut files: Vec<(String, Vec<u8>)> = vec![
         (blob(&layer_digest), layer.into_data()),
@@ -414,7 +414,7 @@ pub fn write_image(
 impl OciConfig {
     /// The image config document for a single layer.
     fn image_config(&self, diff_id: &Digest) -> ImageConfig {
-        let mut image = ImageConfig::new(self.architecture, vec![diff_id.clone()]);
+        let mut image = ImageConfig::new(self.architecture, vec![*diff_id]);
         image.created.clone_from(&self.created);
 
         let container = ContainerConfig {
@@ -445,7 +445,7 @@ impl OciConfig {
     fn image_index(&self, manifest_digest: &Digest, manifest_size: usize) -> ImageIndex {
         let manifest = Descriptor::new(
             MediaType::ImageManifest,
-            manifest_digest.clone(),
+            *manifest_digest,
             manifest_size as u64,
         )
         .with_annotation("org.opencontainers.image.ref.name", self.reference());

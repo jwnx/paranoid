@@ -24,6 +24,17 @@ pub enum OciError {
         source: std::io::Error,
     },
 
+    /// Failed to read an existing image.
+    #[error("failed to read image '{}'", path.display())]
+    ReadImage {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    /// An existing image is malformed.
+    #[error("invalid image: {0}")]
+    InvalidImage(String),
+
     /// Failed to serialize JSON.
     #[error("failed to serialize JSON: {0}")]
     JsonSerialization(#[from] serde_json::Error),

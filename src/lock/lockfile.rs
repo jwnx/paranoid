@@ -74,6 +74,34 @@ pub enum LockFileError {
     Serialize(#[from] toml::ser::Error),
 }
 
+/// How one package differs between two lock files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Change<'a> {
+    Added {
+        name: &'a str,
+        version: &'a str,
+    },
+    Changed {
+        name: &'a str,
+        from: &'a str,
+        to: &'a str,
+    },
+    Removed {
+        name: &'a str,
+        version: &'a str,
+    },
+}
+
+impl Change<'_> {
+    pub fn name(&self) -> &str {
+        match self {
+            Change::Added { name, .. }
+            | Change::Changed { name, .. }
+            | Change::Removed { name, .. } => name,
+        }
+    }
+}
+
 impl LockFile {
     /// Create a new lock file from a resolved manifest.
     ///
@@ -198,6 +226,40 @@ impl LockFile {
 
         let json = serde_json::to_vec(&inputs).expect("resolution inputs always serialize");
         Digest::from_bytes(&json).to_string()
+    }
+
+    /// Package-level changes going from `self` to `newer`, sorted by name.
+    pub fn diff<'a>(&'a self, newer: &'a LockFile) -> Vec<Change<'a>> {
+        use std::collections::BTreeMap;
+
+        let versions = |lock: &'a LockFile| -> BTreeMap<&'a str, &'a str> {
+            lock.packages
+                .iter()
+                .map(|p| (p.name.as_str(), p.version.as_str()))
+                .collect()
+        };
+        let old = versions(self);
+        let new = versions(newer);
+
+        let mut changes: Vec<Change<'a>> = new
+            .iter()
+            .filter_map(|(&name, &version)| match old.get(name) {
+                None => Some(Change::Added { name, version }),
+                Some(&from) if from != version => Some(Change::Changed {
+                    name,
+                    from,
+                    to: version,
+                }),
+                Some(_) => None,
+            })
+            .chain(
+                old.iter()
+                    .filter(|(name, _)| !new.contains_key(*name))
+                    .map(|(&name, &version)| Change::Removed { name, version }),
+            )
+            .collect();
+        changes.sort_by(|a, b| a.name().cmp(b.name()));
+        changes
     }
 
     /// Get a package by name.
@@ -455,5 +517,48 @@ name = "vim"
         let hash = lock.content_hash().unwrap();
 
         assert!(hash.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn diff_reports_added_changed_and_removed() {
+        let lock = |pkgs: &[(&str, &str)]| LockFile {
+            config_hash: String::new(),
+            packages: pkgs
+                .iter()
+                .map(|(name, version)| LockedPackage {
+                    name: name.to_string(),
+                    version: version.to_string(),
+                    architecture: Architecture::Amd64,
+                    sha256: Sha256::of(name.as_bytes()),
+                    filename: String::new(),
+                    size: 0,
+                    repository: "debian".to_string(),
+                    direct: false,
+                })
+                .collect(),
+            deps: Vec::new(),
+        };
+        let old = lock(&[("bash", "5.1"), ("curl", "7"), ("zlib", "1")]);
+        let new = lock(&[("bash", "5.2"), ("curl", "7"), ("libc6", "2.36")]);
+
+        assert_eq!(
+            old.diff(&new),
+            [
+                Change::Changed {
+                    name: "bash",
+                    from: "5.1",
+                    to: "5.2"
+                },
+                Change::Added {
+                    name: "libc6",
+                    version: "2.36"
+                },
+                Change::Removed {
+                    name: "zlib",
+                    version: "1"
+                },
+            ]
+        );
+        assert!(new.diff(&new).is_empty());
     }
 }

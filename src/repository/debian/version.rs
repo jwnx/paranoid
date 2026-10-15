@@ -568,11 +568,10 @@ mod tests {
                     DebianVersion::from_str(&v1),
                     DebianVersion::from_str(&v2),
                     DebianVersion::from_str(&v3)
-                ) {
-                    if a <= b && b <= c {
+                )
+                    && a <= b && b <= c {
                         prop_assert!(a <= c);
                     }
-                }
             }
 
             /// Tilde versions always sort before their non-tilde counterparts.
