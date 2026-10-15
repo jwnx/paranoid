@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use thiserror::Error;
 
@@ -23,10 +24,11 @@ pub struct ParsePackageIndexError {
     pub source: ParseDebianPackageError,
 }
 
-/// A virtual package provider entry.
+/// A virtual package provider entry. The provider is shared with the
+/// index's own entry for it rather than copied.
 #[derive(Debug, Clone)]
 pub struct VirtualPackageProvider {
-    pub provider: DebianPackage,
+    pub provider: Arc<DebianPackage>,
     pub provided_version: Option<DebianVersion>,
 }
 
@@ -63,7 +65,7 @@ pub struct VirtualPackageProvider {
 #[derive(Debug, Default)]
 pub struct PackageIndex {
     /// packages[(arch, name)][version] = Package
-    packages: HashMap<(Architecture, String), HashMap<DebianVersion, DebianPackage>>,
+    packages: HashMap<(Architecture, String), HashMap<DebianVersion, Arc<DebianPackage>>>,
     /// virtual_packages[(arch, name)] = Vec<VirtualPackageProvider>
     virtual_packages: HashMap<(Architecture, String), Vec<VirtualPackageProvider>>,
 }
@@ -81,6 +83,7 @@ impl PackageIndex {
             None => return,
         };
 
+        let pkg = Arc::new(pkg);
         for provide in &pkg.provides {
             self.add_virtual_package(arch, provide, &pkg);
         }
@@ -91,15 +94,33 @@ impl PackageIndex {
             .insert(pkg.version.clone(), pkg);
     }
 
+    /// Parse a `Packages` file and add every package in it, so several
+    /// components can share one index without copying it.
+    pub fn add_stanzas(&mut self, contents: &str) -> Result<(), ParsePackageIndexError> {
+        // Stanzas are separated by blank lines, `\n\n` or `\r\n\r\n`.
+        let stanzas = contents
+            .split("\n\n")
+            .flat_map(|s| s.split("\r\n\r\n"))
+            .filter(|s| !s.trim().is_empty());
+        for (i, stanza) in stanzas.enumerate() {
+            let pkg = DebianPackage::from_str(stanza).map_err(|e| ParsePackageIndexError {
+                stanza_index: i,
+                source: e,
+            })?;
+            self.add(pkg);
+        }
+        Ok(())
+    }
+
     /// Add a virtual package entry.
     fn add_virtual_package(
         &mut self,
         arch: Architecture,
         provide: &ProvidesEntry,
-        provider: &DebianPackage,
+        provider: &Arc<DebianPackage>,
     ) {
         let entry = VirtualPackageProvider {
-            provider: provider.clone(),
+            provider: Arc::clone(provider),
             provided_version: provide.version.clone(),
         };
 
@@ -120,13 +141,14 @@ impl PackageIndex {
         self.packages
             .get(&(arch, name.to_string()))
             .and_then(|by_version| by_version.get(&version))
+            .map(Arc::as_ref)
     }
 
     // Get all available versions of a package for an architecture.
     pub fn versions(&self, name: &str, arch: Architecture) -> Vec<&DebianPackage> {
         self.packages
             .get(&(arch, name.to_string()))
-            .map(|by_version| by_version.values().collect())
+            .map(|by_version| by_version.values().map(Arc::as_ref).collect())
             .unwrap_or_default()
     }
 
@@ -178,7 +200,7 @@ impl PackageIndex {
     pub fn packages(&self) -> Vec<&DebianPackage> {
         self.packages
             .values()
-            .flat_map(|by_version| by_version.values())
+            .flat_map(|by_version| by_version.values().map(Arc::as_ref))
             .collect()
     }
 }
@@ -188,23 +210,7 @@ impl FromStr for PackageIndex {
 
     fn from_str(contents: &str) -> Result<Self, Self::Err> {
         let mut index = PackageIndex::new();
-
-        // Split into stanzas (separated by one or more blank lines)
-        // Handle both \n\n and \r\n\r\n
-        let stanzas: Vec<&str> = contents
-            .split("\n\n")
-            .flat_map(|s| s.split("\r\n\r\n"))
-            .filter(|s| !s.trim().is_empty())
-            .collect();
-
-        for (i, stanza) in stanzas.iter().enumerate() {
-            let pkg = DebianPackage::from_str(stanza).map_err(|e| ParsePackageIndexError {
-                stanza_index: i,
-                source: e,
-            })?;
-            index.add(pkg);
-        }
-
+        index.add_stanzas(contents)?;
         Ok(index)
     }
 }

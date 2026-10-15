@@ -260,11 +260,7 @@ impl<'a> DebianRepository<'a> {
             let packages_content = self
                 .fetch_packages(snapshot, component, architecture)
                 .await?;
-            let component_index: PackageIndex = packages_content.parse()?;
-
-            for pkg in component_index.packages() {
-                index.add(pkg.clone());
-            }
+            index.add_stanzas(&packages_content)?;
         }
 
         Ok(index)

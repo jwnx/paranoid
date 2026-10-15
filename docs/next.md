@@ -59,7 +59,7 @@ checks paranoid against apt. What's left:
   parse at the edge.
 - `PackageIndex` keys by `(Architecture, String)` and allocates on every
   lookup. A per-arch `HashMap<String, BTreeMap<DebianVersion, _>>` gives
-  `latest_version` for free. `VirtualPackageProvider` clones whole packages.
+  `latest_version` for free.
 - The single-implementation `Version` trait can become the concrete
   `DebianVersion`.
 - Most modules are `pub`. Shrink the library surface to what the CLI and
