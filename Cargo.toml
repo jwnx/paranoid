@@ -27,6 +27,7 @@ zstd = "0.13"
 indexmap = { version = "2", features = ["serde"] }
 pgp = { version = "0.20", default-features = false }
 libc = "0.2"
+md-5 = "0.10"
 
 [dev-dependencies]
 proptest = "1.6"

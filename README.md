@@ -260,6 +260,11 @@ the same flag.
   written to the host filesystem except the cache and the final image, so a
   hostile package can't escape through symlinks or `..`. Symlinks inside
   the image are resolved like dpkg does, and are confined to the image root.
+- The image gets the dpkg database a real install would have:
+  `/var/lib/dpkg/status` and `info/` with each package's file list,
+  md5sums, conffiles and maintainer scripts. `dpkg -l`, `dpkg --verify` and
+  vulnerability scanners see every package. `scripts/dpkg-db-oracle.sh`
+  checks it against the database dpkg writes for the same packages.
 - Ownership, modes and link targets come from the packages. Every mtime is
   clamped and the image `created` time comes from `SOURCE_DATE_EPOCH`
   (default: the epoch).
@@ -318,6 +323,7 @@ $ cargo clippy --all-targets
 $ scripts/apt-oracle.sh         # compare resolution with apt (needs podman);
                                 #   BACKPORTS=default|<n> adds backports
 $ scripts/dpkg-oracle.sh        # regenerate dpkg's version-order test data
+$ scripts/dpkg-db-oracle.sh     # compare /var/lib/dpkg with dpkg's own
 $ scripts/trust-oracle.sh       # break a signed repo ten ways, ask apt too
 ```
 

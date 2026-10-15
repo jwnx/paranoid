@@ -113,12 +113,25 @@ impl Node {
 }
 
 /// What applying one package did.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ApplyStats {
     /// Entries read from the package.
     pub entries: usize,
     /// Entries skipped because we don't model them (device nodes, FIFOs).
     pub skipped: usize,
+    /// Every path in the package, in archive order: what dpkg lists in
+    /// `/var/lib/dpkg/info/<pkg>.list`.
+    pub paths: Vec<InstalledPath>,
+}
+
+/// A path a package installed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledPath {
+    /// As dpkg lists it: `/.`, `/usr`, `/usr/bin/bash`.
+    pub listed: String,
+    /// Where it ended up in the rootfs, after following symlinked parents
+    /// (see [`Rootfs::get`]). `None` for the root itself.
+    pub key: Option<String>,
 }
 
 /// An in-memory root filesystem.
@@ -155,6 +168,19 @@ impl Rootfs {
         self.nodes.iter().map(|(path, node)| (path.as_str(), node))
     }
 
+    /// Move a file to a new path, as dpkg does with a `.dpkg-new` conffile.
+    /// Returns whether there was a file to move.
+    pub fn rename_file(&mut self, from: &str, to: &str) -> Result<bool, RootfsError> {
+        match self.nodes.get(from) {
+            Some(Node::File(..) | Node::Hardlink { .. }) => {
+                let node = self.nodes.remove(from).expect("just looked it up");
+                self.replace(to.to_string(), node)?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     /// Apply a `.deb` package's files.
     pub fn apply_deb(&mut self, deb: &[u8]) -> Result<ApplyStats, RootfsError> {
         let deb = DebArchive::new(deb)?;
@@ -173,12 +199,20 @@ impl Rootfs {
             let raw_path = entry.path()?.to_string_lossy().into_owned();
             let components = components(&raw_path)?;
             let Some((name, parents)) = components.split_last() else {
+                stats.paths.push(InstalledPath {
+                    listed: "/.".to_string(),
+                    key: None,
+                });
                 continue; // the root directory itself
             };
 
             let meta = Meta::from_header(entry.header())?;
             let parent = self.resolve_dir(parents.iter().copied(), &raw_path)?;
             let path = join(&parent, name);
+            stats.paths.push(InstalledPath {
+                listed: format!("/{}", components.join("/")),
+                key: Some(path.clone()),
+            });
 
             match entry.header().entry_type() {
                 tar::EntryType::Directory => self.add_dir(path, meta)?,

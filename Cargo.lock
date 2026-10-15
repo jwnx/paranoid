@@ -1696,6 +1696,7 @@ dependencies = [
  "hex",
  "indexmap",
  "libc",
+ "md-5",
  "pgp",
  "proptest",
  "reqwest",

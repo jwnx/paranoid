@@ -3,6 +3,7 @@ pub mod build;
 pub mod config;
 pub mod deb;
 pub mod download;
+pub mod dpkg;
 pub mod hash;
 pub mod http;
 pub mod lock;

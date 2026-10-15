@@ -1,17 +1,19 @@
 //! Building an image from a manifest and its lock file.
 //!
 //! The pipeline is: download every locked package into the cache, apply them
-//! to an in-memory [`Rootfs`] in lock order, and write a single-layer OCI
-//! image from it.
+//! to an in-memory [`Rootfs`] in lock order, record them in the dpkg database
+//! (`/var/lib/dpkg`), and write a single-layer OCI image from it.
 
 use std::path::PathBuf;
 
 use thiserror::Error;
 
 use crate::config::Manifest;
+use crate::deb::{DebArchive, DebError};
 use crate::download::{
     DownloadConfig, DownloadError, DownloadFailures, DownloadService, Fetched, PackageCache,
 };
+use crate::dpkg::{DpkgDatabase, DpkgError};
 use crate::lock::LockFile;
 use crate::oci::{ImageOutput, OciConfig, OciConfigError, OciError, OciImageResult, Timestamp};
 use crate::report::{Event, Phase, Reporter};
@@ -66,6 +68,23 @@ pub enum BuildError {
         source: RootfsError,
     },
 
+    #[error("failed to read the control files of {package}")]
+    Control {
+        package: String,
+        #[source]
+        source: DebError,
+    },
+
+    #[error("failed to record {package} in the dpkg database")]
+    Dpkg {
+        package: String,
+        #[source]
+        source: DpkgError,
+    },
+
+    #[error("failed to write the dpkg database")]
+    DpkgDatabase(#[source] RootfsError),
+
     #[error("failed to write image")]
     Image(#[from] OciError),
 }
@@ -110,6 +129,7 @@ pub fn assemble(packages: &[Fetched<'_>], reporter: &dyn Reporter) -> Result<Roo
     });
 
     let mut rootfs = Rootfs::new();
+    let mut dpkg = DpkgDatabase::new();
     for fetched in packages {
         let name = &fetched.package.name;
         let result = PackageCache::read(&fetched.path, fetched.package)
@@ -118,9 +138,20 @@ pub fn assemble(packages: &[Fetched<'_>], reporter: &dyn Reporter) -> Result<Roo
                 source,
             })
             .and_then(|deb| {
-                rootfs
+                let stats = rootfs
                     .apply_deb(&deb)
                     .map_err(|source| BuildError::Install {
+                        package: name.clone(),
+                        source,
+                    })?;
+                let control = DebArchive::new(&deb)
+                    .and_then(|deb| deb.control())
+                    .map_err(|source| BuildError::Control {
+                        package: name.clone(),
+                        source,
+                    })?;
+                dpkg.add(control, &stats.paths, &rootfs)
+                    .map_err(|source| BuildError::Dpkg {
                         package: name.clone(),
                         source,
                     })
@@ -140,6 +171,13 @@ pub fn assemble(packages: &[Fetched<'_>], reporter: &dyn Reporter) -> Result<Roo
             item: name,
         });
     }
+
+    let database = dpkg
+        .to_tar()
+        .map_err(|e| BuildError::DpkgDatabase(e.into()))?;
+    rootfs
+        .apply_tar(database.as_slice())
+        .map_err(BuildError::DpkgDatabase)?;
 
     reporter.report(Event::End {
         phase: Phase::Assemble,
