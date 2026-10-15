@@ -1,0 +1,131 @@
+# Build the release binaries and draft a GitHub release for a `v*` tag.
+#
+# Push an annotated tag whose message is the release notes:
+#
+#   git tag -a v0.2.0 -F notes.md && git push origin v0.2.0
+#
+# The release is created as a draft, with the binaries, SHA256SUMS and build
+# provenance attestations, for a person to read and publish. Running the
+# workflow by hand builds everything without releasing.
+#
+# Actions are pinned by commit; versions are at least two weeks old when
+# pinned.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN: "1.91.0"
+  ZIG_VERSION: "0.16.0"
+  CARGO_ZIGBUILD_VERSION: "0.23.4"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy
+          rustup default "$RUST_TOOLCHAIN"
+      - name: Check the tag matches Cargo.toml
+        if: github.ref_type == 'tag'
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 |
+            python3 -c 'import json, sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "tag $GITHUB_REF_NAME doesn't match Cargo.toml version $version" >&2
+            exit 1
+          fi
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04
+          - target: aarch64-apple-darwin
+            os: macos-15
+          - target: x86_64-apple-darwin
+            os: macos-15
+    runs-on: ${{ matrix.os }}
+    env:
+      TARGET: ${{ matrix.target }}
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target "$TARGET"
+          rustup default "$RUST_TOOLCHAIN"
+      - name: Install zig and cargo-zigbuild
+        if: runner.os == 'Linux'
+        run: |
+          python3 -m pip install --user "ziglang==$ZIG_VERSION"
+          cargo install --locked cargo-zigbuild --version "$CARGO_ZIGBUILD_VERSION"
+      - name: Build
+        run: |
+          # Static musl binaries via zig on Linux; Apple's toolchain on macOS.
+          if [ "$RUNNER_OS" = Linux ]; then
+            cargo zigbuild --release --locked --target "$TARGET"
+          else
+            cargo build --release --locked --target "$TARGET"
+          fi
+      - name: Package
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then version=$GITHUB_REF_NAME; else version=dev-${GITHUB_SHA::7}; fi
+          name=paranoid-$version-$TARGET
+          mkdir -p "dist/$name"
+          cp "target/$TARGET/release/paranoid" README.md LICENSE "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          "dist/$name/paranoid" --version 2>/dev/null || file "dist/$name/paranoid"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum -- *.tar.gz | tee SHA256SUMS
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*.tar.gz
+      - name: Draft the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --draft --verify-tag --notes-from-tag \
+            --title "paranoid ${GITHUB_REF_NAME#v}" dist/*.tar.gz dist/SHA256SUMS
