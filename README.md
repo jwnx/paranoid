@@ -9,16 +9,22 @@ PARANOID(1)                     User Commands                     PARANOID(1)
 
 # paranoid
 
-Deterministic, minimal OCI images built straight from Debian packages.
+Build reproducible OCI images from Debian packages.
 
-No Dockerfile. No base image. No shell unless you ask for one. No `RUN`.
-You list packages, paranoid pins the whole dependency closure to exact
-versions and checksums, and the same lock gives you the same image, byte for
-byte, on any machine.
+paranoid builds an image without running a container, a shell or a package
+manager. You list the packages you need in `paranoid.toml`. `paranoid lock`
+resolves their dependencies against the repositories you list and writes every
+package's exact version and SHA-256 to `paranoid.lock`. `paranoid build`
+downloads those packages, checks them against the lock, unpacks them and
+writes the image. Building the same lock twice gives the same image digest.
+
+The images it makes are in the style of
+[distroless](https://github.com/GoogleContainerTools/distroless): your
+application and its runtime libraries, and nothing else unless you add it.
+If you want a shell in the image, add one, like `bash`, to the package list.
 
 ```
   paranoid.toml ──lock──▶ paranoid.lock ──build──▶ image.tar
-   what you want          what you get            what you ship
 ```
 
 ## SYNOPSIS
@@ -131,9 +137,10 @@ removed; if not, it does nothing unless you pass `--force`. Commit the lock.
 - Output is a tarball for `podman load` / `docker load` if `-o` ends in
   `.tar`, otherwise an OCI image layout directory.
 
-Maintainer scripts (`preinst`, `postinst`, ...) are *never* run. That's the
-point. It also means packages that only work after their `postinst` has run
-need you to do that work some other way.
+Maintainer scripts (`preinst`, `postinst`, ...) are never run. Packages
+that rely on their `postinst` to finish setting themselves up (creating
+users, generating config, running `update-alternatives`) won't be fully set
+up in the image, and you'll need to do that work some other way.
 
 ## GUARANTEES
 
