@@ -6,7 +6,7 @@ use futures::stream::{self, StreamExt};
 use indexmap::IndexMap;
 
 use crate::config::RepositoryConfig;
-use crate::http::Client;
+use crate::http::{Client, ClientError};
 use crate::lock::{LockFile, LockedPackage};
 use crate::report::{Event, Phase, Reporter};
 
@@ -126,8 +126,7 @@ impl DownloadService {
 
         let repo_config = repo_config
             .ok_or_else(|| DownloadError::UnknownRepository(package.repository.clone()))?;
-        let url = Self::build_download_url(package, repo_config);
-        let data = self.client.fetch_bytes(&url).await?;
+        let data = self.fetch(package, repo_config).await?;
         let path = self.cache.store(package, &data)?;
 
         Ok(Fetched {
@@ -137,9 +136,37 @@ impl DownloadService {
         })
     }
 
-    /// Build the download URL for a package.
-    fn build_download_url(package: &LockedPackage, repo_config: &RepositoryConfig) -> String {
-        format!("{}/{}", repo_config.base_url(), package.filename)
+    /// Fetch a package from its repository, or from the first of its
+    /// mirrors that still has it. Only a 404 moves on to the next one: any
+    /// other failure is a real error, and whatever we get is checked
+    /// against the lock either way.
+    async fn fetch(
+        &self,
+        package: &LockedPackage,
+        repo_config: &RepositoryConfig,
+    ) -> Result<Vec<u8>, DownloadError> {
+        let mut urls = Self::download_urls(package, repo_config)
+            .into_iter()
+            .peekable();
+        while let Some(url) = urls.next() {
+            match self.client.fetch_bytes(&url).await {
+                Err(ClientError::NotFound { .. }) if urls.peek().is_some() => continue,
+                result => return Ok(result?),
+            }
+        }
+        unreachable!("a repository always has a URL")
+    }
+
+    /// Where a package can be downloaded from, in the order to try.
+    fn download_urls(package: &LockedPackage, repo_config: &RepositoryConfig) -> Vec<String> {
+        let mirrors = repo_config
+            .mirrors
+            .iter()
+            .map(|m| m.as_str().trim_end_matches('/').to_string());
+        std::iter::once(repo_config.base_url())
+            .chain(mirrors)
+            .map(|base| format!("{base}/{}", package.filename))
+            .collect()
     }
 
     /// Get a reference to the cache.
@@ -160,39 +187,71 @@ mod tests {
         assert!(!config.force);
     }
 
-    #[test]
-    fn test_build_download_url() {
-        let package = make_test_package("bash", crate::hash::Sha256::of(b"bash"));
-        let repo_config = RepositoryConfig {
-            url: url::Url::parse("https://deb.debian.org/debian").unwrap(),
+    fn repository(url: &str, snapshot: Option<&str>, mirrors: &[&str]) -> RepositoryConfig {
+        RepositoryConfig {
+            url: url::Url::parse(url).unwrap(),
             distribution: "bookworm".to_string(),
             components: vec!["main".to_string()],
             signed_by: "keys/debian.asc".into(),
-            snapshot: None,
+            snapshot: snapshot.map(|s| s.parse().unwrap()),
             priority: None,
-        };
+            mirrors: mirrors
+                .iter()
+                .map(|m| url::Url::parse(m).unwrap())
+                .collect(),
+        }
+    }
 
-        let url = DownloadService::build_download_url(&package, &repo_config);
+    fn urls(repo: &RepositoryConfig) -> Vec<String> {
+        let package = make_test_package("bash", crate::hash::Sha256::of(b"bash"));
+        DownloadService::download_urls(&package, repo)
+    }
+
+    #[test]
+    fn downloads_from_the_repository() {
+        let expected = ["https://deb.debian.org/debian/pool/main/b/bash_1.0.0_amd64.deb"];
         assert_eq!(
-            url,
-            "https://deb.debian.org/debian/pool/main/b/bash_1.0.0_amd64.deb"
+            urls(&repository("https://deb.debian.org/debian", None, &[])),
+            expected
+        );
+        assert_eq!(
+            urls(&repository("https://deb.debian.org/debian/", None, &[])),
+            expected
         );
     }
 
     #[test]
-    fn test_build_download_url_trailing_slash() {
-        let package = make_test_package("bash", crate::hash::Sha256::of(b"bash"));
-        let repo_config = RepositoryConfig {
-            url: url::Url::parse("https://deb.debian.org/debian/").unwrap(),
-            distribution: "bookworm".to_string(),
-            components: vec!["main".to_string()],
-            signed_by: "keys/debian.asc".into(),
-            snapshot: None,
-            priority: None,
-        };
+    fn downloads_from_the_snapshot() {
+        let repo = repository(
+            "https://snapshot.debian.org/archive/debian/",
+            Some("20261005T000000Z"),
+            &[],
+        );
+        assert_eq!(
+            urls(&repo),
+            [
+                "https://snapshot.debian.org/archive/debian/20261005T000000Z/pool/main/b/bash_1.0.0_amd64.deb"
+            ]
+        );
+    }
 
-        let url = DownloadService::build_download_url(&package, &repo_config);
-        // Should not have double slashes
-        assert!(!url.contains("//pool"));
+    #[test]
+    fn mirrors_are_tried_after_the_repository_in_order() {
+        let repo = repository(
+            "https://apt.postgresql.org/pub/repos/apt",
+            None,
+            &[
+                "https://apt-archive.postgresql.org/pub/repos/apt/",
+                "https://example.org/",
+            ],
+        );
+        assert_eq!(
+            urls(&repo),
+            [
+                "https://apt.postgresql.org/pub/repos/apt/pool/main/b/bash_1.0.0_amd64.deb",
+                "https://apt-archive.postgresql.org/pub/repos/apt/pool/main/b/bash_1.0.0_amd64.deb",
+                "https://example.org/pool/main/b/bash_1.0.0_amd64.deb",
+            ]
+        );
     }
 }

@@ -144,6 +144,24 @@ one that only says `NotAutomatic` (experimental). A low priority is how you
 keep an archive of old versions around for the few packages you hold back,
 without its newer or pre-release versions creeping in.
 
+Some repositories drop old versions from their pool, which breaks every
+lock that still names one. PGDG moves them to apt-archive. `mirrors` lists
+more base URLs serving the same pool, which `build` tries in order when a
+package is gone (a 404) from the repository:
+
+```toml
+[repositories.pgdg]
+url          = "https://apt.postgresql.org/pub/repos/apt"
+distribution = "trixie-pgdg"
+components   = ["main"]
+signed_by    = "keys/pgdg.asc"
+mirrors      = ["https://apt-archive.postgresql.org/pub/repos/apt"]
+```
+
+Whatever a mirror serves is checked against the lock like anything else,
+and mirrors play no part in resolution, so adding one doesn't make the
+lock stale.
+
 To lock against a fixed point in a repository's history, point `url` at a
 snapshot service and add `snapshot`. The repository becomes `url/snapshot`,
 so moving to a newer snapshot is a one-line change:

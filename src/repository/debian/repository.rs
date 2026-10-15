@@ -288,6 +288,7 @@ mod tests {
             signed_by: "keys/debian.asc".into(),
             snapshot: None,
             priority: None,
+            mirrors: Vec::new(),
         }
     }
 

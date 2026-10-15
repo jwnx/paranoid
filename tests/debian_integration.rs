@@ -327,6 +327,7 @@ async fn test_debian_repository_fetch_packages() {
         signed_by: KEY.into(),
         snapshot: None,
         priority: None,
+        mirrors: Vec::new(),
     };
     let keyring = Keyring::load(KEY.as_ref()).expect("Should load keyring");
     let repo = DebianRepository::new(&client, "debian", &config, &keyring);
@@ -375,6 +376,7 @@ async fn test_debian_repository_fetch_release() {
         signed_by: KEY.into(),
         snapshot: None,
         priority: None,
+        mirrors: Vec::new(),
     };
     let keyring = Keyring::load(KEY.as_ref()).expect("Should load keyring");
     let repo = DebianRepository::new(&client, "debian", &config, &keyring);
@@ -416,6 +418,7 @@ async fn test_debian_repository_rejects_the_wrong_key() {
         signed_by: WRONG_KEY.into(),
         snapshot: None,
         priority: None,
+        mirrors: Vec::new(),
     };
     let keyring = Keyring::load(WRONG_KEY.as_ref()).expect("Should load keyring");
     let repo = DebianRepository::new(&client, "debian", &config, &keyring);

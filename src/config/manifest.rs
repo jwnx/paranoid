@@ -61,6 +61,13 @@ pub struct RepositoryConfig {
     /// a repository whose Release says `NotAutomatic` (like backports).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<i32>,
+    /// More base URLs serving the same pool, tried in order when a package
+    /// is gone from the repository: PGDG moves superseded versions to
+    /// apt-archive, for one. Only `.deb` downloads use them, and those are
+    /// checked against the lock, so they don't affect resolution and are
+    /// left out of the config hash.
+    #[serde(default, skip_serializing, deserialize_with = "deserialize_http_urls")]
+    pub mirrors: Vec<Url>,
 }
 
 impl RepositoryConfig {
@@ -143,6 +150,19 @@ where
         )));
     }
     Ok(url)
+}
+
+fn deserialize_http_urls<'de, D>(deserializer: D) -> Result<Vec<Url>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    struct HttpUrl(#[serde(deserialize_with = "deserialize_http_url")] Url);
+
+    Ok(Vec::<HttpUrl>::deserialize(deserializer)?
+        .into_iter()
+        .map(|u| u.0)
+        .collect())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -434,6 +454,18 @@ mod tests {
             plain.base_url(),
             "https://snapshot.debian.org/archive/debian"
         );
+    }
+
+    #[test]
+    fn mirrors_stay_out_of_the_config_hash() {
+        let repo =
+            repository("mirrors = [\"https://apt-archive.postgresql.org/pub/repos/apt\"]").unwrap();
+        assert_eq!(repo.mirrors.len(), 1);
+        let json = serde_json::to_string(&repo).unwrap();
+        assert!(!json.contains("mirrors"), "{json}");
+
+        let err = repository("mirrors = [\"ftp://example.org\"]").unwrap_err();
+        assert!(err.to_string().contains("http or https"), "{err}");
     }
 
     #[test]
