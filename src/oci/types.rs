@@ -12,6 +12,78 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// Implement the boilerplate shared by our validated string newtypes,
+/// given a `fn validate(&str) -> Result<(), $err>` on the type: `as_str`,
+/// `TryFrom<&str>`, `TryFrom<String>`, `FromStr`, `Display`, `AsRef<str>`,
+/// `From<$ty> for String` and serde via strings.
+macro_rules! string_newtype {
+    ($ty:ident, $err:ty) => {
+        impl $ty {
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl TryFrom<String> for $ty {
+            type Error = $err;
+
+            fn try_from(s: String) -> Result<Self, Self::Error> {
+                Self::validate(&s)?;
+                Ok(Self(s))
+            }
+        }
+
+        impl TryFrom<&str> for $ty {
+            type Error = $err;
+
+            fn try_from(s: &str) -> Result<Self, Self::Error> {
+                Self::validate(s)?;
+                Ok(Self(s.to_string()))
+            }
+        }
+
+        impl FromStr for $ty {
+            type Err = $err;
+
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                s.try_into()
+            }
+        }
+
+        impl From<$ty> for String {
+            fn from(value: $ty) -> String {
+                value.0
+            }
+        }
+
+        impl AsRef<str> for $ty {
+            fn as_ref(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl fmt::Display for $ty {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+
+        impl Serialize for $ty {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_str(&self.0)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $ty {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                String::deserialize(deserializer)?
+                    .try_into()
+                    .map_err(serde::de::Error::custom)
+            }
+        }
+    };
+}
+
 // ── EnvVar ────────────────────────────────────────────────────────────────────
 
 /// An environment variable in `KEY=VALUE` format.
@@ -77,76 +149,19 @@ impl EnvVar {
         self.0.split_once('=').map(|(_, v)| v).unwrap_or("")
     }
 
-    /// The full `KEY=VALUE` string.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl TryFrom<&str> for EnvVar {
-    type Error = EnvVarError;
-
-    fn try_from(s: &str) -> Result<Self, Self::Error> {
+    fn validate(s: &str) -> Result<(), EnvVarError> {
         if s.contains('\0') {
             return Err(EnvVarError::NulByte);
         }
-        let eq = s
-            .find('=')
-            .ok_or_else(|| EnvVarError::MissingSeparator(s.to_string()))?;
-        if eq == 0 {
-            return Err(EnvVarError::EmptyKey);
+        match s.find('=') {
+            None => Err(EnvVarError::MissingSeparator(s.to_string())),
+            Some(0) => Err(EnvVarError::EmptyKey),
+            Some(_) => Ok(()),
         }
-        Ok(Self(s.to_string()))
     }
 }
 
-impl TryFrom<String> for EnvVar {
-    type Error = EnvVarError;
-
-    fn try_from(s: String) -> Result<Self, Self::Error> {
-        if s.contains('\0') {
-            return Err(EnvVarError::NulByte);
-        }
-        let eq = s
-            .find('=')
-            .ok_or_else(|| EnvVarError::MissingSeparator(s.clone()))?;
-        if eq == 0 {
-            return Err(EnvVarError::EmptyKey);
-        }
-        Ok(Self(s))
-    }
-}
-
-impl From<EnvVar> for String {
-    fn from(v: EnvVar) -> String {
-        v.0
-    }
-}
-
-impl AsRef<str> for EnvVar {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for EnvVar {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl Serialize for EnvVar {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.0)
-    }
-}
-
-impl<'de> Deserialize<'de> for EnvVar {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(deserializer)?;
-        Self::try_from(s).map_err(serde::de::Error::custom)
-    }
-}
+string_newtype!(EnvVar, EnvVarError);
 
 // ── AbsolutePath ──────────────────────────────────────────────────────────────
 
@@ -179,66 +194,16 @@ pub enum AbsolutePathError {
 }
 
 impl AbsolutePath {
-    /// The path as a `&str`.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl TryFrom<&str> for AbsolutePath {
-    type Error = AbsolutePathError;
-
-    fn try_from(s: &str) -> Result<Self, Self::Error> {
+    fn validate(s: &str) -> Result<(), AbsolutePathError> {
         if Path::new(s).is_absolute() {
-            Ok(Self(s.to_string()))
+            Ok(())
         } else {
             Err(AbsolutePathError::NotAbsolute(s.to_string()))
         }
     }
 }
 
-impl TryFrom<String> for AbsolutePath {
-    type Error = AbsolutePathError;
-
-    fn try_from(s: String) -> Result<Self, Self::Error> {
-        if Path::new(&s).is_absolute() {
-            Ok(Self(s))
-        } else {
-            Err(AbsolutePathError::NotAbsolute(s))
-        }
-    }
-}
-
-impl From<AbsolutePath> for String {
-    fn from(p: AbsolutePath) -> String {
-        p.0
-    }
-}
-
-impl AsRef<str> for AbsolutePath {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for AbsolutePath {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl Serialize for AbsolutePath {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.0)
-    }
-}
-
-impl<'de> Deserialize<'de> for AbsolutePath {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(deserializer)?;
-        Self::try_from(s).map_err(serde::de::Error::custom)
-    }
-}
+string_newtype!(AbsolutePath, AbsolutePathError);
 
 // ── Signal ────────────────────────────────────────────────────────────────────
 
@@ -299,77 +264,56 @@ pub enum Signal {
 #[error("unknown signal: {0:?}")]
 pub struct ParseSignalError(String);
 
+/// Every signal with its name and Linux number, in one place.
+const SIGNALS: &[(Signal, &str, u8)] = &[
+    (Signal::Sighup, "SIGHUP", 1),
+    (Signal::Sigint, "SIGINT", 2),
+    (Signal::Sigquit, "SIGQUIT", 3),
+    (Signal::Sigill, "SIGILL", 4),
+    (Signal::Sigtrap, "SIGTRAP", 5),
+    (Signal::Sigabrt, "SIGABRT", 6),
+    (Signal::Sigbus, "SIGBUS", 7),
+    (Signal::Sigfpe, "SIGFPE", 8),
+    (Signal::Sigkill, "SIGKILL", 9),
+    (Signal::Sigusr1, "SIGUSR1", 10),
+    (Signal::Sigsegv, "SIGSEGV", 11),
+    (Signal::Sigusr2, "SIGUSR2", 12),
+    (Signal::Sigpipe, "SIGPIPE", 13),
+    (Signal::Sigalrm, "SIGALRM", 14),
+    (Signal::Sigterm, "SIGTERM", 15),
+    (Signal::Sigchld, "SIGCHLD", 17),
+    (Signal::Sigcont, "SIGCONT", 18),
+    (Signal::Sigstop, "SIGSTOP", 19),
+    (Signal::Sigtstp, "SIGTSTP", 20),
+    (Signal::Sigttin, "SIGTTIN", 21),
+    (Signal::Sigttou, "SIGTTOU", 22),
+    (Signal::Sigurg, "SIGURG", 23),
+    (Signal::Sigxcpu, "SIGXCPU", 24),
+    (Signal::Sigxfsz, "SIGXFSZ", 25),
+    (Signal::Sigvtalrm, "SIGVTALRM", 26),
+    (Signal::Sigprof, "SIGPROF", 27),
+    (Signal::Sigwinch, "SIGWINCH", 28),
+    (Signal::Sigio, "SIGIO", 29),
+    (Signal::Sigpwr, "SIGPWR", 30),
+    (Signal::Sigsys, "SIGSYS", 31),
+];
+
 impl Signal {
-    /// The canonical signal name string (e.g. `"SIGTERM"`).
-    pub const fn as_str(&self) -> &'static str {
-        match self {
-            Self::Sighup => "SIGHUP",
-            Self::Sigint => "SIGINT",
-            Self::Sigquit => "SIGQUIT",
-            Self::Sigill => "SIGILL",
-            Self::Sigtrap => "SIGTRAP",
-            Self::Sigabrt => "SIGABRT",
-            Self::Sigbus => "SIGBUS",
-            Self::Sigfpe => "SIGFPE",
-            Self::Sigkill => "SIGKILL",
-            Self::Sigusr1 => "SIGUSR1",
-            Self::Sigsegv => "SIGSEGV",
-            Self::Sigusr2 => "SIGUSR2",
-            Self::Sigpipe => "SIGPIPE",
-            Self::Sigalrm => "SIGALRM",
-            Self::Sigterm => "SIGTERM",
-            Self::Sigchld => "SIGCHLD",
-            Self::Sigcont => "SIGCONT",
-            Self::Sigstop => "SIGSTOP",
-            Self::Sigtstp => "SIGTSTP",
-            Self::Sigttin => "SIGTTIN",
-            Self::Sigttou => "SIGTTOU",
-            Self::Sigurg => "SIGURG",
-            Self::Sigxcpu => "SIGXCPU",
-            Self::Sigxfsz => "SIGXFSZ",
-            Self::Sigvtalrm => "SIGVTALRM",
-            Self::Sigprof => "SIGPROF",
-            Self::Sigwinch => "SIGWINCH",
-            Self::Sigio => "SIGIO",
-            Self::Sigpwr => "SIGPWR",
-            Self::Sigsys => "SIGSYS",
-        }
+    fn entry(self) -> &'static (Signal, &'static str, u8) {
+        SIGNALS
+            .iter()
+            .find(|(signal, ..)| *signal == self)
+            .expect("every Signal has a row in SIGNALS")
     }
 
-    /// The standard signal number on Linux.
-    pub const fn number(&self) -> u8 {
-        match self {
-            Self::Sighup => 1,
-            Self::Sigint => 2,
-            Self::Sigquit => 3,
-            Self::Sigill => 4,
-            Self::Sigtrap => 5,
-            Self::Sigabrt => 6,
-            Self::Sigbus => 7,
-            Self::Sigfpe => 8,
-            Self::Sigkill => 9,
-            Self::Sigusr1 => 10,
-            Self::Sigsegv => 11,
-            Self::Sigusr2 => 12,
-            Self::Sigpipe => 13,
-            Self::Sigalrm => 14,
-            Self::Sigterm => 15,
-            Self::Sigchld => 17,
-            Self::Sigcont => 18,
-            Self::Sigstop => 19,
-            Self::Sigtstp => 20,
-            Self::Sigttin => 21,
-            Self::Sigttou => 22,
-            Self::Sigurg => 23,
-            Self::Sigxcpu => 24,
-            Self::Sigxfsz => 25,
-            Self::Sigvtalrm => 26,
-            Self::Sigprof => 27,
-            Self::Sigwinch => 28,
-            Self::Sigio => 29,
-            Self::Sigpwr => 30,
-            Self::Sigsys => 31,
-        }
+    /// The canonical signal name (e.g. `"SIGTERM"`).
+    pub fn as_str(&self) -> &'static str {
+        self.entry().1
+    }
+
+    /// The signal number on Linux.
+    pub fn number(&self) -> u8 {
+        self.entry().2
     }
 }
 
@@ -379,101 +323,20 @@ impl fmt::Display for Signal {
     }
 }
 
-impl Signal {
-    /// Look up a signal by its canonical `SIGFOO` name (must be uppercase, with prefix).
-    fn from_name(name: &str) -> Option<Self> {
-        match name {
-            "SIGHUP" => Some(Self::Sighup),
-            "SIGINT" => Some(Self::Sigint),
-            "SIGQUIT" => Some(Self::Sigquit),
-            "SIGILL" => Some(Self::Sigill),
-            "SIGTRAP" => Some(Self::Sigtrap),
-            "SIGABRT" => Some(Self::Sigabrt),
-            "SIGBUS" => Some(Self::Sigbus),
-            "SIGFPE" => Some(Self::Sigfpe),
-            "SIGKILL" => Some(Self::Sigkill),
-            "SIGUSR1" => Some(Self::Sigusr1),
-            "SIGSEGV" => Some(Self::Sigsegv),
-            "SIGUSR2" => Some(Self::Sigusr2),
-            "SIGPIPE" => Some(Self::Sigpipe),
-            "SIGALRM" => Some(Self::Sigalrm),
-            "SIGTERM" => Some(Self::Sigterm),
-            "SIGCHLD" => Some(Self::Sigchld),
-            "SIGCONT" => Some(Self::Sigcont),
-            "SIGSTOP" => Some(Self::Sigstop),
-            "SIGTSTP" => Some(Self::Sigtstp),
-            "SIGTTIN" => Some(Self::Sigttin),
-            "SIGTTOU" => Some(Self::Sigttou),
-            "SIGURG" => Some(Self::Sigurg),
-            "SIGXCPU" => Some(Self::Sigxcpu),
-            "SIGXFSZ" => Some(Self::Sigxfsz),
-            "SIGVTALRM" => Some(Self::Sigvtalrm),
-            "SIGPROF" => Some(Self::Sigprof),
-            "SIGWINCH" => Some(Self::Sigwinch),
-            "SIGIO" => Some(Self::Sigio),
-            "SIGPWR" => Some(Self::Sigpwr),
-            "SIGSYS" => Some(Self::Sigsys),
-            _ => None,
-        }
-    }
-}
-
 impl FromStr for Signal {
     type Err = ParseSignalError;
 
+    /// Accepts a number (`"15"`), or a name with or without the `SIG`
+    /// prefix, in any case (`"SIGTERM"`, `"term"`).
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        // Try interpreting as a number first.
-        if let Ok(n) = s.parse::<u8>() {
-            return Self::from_number(n).ok_or_else(|| ParseSignalError(s.to_string()));
-        }
-
-        // Accept with or without the "SIG" prefix, case-insensitive.
         let upper = s.to_ascii_uppercase();
-        let name = if upper.starts_with("SIG") {
-            upper
-        } else {
-            format!("SIG{}", upper)
-        };
-
-        Self::from_name(&name).ok_or_else(|| ParseSignalError(s.to_string()))
-    }
-}
-
-impl Signal {
-    fn from_number(n: u8) -> Option<Self> {
-        match n {
-            1 => Some(Self::Sighup),
-            2 => Some(Self::Sigint),
-            3 => Some(Self::Sigquit),
-            4 => Some(Self::Sigill),
-            5 => Some(Self::Sigtrap),
-            6 => Some(Self::Sigabrt),
-            7 => Some(Self::Sigbus),
-            8 => Some(Self::Sigfpe),
-            9 => Some(Self::Sigkill),
-            10 => Some(Self::Sigusr1),
-            11 => Some(Self::Sigsegv),
-            12 => Some(Self::Sigusr2),
-            13 => Some(Self::Sigpipe),
-            14 => Some(Self::Sigalrm),
-            15 => Some(Self::Sigterm),
-            17 => Some(Self::Sigchld),
-            18 => Some(Self::Sigcont),
-            19 => Some(Self::Sigstop),
-            20 => Some(Self::Sigtstp),
-            21 => Some(Self::Sigttin),
-            22 => Some(Self::Sigttou),
-            23 => Some(Self::Sigurg),
-            24 => Some(Self::Sigxcpu),
-            25 => Some(Self::Sigxfsz),
-            26 => Some(Self::Sigvtalrm),
-            27 => Some(Self::Sigprof),
-            28 => Some(Self::Sigwinch),
-            29 => Some(Self::Sigio),
-            30 => Some(Self::Sigpwr),
-            31 => Some(Self::Sigsys),
-            _ => None,
-        }
+        let name = upper.strip_prefix("SIG").unwrap_or(&upper);
+        let number = s.parse::<u8>().ok();
+        SIGNALS
+            .iter()
+            .find(|(_, n, num)| Some(*num) == number || n[3..] == *name)
+            .map(|(signal, ..)| *signal)
+            .ok_or_else(|| ParseSignalError(s.to_string()))
     }
 }
 
@@ -584,9 +447,8 @@ impl<'de> Deserialize<'de> for Timestamp {
 ///
 /// # Invariants
 ///
-/// - Non-empty.
-/// - At most 128 characters.
-/// - Contains only ASCII alphanumeric characters, `.`, `_`, or `-`.
+/// - Matches `[A-Za-z0-9_][A-Za-z0-9._-]{0,127}`: at most 128 characters,
+///   not starting with `.` or `-`.
 ///
 /// Ref.: <https://github.com/opencontainers/distribution-spec/blob/main/spec.md#pulling-manifests>
 ///
@@ -618,90 +480,34 @@ pub enum ImageTagError {
 }
 
 impl ImageTag {
-    /// The tag string.
-    pub fn as_str(&self) -> &str {
-        &self.0
+    fn validate(s: &str) -> Result<(), ImageTagError> {
+        let first = s.chars().next().ok_or(ImageTagError::Empty)?;
+        if s.len() > 128 {
+            return Err(ImageTagError::TooLong(s.to_string()));
+        }
+        let invalid = |ch| ImageTagError::InvalidChar {
+            ch,
+            tag: s.to_string(),
+        };
+        if !(first.is_ascii_alphanumeric() || first == '_') {
+            return Err(invalid(first));
+        }
+        match s
+            .chars()
+            .find(|c| !c.is_ascii_alphanumeric() && !matches!(c, '.' | '_' | '-'))
+        {
+            Some(ch) => Err(invalid(ch)),
+            None => Ok(()),
+        }
     }
 }
+
+string_newtype!(ImageTag, ImageTagError);
 
 impl Default for ImageTag {
     fn default() -> Self {
         // "latest" always satisfies the invariants.
         Self("latest".to_string())
-    }
-}
-
-impl TryFrom<&str> for ImageTag {
-    type Error = ImageTagError;
-
-    fn try_from(s: &str) -> Result<Self, Self::Error> {
-        if s.is_empty() {
-            return Err(ImageTagError::Empty);
-        }
-        if s.len() > 128 {
-            return Err(ImageTagError::TooLong(s.to_string()));
-        }
-        if let Some(ch) = s
-            .chars()
-            .find(|c| !c.is_ascii_alphanumeric() && !matches!(c, '.' | '_' | '-'))
-        {
-            return Err(ImageTagError::InvalidChar {
-                ch,
-                tag: s.to_string(),
-            });
-        }
-        Ok(Self(s.to_string()))
-    }
-}
-
-impl TryFrom<String> for ImageTag {
-    type Error = ImageTagError;
-
-    fn try_from(s: String) -> Result<Self, Self::Error> {
-        if s.is_empty() {
-            return Err(ImageTagError::Empty);
-        }
-        if s.len() > 128 {
-            return Err(ImageTagError::TooLong(s));
-        }
-        if let Some(ch) = s
-            .chars()
-            .find(|c| !c.is_ascii_alphanumeric() && !matches!(c, '.' | '_' | '-'))
-        {
-            return Err(ImageTagError::InvalidChar { ch, tag: s });
-        }
-        Ok(Self(s))
-    }
-}
-
-impl From<ImageTag> for String {
-    fn from(t: ImageTag) -> String {
-        t.0
-    }
-}
-
-impl AsRef<str> for ImageTag {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for ImageTag {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl Serialize for ImageTag {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.0)
-    }
-}
-
-impl<'de> Deserialize<'de> for ImageTag {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(deserializer)?;
-        Self::try_from(s).map_err(serde::de::Error::custom)
     }
 }
 
@@ -712,8 +518,9 @@ impl<'de> Deserialize<'de> for ImageTag {
 /// # Invariants
 ///
 /// - Non-empty.
-/// - Does not contain `:` (that is reserved for separating name from tag).
-/// - Does not contain `@` (that is reserved for digest references).
+/// - No `:` (reserved for separating name from tag), except for a registry
+///   port in the first component, as in `localhost:5000/app`.
+/// - No `@` (reserved for digest references).
 ///
 /// # Example
 ///
@@ -741,76 +548,26 @@ pub enum ImageNameError {
 }
 
 impl ImageName {
-    /// The name string.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl TryFrom<&str> for ImageName {
-    type Error = ImageNameError;
-
-    fn try_from(s: &str) -> Result<Self, Self::Error> {
+    fn validate(s: &str) -> Result<(), ImageNameError> {
         if s.is_empty() {
             return Err(ImageNameError::Empty);
-        }
-        if s.contains(':') {
-            return Err(ImageNameError::ContainsColon(s.to_string()));
         }
         if s.contains('@') {
             return Err(ImageNameError::ContainsAt(s.to_string()));
         }
-        Ok(Self(s.to_string()))
-    }
-}
-
-impl TryFrom<String> for ImageName {
-    type Error = ImageNameError;
-
-    fn try_from(s: String) -> Result<Self, Self::Error> {
-        if s.is_empty() {
-            return Err(ImageNameError::Empty);
+        // A colon may only appear as a registry port: `host:port/path`.
+        let path = match s.split_once('/') {
+            Some((host, path)) if host.contains(':') => path,
+            _ => s,
+        };
+        if path.contains(':') {
+            return Err(ImageNameError::ContainsColon(s.to_string()));
         }
-        if s.contains(':') {
-            return Err(ImageNameError::ContainsColon(s));
-        }
-        if s.contains('@') {
-            return Err(ImageNameError::ContainsAt(s));
-        }
-        Ok(Self(s))
+        Ok(())
     }
 }
 
-impl From<ImageName> for String {
-    fn from(n: ImageName) -> String {
-        n.0
-    }
-}
-
-impl AsRef<str> for ImageName {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for ImageName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl Serialize for ImageName {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.0)
-    }
-}
-
-impl<'de> Deserialize<'de> for ImageName {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let s = String::deserialize(deserializer)?;
-        Self::try_from(s).map_err(serde::de::Error::custom)
-    }
-}
+string_newtype!(ImageName, ImageNameError);
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -1051,5 +808,40 @@ mod tests {
         ));
         // '@' with ':' triggers ContainsColon first — either error is correct
         assert!(ImageName::try_from("name@sha256:abc").is_err());
+    }
+
+    #[test]
+    fn image_name_allows_registry_port() {
+        assert!(ImageName::try_from("localhost:5000/app").is_ok());
+        assert!(ImageName::try_from("registry.io:443/org/app").is_ok());
+        assert!(ImageName::try_from("localhost:5000/app:tag").is_err());
+        assert!(ImageName::try_from("app:tag").is_err());
+    }
+
+    #[test]
+    fn image_tag_rejects_leading_dot_or_dash() {
+        assert!(ImageTag::try_from(".hidden").is_err());
+        assert!(ImageTag::try_from("-dash").is_err());
+        assert!(ImageTag::try_from("_ok").is_ok());
+    }
+
+    #[test]
+    fn string_newtypes_parse() {
+        let tag: ImageTag = "v1".parse().unwrap();
+        assert_eq!(String::from(tag), "v1");
+        assert!("relative".parse::<AbsolutePath>().is_err());
+    }
+
+    #[test]
+    fn signal_table_roundtrips() {
+        for (signal, name, number) in SIGNALS {
+            assert_eq!(signal.as_str(), *name);
+            assert_eq!(signal.number(), *number);
+            assert_eq!(name.parse::<Signal>().unwrap(), *signal);
+            assert_eq!(number.to_string().parse::<Signal>().unwrap(), *signal);
+            assert_eq!(name[3..].to_lowercase().parse::<Signal>().unwrap(), *signal);
+        }
+        assert!("16".parse::<Signal>().is_err());
+        assert!("SIGNOPE".parse::<Signal>().is_err());
     }
 }
