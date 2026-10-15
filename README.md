@@ -134,6 +134,23 @@ pub   rsa4096 2023-01-21 [SC] [expires: 2031-01-19]
 uid                      Debian Archive Automatic Signing Key (12/bookworm) <ftpmaster@debian.org>
 ```
 
+To lock against a fixed point in a repository's history, point `url` at a
+snapshot service and add `snapshot`. The repository becomes `url/snapshot`,
+so moving to a newer snapshot is a one-line change:
+
+```toml
+[repositories.debian]
+url          = "https://snapshot.debian.org/archive/debian"
+snapshot     = "20261005T000000Z"
+distribution = "trixie"
+components   = ["main"]
+signed_by    = "keys/debian-archive-trixie-automatic.asc"
+```
+
+An old snapshot's Release is usually past its `Valid-Until`. With
+`snapshot` set, paranoid checks that the Release was valid at the
+snapshot's time instead of now, and that it isn't dated after it.
+
 `cmd` is the image's *entrypoint*: arguments to `podman run` are appended
 to it, they don't replace it.
 
@@ -179,7 +196,8 @@ The signature check follows what apt does with `gpgv`. One good signature
 from a key in `signed_by` is required. A signature from one of those keys
 that doesn't verify is an error, while signatures from other keys are
 ignored. Revoked or expired keys, SHA-1 signatures and an expired
-`Valid-Until` are refused. paranoid is stricter than apt in two places:
+`Valid-Until` are refused (for a `snapshot`, expired at the snapshot's
+time). paranoid is stricter than apt in two places:
 
 - A repository without `InRelease` is refused. paranoid doesn't fall back
   to an unsigned `Release`.

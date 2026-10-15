@@ -139,8 +139,7 @@ impl DownloadService {
 
     /// Build the download URL for a package.
     fn build_download_url(package: &LockedPackage, repo_config: &RepositoryConfig) -> String {
-        let base_url = repo_config.url.as_str().trim_end_matches('/');
-        format!("{}/{}", base_url, package.filename)
+        format!("{}/{}", repo_config.base_url(), package.filename)
     }
 
     /// Get a reference to the cache.
@@ -169,6 +168,7 @@ mod tests {
             distribution: "bookworm".to_string(),
             components: vec!["main".to_string()],
             signed_by: "keys/debian.asc".into(),
+            snapshot: None,
         };
 
         let url = DownloadService::build_download_url(&package, &repo_config);
@@ -186,6 +186,7 @@ mod tests {
             distribution: "bookworm".to_string(),
             components: vec!["main".to_string()],
             signed_by: "keys/debian.asc".into(),
+            snapshot: None,
         };
 
         let url = DownloadService::build_download_url(&package, &repo_config);

@@ -77,6 +77,8 @@ pub struct DebianRepository<'a> {
     config: &'a RepositoryConfig,
     keyring: &'a Keyring,
     name: String,
+    /// `config.base_url()`, computed once.
+    base_url: String,
 }
 
 impl<'a> DebianRepository<'a> {
@@ -93,6 +95,7 @@ impl<'a> DebianRepository<'a> {
             config,
             keyring,
             name: name.to_string(),
+            base_url: config.base_url(),
         }
     }
 
@@ -139,7 +142,11 @@ impl<'a> DebianRepository<'a> {
                     source,
                 })?;
         release
-            .check(&self.config.distribution, now)
+            .check(
+                &self.config.distribution,
+                now,
+                self.config.snapshot.map(|s| s.time()),
+            )
             .map_err(|source| DebianRepositoryError::Release {
                 url: url.clone(),
                 source,
@@ -162,9 +169,9 @@ impl<'a> DebianRepository<'a> {
         )
     }
 
-    /// Get the base URL with trailing slash removed.
+    /// The repository's root URL, without a trailing slash.
     fn base_url(&self) -> &str {
-        self.config.url.as_str().trim_end_matches('/')
+        &self.base_url
     }
 
     /// Fetch a file listed in the snapshot and check it against the listing.
@@ -279,6 +286,7 @@ mod tests {
             distribution: "bookworm".to_string(),
             components: vec!["main".to_string()],
             signed_by: "keys/debian.asc".into(),
+            snapshot: None,
         }
     }
 

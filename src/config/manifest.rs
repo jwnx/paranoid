@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use chrono::{DateTime, NaiveDateTime, Utc};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -49,6 +50,64 @@ pub struct RepositoryConfig {
     /// OpenPGP keys allowed to sign the repository's `InRelease`, relative
     /// to the manifest. Like apt's `Signed-By`, but required.
     pub signed_by: PathBuf,
+    /// A point in time on a snapshot service such as snapshot.debian.org:
+    /// the repository is then `<url>/<snapshot>`, and its Release must have
+    /// been valid at that time rather than now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<SnapshotTime>,
+}
+
+impl RepositoryConfig {
+    /// The repository's root URL, without a trailing slash: `url`, or
+    /// `url/snapshot` for a snapshot.
+    pub fn base_url(&self) -> String {
+        let url = self.url.as_str().trim_end_matches('/');
+        match &self.snapshot {
+            Some(snapshot) => format!("{url}/{snapshot}"),
+            None => url.to_string(),
+        }
+    }
+}
+
+/// A snapshot timestamp as snapshot.debian.org and snapshot.ubuntu.com
+/// write it: `20261005T000000Z`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SnapshotTime(DateTime<Utc>);
+
+const SNAPSHOT_FORMAT: &str = "%Y%m%dT%H%M%SZ";
+
+impl SnapshotTime {
+    pub fn time(&self) -> DateTime<Utc> {
+        self.0
+    }
+}
+
+impl FromStr for SnapshotTime {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        NaiveDateTime::parse_from_str(s, SNAPSHOT_FORMAT)
+            .map(|t| Self(t.and_utc()))
+            .map_err(|_| format!("invalid snapshot '{s}': expected a time like 20261005T000000Z"))
+    }
+}
+
+impl std::fmt::Display for SnapshotTime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0.format(SNAPSHOT_FORMAT))
+    }
+}
+
+impl Serialize for SnapshotTime {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for SnapshotTime {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserialize_from_str(deserializer)
+    }
 }
 
 /// Deserialize any `FromStr` type from a string, so aliases and validation
@@ -339,6 +398,50 @@ impl Manifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn repository(extra: &str) -> Result<RepositoryConfig, ManifestError> {
+        let toml = format!(
+            "[repositories.debian]\n\
+             url = \"https://snapshot.debian.org/archive/debian/\"\n\
+             distribution = \"trixie\"\n\
+             components = [\"main\"]\n\
+             signed_by = \"keys/debian.asc\"\n{extra}\n\
+             [[packages]]\nname = \"bash\"\n"
+        );
+        Manifest::from_str(&toml).map(|m| m.repositories["debian"].clone())
+    }
+
+    #[test]
+    fn a_snapshot_is_appended_to_the_url() {
+        let repo = repository("snapshot = \"20261005T000000Z\"").unwrap();
+        assert_eq!(
+            repo.base_url(),
+            "https://snapshot.debian.org/archive/debian/20261005T000000Z"
+        );
+        assert_eq!(
+            repo.snapshot.unwrap().time(),
+            "2026-10-05T00:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
+
+        let plain = repository("").unwrap();
+        assert_eq!(
+            plain.base_url(),
+            "https://snapshot.debian.org/archive/debian"
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_snapshots() {
+        for bad in [
+            "2026-10-05",
+            "20261005",
+            "20261005T000000",
+            "20261305T000000Z",
+        ] {
+            let err = repository(&format!("snapshot = \"{bad}\"")).unwrap_err();
+            assert!(err.to_string().contains("invalid snapshot"), "{bad}: {err}");
+        }
+    }
 
     #[test]
     fn parse_valid_config() {

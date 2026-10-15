@@ -41,6 +41,18 @@ pub enum ReleaseError {
     #[error("the Release file expired at {0}")]
     Expired(DateTime<Utc>),
 
+    #[error("the Release file expired at {until}, before the snapshot at {at}")]
+    ExpiredAtSnapshot {
+        until: DateTime<Utc>,
+        at: DateTime<Utc>,
+    },
+
+    #[error("the Release file is dated {date}, after the snapshot at {at}")]
+    AfterSnapshot {
+        date: DateTime<Utc>,
+        at: DateTime<Utc>,
+    },
+
     #[error("the Release file lists no Packages index for {component}/binary-{architecture}")]
     MissingIndex {
         component: String,
@@ -74,8 +86,14 @@ pub const PACKAGES_VARIANTS: &[&str] = &["Packages.xz", "Packages.gz", "Packages
 
 impl Release {
     /// Check that this is the distribution we asked for and that it's
-    /// still valid at `now`.
-    pub fn check(&self, distribution: &str, now: DateTime<Utc>) -> Result<(), ReleaseError> {
+    /// still valid at `now`, or, for a repository pinned to a snapshot,
+    /// that it was valid at the snapshot's time.
+    pub fn check(
+        &self,
+        distribution: &str,
+        now: DateTime<Utc>,
+        snapshot: Option<DateTime<Utc>>,
+    ) -> Result<(), ReleaseError> {
         // A validly signed Release for another distribution (an older one,
         // say) is a downgrade, not a mirror quirk.
         let names = [&self.suite, &self.codename];
@@ -88,13 +106,20 @@ impl Release {
             });
         }
         // Valid-Until is what stops a mirror from serving a stale, but
-        // validly signed, snapshot forever.
-        if let Some(until) = self.valid_until
-            && until <= now
-        {
-            return Err(ReleaseError::Expired(until));
+        // validly signed, snapshot forever. A snapshot is stale on purpose,
+        // so it has to have been fresh at its own time instead, and can't
+        // hold a Release from after it.
+        match (snapshot, self.valid_until) {
+            (Some(at), _) if self.date > at => Err(ReleaseError::AfterSnapshot {
+                date: self.date,
+                at,
+            }),
+            (Some(at), Some(until)) if until <= at => {
+                Err(ReleaseError::ExpiredAtSnapshot { until, at })
+            }
+            (None, Some(until)) if until <= now => Err(ReleaseError::Expired(until)),
+            _ => Ok(()),
         }
-        Ok(())
     }
 
     /// The `Packages` index to fetch for a component and architecture: its
@@ -258,16 +283,54 @@ SHA256:
     fn checks_distribution_and_expiry() {
         let r: Release = RELEASE.parse().unwrap();
         let before = at("2026-10-16T00:00:00Z");
-        assert_eq!(r.check("bookworm-security", before), Ok(()));
-        assert_eq!(r.check("oldstable-security", before), Ok(()));
+        assert_eq!(r.check("bookworm-security", before, None), Ok(()));
+        assert_eq!(r.check("oldstable-security", before, None), Ok(()));
         assert!(matches!(
-            r.check("trixie-security", before),
+            r.check("trixie-security", before, None),
             Err(ReleaseError::WrongDistribution { .. })
         ));
         assert_eq!(
-            r.check("bookworm-security", at("2026-10-23T00:00:00Z")),
+            r.check("bookworm-security", at("2026-10-23T00:00:00Z"), None),
             Err(ReleaseError::Expired(at("2026-10-22T20:04:09Z")))
         );
+    }
+
+    #[test]
+    fn checks_snapshots_at_their_own_time() {
+        // Dated 2026-10-15 20:04, valid until 2026-10-22 20:04.
+        let r: Release = RELEASE.parse().unwrap();
+        let long_after = at("2027-01-01T00:00:00Z");
+        let dist = "bookworm-security";
+
+        // Expired now, but valid when the snapshot was taken.
+        assert_eq!(
+            r.check(dist, long_after, Some(at("2026-10-16T00:00:00Z"))),
+            Ok(())
+        );
+        assert_eq!(
+            r.check(dist, long_after, Some(at("2026-10-23T00:00:00Z"))),
+            Err(ReleaseError::ExpiredAtSnapshot {
+                until: at("2026-10-22T20:04:09Z"),
+                at: at("2026-10-23T00:00:00Z"),
+            })
+        );
+        // A snapshot can't hold a Release from after it.
+        assert_eq!(
+            r.check(dist, long_after, Some(at("2026-10-15T00:00:00Z"))),
+            Err(ReleaseError::AfterSnapshot {
+                date: at("2026-10-15T20:04:09Z"),
+                at: at("2026-10-15T00:00:00Z"),
+            })
+        );
+        // The distribution is still checked.
+        assert!(matches!(
+            r.check(
+                "trixie-security",
+                long_after,
+                Some(at("2026-10-16T00:00:00Z"))
+            ),
+            Err(ReleaseError::WrongDistribution { .. })
+        ));
     }
 
     #[test]

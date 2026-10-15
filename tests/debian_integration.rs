@@ -325,6 +325,7 @@ async fn test_debian_repository_fetch_packages() {
         distribution: "bookworm".to_string(),
         components: vec!["main".to_string()],
         signed_by: KEY.into(),
+        snapshot: None,
     };
     let keyring = Keyring::load(KEY.as_ref()).expect("Should load keyring");
     let repo = DebianRepository::new(&client, "debian", &config, &keyring);
@@ -371,6 +372,7 @@ async fn test_debian_repository_fetch_release() {
         distribution: "bookworm".to_string(),
         components: vec!["main".to_string()],
         signed_by: KEY.into(),
+        snapshot: None,
     };
     let keyring = Keyring::load(KEY.as_ref()).expect("Should load keyring");
     let repo = DebianRepository::new(&client, "debian", &config, &keyring);
@@ -410,6 +412,7 @@ async fn test_debian_repository_rejects_the_wrong_key() {
         distribution: "bookworm".to_string(),
         components: vec!["main".to_string()],
         signed_by: WRONG_KEY.into(),
+        snapshot: None,
     };
     let keyring = Keyring::load(WRONG_KEY.as_ref()).expect("Should load keyring");
     let repo = DebianRepository::new(&client, "debian", &config, &keyring);
