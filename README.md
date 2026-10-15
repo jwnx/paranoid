@@ -62,9 +62,10 @@ If you want a shell in the image, add one, like `bash`, to the package list.
 ## SYNOPSIS
 
 ```
-paranoid lock    [-f MANIFEST] [-o LOCK] [--force]
+paranoid lock    [-f MANIFEST] [-o LOCK] [--force] [--allow-unmet]
 paranoid build   [-f MANIFEST] [--lock LOCK] [-o OUT] [--cache-dir DIR]
-                 [--jobs N] [--force-download]
+                 [--jobs N] [--force-download] [--allow-stale]
+                 [--allow-unmet]
 paranoid inspect lock  [FILE] [--tree]
 paranoid inspect image [PATH]
 ```
@@ -191,6 +192,12 @@ removed. It also re-resolves if none of the keys that signed the locked
 snapshot are in `signed_by` any more. Otherwise it does nothing unless you
 pass `--force`. Commit the lock.
 
+If a dependency can't be satisfied from the repositories, `lock` lists
+what's missing and writes nothing. `--allow-unmet` writes the lock anyway
+and records each unmet dependency in it as an `[[unmet]]` table, so the
+gap shows up in review. Every later `lock` or `build` on that lock needs
+the same flag.
+
 ## BUILD
 
 ```
@@ -212,6 +219,10 @@ pass `--force`. Commit the lock.
   (default: the epoch).
 - Output is a tarball for `podman load` / `docker load` if `-o` ends in
   `.tar`, otherwise an OCI image layout directory.
+- A stale lock stops the build before anything is downloaded. That means
+  the manifest changed since the lock was written, or none of the keys that
+  signed it are in `signed_by` any more. `--allow-stale` builds from it
+  anyway.
 
 Maintainer scripts (`preinst`, `postinst`, ...) are never run. Packages
 that rely on their `postinst` to finish setting themselves up (creating

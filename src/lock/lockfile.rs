@@ -28,6 +28,21 @@ pub struct LockedPackage {
     pub direct: bool,
 }
 
+/// A dependency nothing in the repositories satisfied, which the lock was
+/// written without because `--allow-unmet` said so. Recording it keeps that
+/// decision visible in review, and lets `build` ask for the same flag.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LockedUnmet {
+    pub required_by: String,
+    pub dependency: String,
+}
+
+impl std::fmt::Display for LockedUnmet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} (required by {})", self.dependency, self.required_by)
+    }
+}
+
 /// A single dependency edge in the lock file.
 ///
 /// Represents "parent depends on children".
@@ -47,6 +62,11 @@ pub struct LockFile {
     /// The signed repository snapshots the packages were resolved from.
     #[serde(rename = "repository", default)]
     pub repositories: Vec<ResolvedRepository>,
+
+    /// Dependencies left unmet, sorted. Empty unless the lock was written
+    /// with `--allow-unmet`.
+    #[serde(default)]
+    pub unmet: Vec<LockedUnmet>,
 
     /// All locked packages.
     #[serde(rename = "package")]
@@ -155,9 +175,20 @@ impl LockFile {
             .collect();
         deps.sort_by(|a, b| a.parent.cmp(&b.parent));
 
+        let mut unmet: Vec<LockedUnmet> = resolved
+            .unmet
+            .into_iter()
+            .map(|u| LockedUnmet {
+                required_by: u.required_by,
+                dependency: u.dependency.to_string(),
+            })
+            .collect();
+        unmet.sort();
+
         Self {
             config_hash,
             repositories: resolved.repositories,
+            unmet,
             packages,
             deps,
         }
@@ -653,6 +684,34 @@ name = "vim"
     }
 
     #[test]
+    fn records_unmet_dependencies_sorted() {
+        use crate::repository::debian::UnmetDependency;
+
+        let unmet = |by: &str, dep: &str| UnmetDependency {
+            required_by: by.to_string(),
+            dependency: dep.parse().unwrap(),
+        };
+        let mut resolved = make_resolved();
+        resolved.unmet = vec![
+            unmet("coreutils", "libacl1 (>= 2.2)"),
+            unmet("bash", "base-files (>= 2.1.12) | debianutils"),
+        ];
+
+        let lock = LockFile::from_resolved(&make_manifest(), resolved);
+        let shown: Vec<_> = lock.unmet.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            shown,
+            [
+                "base-files (>= 2.1.12) | debianutils (required by bash)",
+                "libacl1 (>= 2.2) (required by coreutils)",
+            ]
+        );
+
+        let parsed = LockFile::from_str(&lock.serialize().unwrap()).unwrap();
+        assert_eq!(parsed.unmet, lock.unmet);
+    }
+
+    #[test]
     fn test_content_hash() {
         let manifest = make_manifest();
         let resolved = make_resolved();
@@ -668,6 +727,7 @@ name = "vim"
         let lock = |pkgs: &[(&str, &str)]| LockFile {
             config_hash: String::new(),
             repositories: vec![],
+            unmet: vec![],
             packages: pkgs
                 .iter()
                 .map(|(name, version)| LockedPackage {

@@ -26,6 +26,12 @@ pub struct LockArgs {
     /// Re-resolve even if the lock file is already up to date.
     #[arg(long)]
     force: bool,
+
+    /// Write the lock even if some dependencies can't be satisfied.
+    ///
+    /// They are recorded in the lock, and `build` asks for the same flag.
+    #[arg(long)]
+    allow_unmet: bool,
 }
 
 pub async fn run(args: LockArgs, quiet: bool) -> Result<(), CliError> {
@@ -51,6 +57,7 @@ pub async fn run(args: LockArgs, quiet: bool) -> Result<(), CliError> {
         // A keyring we can't read is reported by the resolution below.
         && existing.is_current(&manifest).unwrap_or(false)
     {
+        check_unmet(existing, args.allow_unmet)?;
         if !quiet {
             let hash = existing.content_hash().map_err(CliError::lock)?;
             eprintln!("Lockfile up to date.");
@@ -71,11 +78,12 @@ pub async fn run(args: LockArgs, quiet: bool) -> Result<(), CliError> {
         eprint!(" Done ");
     }
 
-    for dep in &resolved.unmet {
-        st::warning(format!("unmet dependency: {dep}"));
-    }
-
     let lock = LockFile::from_resolved(&manifest, resolved);
+    if !lock.unmet.is_empty() && !quiet {
+        // Finish the progress line before the warning or error.
+        eprintln!();
+    }
+    check_unmet(&lock, args.allow_unmet)?;
     lock.write(&output).map_err(CliError::lock)?;
 
     if !quiet {
@@ -97,6 +105,18 @@ pub async fn run(args: LockArgs, quiet: bool) -> Result<(), CliError> {
         st::footer(&output, &lock.content_hash().map_err(CliError::lock)?);
     }
 
+    Ok(())
+}
+
+/// Fail on unmet dependencies unless they are allowed, in which case warn
+/// about each one.
+pub fn check_unmet(lock: &LockFile, allow: bool) -> Result<(), CliError> {
+    if !allow && !lock.unmet.is_empty() {
+        return Err(CliError::unmet(&lock.unmet));
+    }
+    for unmet in &lock.unmet {
+        st::warning(format!("unmet dependency: {unmet}"));
+    }
     Ok(())
 }
 

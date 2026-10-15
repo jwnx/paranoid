@@ -86,6 +86,9 @@ fn print_lock_summary(lock: &LockFile) {
             ))
         );
     }
+    for unmet in &lock.unmet {
+        println!("{}", st::removed().apply_to(format!("unmet: {unmet}")));
+    }
     println!();
 }
 

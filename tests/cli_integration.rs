@@ -360,8 +360,8 @@ fn build_lock_default_path_alongside_manifest() {
 }
 
 #[test]
-fn build_warns_on_stale_lock() {
-    // Use a lock file with a wrong config_hash so the stale-lock warning fires.
+fn build_refuses_a_stale_lock() {
+    // A lock with a wrong config_hash is stale.
     let tmp = TempDir::new().unwrap();
     write_minimal_manifest(tmp.path());
     fs::write(
@@ -387,13 +387,92 @@ direct = true
     )
     .unwrap();
 
-    // Build will fail (no network / packages won't download), but we only care
-    // that the stale warning was printed before any download attempt.
-    let out = paranoid_in(tmp.path(), &["build", "-o", "/tmp/paranoid-test-stale.tar"]);
+    let out = paranoid_in(tmp.path(), &["build", "-o", "image.tar"]);
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(err.contains("is stale"), "stderr: {err}");
+    assert!(err.contains("--allow-stale"), "stderr: {err}");
     assert!(
-        stderr(&out).contains("stale") || stderr(&out).contains("paranoid lock"),
-        "expected stale warning; stderr: {}",
+        !err.contains("Downloading"),
+        "must stop before downloading: {err}"
+    );
+
+    // With the flag it's a warning, and the build goes on.
+    let out = paranoid_in(tmp.path(), &["build", "--allow-stale", "-o", "image.tar"]);
+    let err = stderr(&out);
+    assert!(
+        err.contains("warning:") && err.contains("is stale"),
+        "stderr: {err}"
+    );
+    assert!(!err.contains("--allow-stale"), "stderr: {err}");
+}
+
+/// The hello-world example with one dependency left unmet in its lock, as
+/// `lock --allow-unmet` would have written it. Still current.
+fn hello_world_with_unmet(dest: &Path) -> PathBuf {
+    let dir = copy_hello_world(dest);
+    let lock = dir.join("paranoid.lock");
+    let mut content = fs::read_to_string(&lock).unwrap();
+    content.push_str(
+        "\n[[unmet]]\nrequired_by = \"ca-certificates\"\ndependency = \"openssl (>= 9)\"\n",
+    );
+    fs::write(lock, content).unwrap();
+    dir
+}
+
+#[test]
+fn build_refuses_unmet_dependencies() {
+    let tmp = TempDir::new().unwrap();
+    let dir = hello_world_with_unmet(tmp.path());
+
+    let out = paranoid_in(&dir, &["build", "-o", "image.tar"]);
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(
+        err.contains("1 unmet dependency:\n  openssl (>= 9) (required by ca-certificates)"),
+        "stderr: {err}"
+    );
+    assert!(err.contains("--allow-unmet"), "stderr: {err}");
+    assert!(
+        !err.contains("Downloading"),
+        "must stop before downloading: {err}"
+    );
+}
+
+#[test]
+fn lock_refuses_an_up_to_date_lock_with_unmet_dependencies() {
+    let tmp = TempDir::new().unwrap();
+    let dir = hello_world_with_unmet(tmp.path());
+
+    let out = paranoid_in(&dir, &["lock"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("1 unmet dependency"),
+        "{}",
         stderr(&out)
+    );
+
+    let out = paranoid_in(&dir, &["lock", "--allow-unmet"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let err = stderr(&out);
+    assert!(err.contains("up to date"), "stderr: {err}");
+    assert!(
+        err.contains("warning: unmet dependency: openssl (>= 9)"),
+        "stderr: {err}"
+    );
+}
+
+#[test]
+fn inspect_lock_shows_unmet_dependencies() {
+    let tmp = TempDir::new().unwrap();
+    let dir = hello_world_with_unmet(tmp.path());
+
+    let out = paranoid_in(&dir, &["inspect", "lock"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("unmet: openssl (>= 9) (required by ca-certificates)"),
+        "stdout: {}",
+        stdout(&out)
     );
 }
 

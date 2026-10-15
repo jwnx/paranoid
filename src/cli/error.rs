@@ -4,6 +4,8 @@ use std::error::Error;
 use std::fmt;
 use std::path::Path;
 
+use paranoid::lock::LockedUnmet;
+
 /// A top-level CLI error shown to the user before the process exits.
 pub struct CliError(String);
 
@@ -64,6 +66,32 @@ impl CliError {
     pub fn missing_lock(path: &Path) -> Self {
         Self(format!(
             "lock file '{}' not found — run `paranoid lock` first",
+            path.display()
+        ))
+    }
+
+    /// A lock that leaves dependencies unmet, used without `--allow-unmet`.
+    pub fn unmet(unmet: &[LockedUnmet]) -> Self {
+        let s = if unmet.len() == 1 { "y" } else { "ies" };
+        let mut msg = format!("{} unmet dependenc{s}:", unmet.len());
+        for u in unmet {
+            msg.push_str(&format!("\n  {u}"));
+        }
+        msg.push_str(
+            "\nnothing in the configured repositories satisfies them, so the image \
+             would be missing them; add a repository that has them, or pass \
+             --allow-unmet to go ahead without them",
+        );
+        Self(msg)
+    }
+
+    /// A lock that no longer stands for the manifest, used without
+    /// `--allow-stale`.
+    pub fn stale(path: &Path) -> Self {
+        Self(format!(
+            "{} is stale: the manifest changed since it was written, or none of the \
+             keys that signed it are trusted any more; run `paranoid lock`, or pass \
+             --allow-stale to build from it anyway",
             path.display()
         ))
     }

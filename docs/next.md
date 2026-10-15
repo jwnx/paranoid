@@ -3,8 +3,9 @@
 The October 2026 tidy-up fixed image building: the rootfs is assembled in
 memory, builds are reproducible, extraction can't escape, and there is one
 progress model, one hash type and a thin `main.rs`. Resolution and trust
-came next, since each changed what the lock file contains; both are done
-apart from the notes below.
+came next, since each changed what the lock file contains, and then the
+policy for unmet dependencies and stale locks. All three are done apart
+from the notes below.
 
 ## 1. Resolver
 
@@ -42,15 +43,7 @@ checks paranoid against apt. What's left:
   signature, which for Debian is a subkey; the primary fingerprint would be
   friendlier, but we can't know it without the key.
 
-## 3. Policy
-
-- `lock` writes a lock even with unmet dependencies, and `build` builds
-  from a stale lock with only a warning. A lock is stale when the manifest
-  changed or none of the keys that signed its snapshots are trusted any
-  more (`LockFile::is_current`). Both should fail by default, with
-  `--allow-unmet` / `--allow-stale` to opt out.
-
-## 4. Smaller cleanups
+## 3. Smaller cleanups
 
 - `oci/spec.rs` hand-writes about 400 lines of serde. Use derives
   (`rename_all`, `skip_serializing_if`), or the `oci-spec` crate.

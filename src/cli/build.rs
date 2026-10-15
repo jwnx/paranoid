@@ -12,6 +12,7 @@ use paranoid::lock::LockFile;
 use paranoid::oci::{ImageOutput, Timestamp};
 
 use super::error::CliError;
+use super::lock::check_unmet;
 use super::progress::DotsReporter;
 use super::style as st;
 
@@ -42,6 +43,15 @@ pub struct BuildArgs {
     #[arg(long)]
     force_download: bool,
 
+    /// Build even if the lock is stale: the manifest changed since it was
+    /// written, or the keys that signed it are no longer trusted.
+    #[arg(long)]
+    allow_stale: bool,
+
+    /// Build even though the lock leaves dependencies unmet.
+    #[arg(long)]
+    allow_unmet: bool,
+
     /// Maximum number of parallel downloads.
     #[arg(long, value_name = "N", default_value = "4")]
     jobs: NonZeroUsize,
@@ -59,15 +69,19 @@ pub async fn run(args: BuildArgs, quiet: bool) -> Result<(), CliError> {
     let lock = LockFile::from_file(&lock_path).map_err(CliError::lock)?;
     match lock.is_current(&manifest) {
         Ok(true) => {}
-        Ok(false) => st::warning(format!(
-            "{} may be stale — run `paranoid lock` first",
-            lock_path.display()
-        )),
-        Err(e) => st::warning(format!(
+        Ok(false) if args.allow_stale => {
+            st::warning(format!("{} is stale", lock_path.display()));
+        }
+        Ok(false) => return Err(CliError::stale(&lock_path)),
+        // Without the keys there's no telling whether the lock is current,
+        // which is the same question --allow-stale answers.
+        Err(e) if args.allow_stale => st::warning(format!(
             "could not check {} against the manifest: {e}",
             lock_path.display()
         )),
+        Err(e) => return Err(CliError::lock(e)),
     }
+    check_unmet(&lock, args.allow_unmet)?;
 
     let options = BuildOptions {
         download: DownloadConfig {
