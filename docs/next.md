@@ -11,12 +11,6 @@ changes what the lock file contains.
 The resolver gives plausible answers for simple manifests but is wrong at
 the edges. Each item below was reproduced during the review.
 
-- **Version comparison doesn't match dpkg** (`repository/debian/version.rs`).
-  It gets `1.0-a1` vs `1.0-1`, `a1` vs `1.0` and `1.0` vs `1.` wrong, and
-  `Ord` disagrees with `Eq`/`Hash` (`1.0` vs `1.0-0`, `1.01` vs `1.1`), while
-  `PackageIndex` uses versions as map keys. Port dpkg's `verrevcmp` and test
-  it against the vectors in dpkg's `lib/dpkg/t/t-version.c`. The current
-  proptests only generate digit-led versions, so they can't find this.
 - **Malformed relations silently become "no dependencies"**
   (`package.rs:130-148`). `(>=2.17)` without a space drops the constraint,
   `(>=  2.17)` keeps a leading space, and an unknown arch restriction fails
