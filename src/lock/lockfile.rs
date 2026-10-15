@@ -65,7 +65,7 @@ pub struct LockFile {
 
     /// Dependencies left unmet, sorted. Empty unless the lock was written
     /// with `--allow-unmet`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unmet: Vec<LockedUnmet>,
 
     /// All locked packages.
@@ -681,6 +681,13 @@ name = "vim"
             lock.is_current(&manifest),
             Err(LockFileError::Keyring { .. })
         ));
+    }
+
+    #[test]
+    fn leaves_unmet_out_when_there_is_none() {
+        let lock = LockFile::from_resolved(&make_manifest(), make_resolved());
+        let serialized = lock.serialize().unwrap();
+        assert!(!serialized.contains("unmet"), "{serialized}");
     }
 
     #[test]
