@@ -73,6 +73,19 @@ fn print_lock_summary(lock: &LockFile) {
     } else {
         println!("{total} packages ({size})");
     }
+    for repo in &lock.repositories {
+        let signers: Vec<_> = repo.signed_by.iter().map(ToString::to_string).collect();
+        println!(
+            "{}",
+            st::dim().apply_to(format!(
+                "{}: Release of {}, InRelease {}, signed by {}",
+                repo.name,
+                repo.date.format("%Y-%m-%d %H:%M:%S UTC"),
+                repo.inrelease,
+                signers.join(", ")
+            ))
+        );
+    }
     println!();
 }
 

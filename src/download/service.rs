@@ -168,6 +168,7 @@ mod tests {
             url: url::Url::parse("https://deb.debian.org/debian").unwrap(),
             distribution: "bookworm".to_string(),
             components: vec!["main".to_string()],
+            signed_by: "keys/debian.asc".into(),
         };
 
         let url = DownloadService::build_download_url(&package, &repo_config);
@@ -184,6 +185,7 @@ mod tests {
             url: url::Url::parse("https://deb.debian.org/debian/").unwrap(),
             distribution: "bookworm".to_string(),
             components: vec!["main".to_string()],
+            signed_by: "keys/debian.asc".into(),
         };
 
         let url = DownloadService::build_download_url(&package, &repo_config);

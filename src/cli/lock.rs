@@ -48,7 +48,8 @@ pub async fn run(args: LockArgs, quiet: bool) -> Result<(), CliError> {
 
     if !args.force
         && let Some(existing) = &existing
-        && existing.matches_config(&manifest)
+        // A keyring we can't read is reported by the resolution below.
+        && existing.is_current(&manifest).unwrap_or(false)
     {
         if !quiet {
             let hash = existing.content_hash().map_err(CliError::lock)?;

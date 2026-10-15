@@ -38,6 +38,7 @@ architecture = "$arch"
 url = "https://deb.debian.org/debian"
 distribution = "bookworm"
 components = ["main"]
+signed_by = "$root/examples/keys/debian-archive-bookworm-automatic.asc"
 TOML
     for package in "$@"; do
         printf '\n[[packages]]\nname = "%s"\n' "$package"

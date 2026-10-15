@@ -5,4 +5,6 @@
 
 mod service;
 
-pub use service::{ResolveService, ResolveServiceError, ResolvedManifest, ResolvedPackage};
+pub use service::{
+    ResolveService, ResolveServiceError, ResolvedManifest, ResolvedPackage, ResolvedRepository,
+};

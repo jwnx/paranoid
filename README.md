@@ -42,11 +42,13 @@ PARANOID(1)                     User Commands                     PARANOID(1)
 Build reproducible OCI images from Debian packages.
 
 paranoid builds an image without running a container, a shell or a package
-manager. You list the packages you need in `paranoid.toml`. `paranoid lock`
-resolves their dependencies against the repositories you list and writes every
-package's exact version and SHA-256 to `paranoid.lock`. `paranoid build`
-downloads those packages, checks them against the lock, unpacks them and
-writes the image. Building the same lock twice gives the same image digest.
+manager. You list the packages you need in `paranoid.toml`, along with the
+repositories to get them from and the keys that sign those repositories.
+`paranoid lock` checks each repository's signature, resolves dependencies,
+and writes every package's exact version and SHA-256 to `paranoid.lock`.
+`paranoid build` downloads those packages, checks them against the lock,
+unpacks them and writes the image. Building the same lock twice gives the
+same image digest.
 
 The images it makes are in the style of
 [distroless](https://github.com/GoogleContainerTools/distroless): your
@@ -102,6 +104,7 @@ source       = "..."             # optional, OCI label
 url          = "https://deb.debian.org/debian"
 distribution = "bookworm"
 components   = ["main"]
+signed_by    = "keys/debian-archive-bookworm-automatic.asc"
 
 [[packages]]
 name       = "nodejs"
@@ -114,6 +117,22 @@ workdir = "/app"
 env     = { NODE_ENV = "production" }
 ```
 
+`signed_by` is required. It names a file of OpenPGP public keys, armored or
+binary, relative to the manifest; apt calls the same thing `Signed-By`.
+Only those keys are trusted for that repository, and paranoid ships none of
+its own. For Debian, the files in `/etc/apt/trusted.gpg.d/` of the
+`debian-archive-keyring` package work as they are, and
+<https://ftp-master.debian.org/keys.html> lists the same keys. Check the
+fingerprint before you commit a key:
+
+```
+$ gpg --show-keys examples/keys/debian-archive-bookworm-automatic.asc
+pub   rsa4096 2023-01-21 [SC] [expires: 2031-01-19]
+      B8B80B5B623EAB6AD8775C45B7C5D7D6350947F8
+      ...
+uid                      Debian Archive Automatic Signing Key (12/bookworm) <ftpmaster@debian.org>
+```
+
 `cmd` is the image's *entrypoint*: arguments to `podman run` are appended
 to it, they don't replace it.
 
@@ -124,11 +143,19 @@ targets and are rejected.
 
 ## LOCK
 
-`paranoid lock` resolves the manifest against the repositories' `Packages`
-indexes and writes `paranoid.lock` next to it:
+`paranoid lock` fetches each repository's `InRelease` and checks its
+signature against the `signed_by` keys. It then fetches the `Packages`
+indexes, checks each against the SHA-256 the signed Release lists for it,
+resolves the manifest, and writes `paranoid.lock` next to it:
 
 ```toml
-config_hash = "sha256:13b382ba..."
+config_hash = "sha256:4daa62e2..."
+
+[[repository]]
+name      = "debian"
+date      = "2026-07-11T10:16:37Z"
+inrelease = "77737fa4b34f2693e982cc9ee35736816c35a7778fc2d326cc1bbf5b301fe1aa"
+signed_by = ["B8B80B5B623EAB6AD8775C45B7C5D7D6350947F8"]
 
 [[package]]
 name         = "libc6"
@@ -141,9 +168,28 @@ repository   = "debian"
 direct       = false
 ```
 
+Each `[[repository]]` records the snapshot the packages came from: the
+Release's date, the SHA-256 of the `InRelease` file as served, and the keys
+whose signatures checked out. That digest names the snapshot, so you can
+find the same `InRelease` on a mirror archive such as snapshot.debian.org
+and check it yourself.
+
+The signature check follows what apt does with `gpgv`. One good signature
+from a key in `signed_by` is required. A signature from one of those keys
+that doesn't verify is an error, while signatures from other keys are
+ignored. Revoked or expired keys, SHA-1 signatures and an expired
+`Valid-Until` are refused. paranoid is stricter than apt in two places:
+
+- A repository without `InRelease` is refused. paranoid doesn't fall back
+  to an unsigned `Release`.
+- A validly signed Release for another distribution is refused, where apt
+  only warns. That is what a downgrade to an older snapshot looks like.
+
 `config_hash` is a SHA-256 over the canonical JSON of the manifest. If the
 manifest changes, `lock` re-resolves and prints what was added, changed or
-removed; if not, it does nothing unless you pass `--force`. Commit the lock.
+removed. It also re-resolves if none of the keys that signed the locked
+snapshot are in `signed_by` any more. Otherwise it does nothing unless you
+pass `--force`. Commit the lock.
 
 ## BUILD
 
@@ -178,6 +224,7 @@ What holds today:
 
 ```
   same lock + same SOURCE_DATE_EPOCH      ─▶  same image digest
+  package lists                           ─▶  signed by a key you chose
   package contents                        ─▶  checked against the lock
   host filesystem                         ─▶  untouched by package contents
   file ownership in the image             ─▶  taken from the package
@@ -186,9 +233,9 @@ What holds today:
 What does **not** hold yet:
 
 ```
-  repository signatures     InRelease is not verified. The checksums in the
-                            lock are only as trustworthy as the mirror you
-                            locked against. Use https mirrors.
+  rechecking a lock         build trusts the checksums in the lock. Keep the
+                            lock under review the way you would any other
+                            pinned dependency.
   complete resolution       the resolver is greedy, with restarts. It picks
                             what apt picks for the packages in
                             scripts/apt-oracle.sh, but contrived conflicts
@@ -213,12 +260,14 @@ $ cargo test -- --ignored       # network tests: real mirrors, real builds,
 $ cargo clippy --all-targets
 $ scripts/apt-oracle.sh         # compare resolution with apt (needs podman)
 $ scripts/dpkg-oracle.sh        # regenerate dpkg's version-order test data
+$ scripts/trust-oracle.sh       # break a signed repo ten ways, ask apt too
 ```
 
 ```
 src/
   config/      manifest parsing and validation
-  repository/  Debian Packages indexes, versions, relations
+  repository/  InRelease signatures, Packages indexes, versions,
+               relations
   resolve/     manifest ─▶ resolved package set
   lock/        lock file format and diffing
   download/    parallel fetch + content-addressed cache
@@ -233,8 +282,7 @@ src/
 ## STATUS
 
 paranoid is early in development. The lock format and the library API will
-change, especially once signature checking lands and the lock starts
-recording which signed Release it came from.
+change.
 
 ```
                                                                   PARANOID(1)

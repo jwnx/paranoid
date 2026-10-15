@@ -25,6 +25,7 @@ xz2 = "0.1.7"
 tar = "0.4"
 zstd = "0.13"
 indexmap = { version = "2", features = ["serde"] }
+pgp = { version = "0.20", default-features = false }
 
 [dev-dependencies]
 proptest = "1.6"

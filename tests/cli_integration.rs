@@ -51,11 +51,18 @@ fn hello_world_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/hello-world")
 }
 
+/// The key that signs bookworm.
+fn debian_key() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("examples/keys/debian-archive-bookworm-automatic.asc")
+}
+
 /// Create a minimal valid manifest in a temp directory.
 fn write_minimal_manifest(dir: &Path) {
     fs::write(
         dir.join("paranoid.toml"),
-        r#"
+        format!(
+            r#"
 [image]
 architecture = "amd64"
 
@@ -63,12 +70,45 @@ architecture = "amd64"
 url = "https://deb.debian.org/debian"
 distribution = "bookworm"
 components = ["main"]
+signed_by = "{}"
 
 [[packages]]
 name = "ca-certificates"
 "#,
+            debian_key().display()
+        ),
     )
     .unwrap();
+}
+
+/// Copy the hello-world manifest into a directory, pointing its relative
+/// key path back at the examples.
+fn copy_hello_world_manifest(dest_dir: &Path) {
+    let manifest = fs::read_to_string(hello_world_dir().join("paranoid.toml")).unwrap();
+    let keys = hello_world_dir().join("../keys/");
+    let manifest = manifest.replace("../keys/", &keys.display().to_string());
+    fs::write(dest_dir.join("paranoid.toml"), manifest).unwrap();
+}
+
+/// Copy the hello-world example, lock and key included, keeping its layout
+/// so the manifest's relative key path still resolves. Returns the copy's
+/// directory.
+fn copy_hello_world(dest: &Path) -> PathBuf {
+    let dir = dest.join("hello-world");
+    fs::create_dir_all(&dir).unwrap();
+    fs::create_dir_all(dest.join("keys")).unwrap();
+    fs::copy(
+        hello_world_dir().join("paranoid.toml"),
+        dir.join("paranoid.toml"),
+    )
+    .unwrap();
+    copy_hello_world_lock(&dir);
+    fs::copy(
+        debian_key(),
+        dest.join("keys/debian-archive-bookworm-automatic.asc"),
+    )
+    .unwrap();
+    dir
 }
 
 /// Copy the hello-world lock file into a directory.
@@ -236,14 +276,9 @@ fn lock_up_to_date_skips_resolve() {
     // Copy manifest + pre-generated lock into a temp dir.
     // Running `lock` again without --force must report "up to date".
     let tmp = TempDir::new().unwrap();
-    fs::copy(
-        hello_world_dir().join("paranoid.toml"),
-        tmp.path().join("paranoid.toml"),
-    )
-    .unwrap();
-    copy_hello_world_lock(tmp.path());
+    let dir = copy_hello_world(tmp.path());
 
-    let out = paranoid_in(tmp.path(), &["lock"]);
+    let out = paranoid_in(&dir, &["lock"]);
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     assert!(
         stderr(&out).to_lowercase().contains("up to date"),
@@ -257,14 +292,9 @@ fn lock_force_re_resolves_even_when_up_to_date() {
     // With --force the tool must attempt resolution (which needs the network).
     // We just verify it does NOT print "up to date".
     let tmp = TempDir::new().unwrap();
-    fs::copy(
-        hello_world_dir().join("paranoid.toml"),
-        tmp.path().join("paranoid.toml"),
-    )
-    .unwrap();
-    copy_hello_world_lock(tmp.path());
+    let dir = copy_hello_world(tmp.path());
 
-    let out = paranoid_in(tmp.path(), &["lock", "--force"]);
+    let out = paranoid_in(&dir, &["lock", "--force"]);
 
     // If resolution succeeded, "up to date" must be absent.
     // If network is unavailable, the command fails — that's acceptable.
@@ -338,6 +368,12 @@ fn build_warns_on_stale_lock() {
         tmp.path().join("paranoid.lock"),
         r#"config_hash = "sha256:0000000000000000"
 
+[[repository]]
+name = "debian"
+date = "2026-07-11T10:16:37Z"
+inrelease = "0000000000000000000000000000000000000000000000000000000000000000"
+signed_by = ["B8B80B5B623EAB6AD8775C45B7C5D7D6350947F8"]
+
 [[package]]
 name = "ca-certificates"
 version = "20230311+deb12u1"
@@ -346,6 +382,7 @@ sha256 = "0d5f444f594e48c1e16a41d8fc628a09b24c658916a1274025c2330f2a802bed"
 filename = "pool/main/c/ca-certificates/ca-certificates_20230311+deb12u1_all.deb"
 size = 155260
 repository = "debian"
+direct = true
 "#,
     )
     .unwrap();
@@ -430,11 +467,7 @@ fn inspect_lock_fails_on_malformed_file() {
 #[ignore]
 fn e2e_lock_build_produces_valid_oci_tarball() {
     let tmp = TempDir::new().unwrap();
-    fs::copy(
-        hello_world_dir().join("paranoid.toml"),
-        tmp.path().join("paranoid.toml"),
-    )
-    .unwrap();
+    copy_hello_world_manifest(tmp.path());
 
     // Step 1: lock
     let lock_out = paranoid_in(tmp.path(), &["lock"]);
@@ -487,11 +520,7 @@ fn e2e_build_is_reproducible() {
     let tmp = TempDir::new().unwrap();
     // Lock fresh: committed locks go stale as Debian rotates security updates
     // off the mirrors.
-    fs::copy(
-        hello_world_dir().join("paranoid.toml"),
-        tmp.path().join("paranoid.toml"),
-    )
-    .unwrap();
+    copy_hello_world_manifest(tmp.path());
     let lock_out = paranoid_in(tmp.path(), &["lock"]);
     assert!(
         lock_out.status.success(),

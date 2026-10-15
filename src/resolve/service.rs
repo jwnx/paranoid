@@ -1,7 +1,10 @@
 //! Resolution service implementation.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::arch::Architecture;
@@ -9,8 +12,8 @@ use crate::config::Manifest;
 use crate::hash::{ParseSha256Error, Sha256};
 use crate::http::{Client, ClientError};
 use crate::repository::debian::{
-    DebianPackage, DebianRepository, DebianRepositoryError, PackageIndexSet, Request, ResolveError,
-    UnmetDependency, resolve,
+    DebianPackage, DebianRepository, DebianRepositoryError, Fingerprint, Keyring, KeyringError,
+    PackageIndexSet, Request, ResolveError, UnmetDependency, resolve,
 };
 
 /// Errors that can occur during resolution.
@@ -19,8 +22,20 @@ pub enum ResolveServiceError {
     #[error("client error: {0}")]
     Client(#[from] ClientError),
 
-    #[error("repository error: {0}")]
-    Repository(#[from] DebianRepositoryError),
+    #[error("repository '{name}': signed_by {}: {source}", path.display())]
+    Keyring {
+        name: String,
+        path: PathBuf,
+        #[source]
+        source: Box<KeyringError>,
+    },
+
+    #[error("repository '{name}': {source}")]
+    Repository {
+        name: String,
+        #[source]
+        source: Box<DebianRepositoryError>,
+    },
 
     #[error("resolve error: {0}")]
     Resolve(#[from] ResolveError),
@@ -79,9 +94,24 @@ impl ResolvedPackage {
     }
 }
 
+/// The signed snapshot of a repository that a resolution used. The lock
+/// file records these as its `[[repository]]` tables.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedRepository {
+    pub name: String,
+    /// The `Date` of its `Release`.
+    pub date: DateTime<Utc>,
+    /// SHA-256 of its `InRelease` file.
+    pub inrelease: Sha256,
+    /// Primary fingerprints of the keys whose signatures verified.
+    pub signed_by: Vec<Fingerprint>,
+}
+
 /// The complete resolution result.
 #[derive(Debug)]
 pub struct ResolvedManifest {
+    /// The repository snapshots, in manifest order.
+    pub repositories: Vec<ResolvedRepository>,
     /// All resolved packages (including transitive dependencies).
     pub packages: Vec<ResolvedPackage>,
     /// Dependencies nothing in the repositories satisfies.
@@ -119,12 +149,37 @@ impl ResolveService {
             .as_ref()
             .map_or(Architecture::Amd64, |i| i.architecture);
 
-        // Build the index set from all repositories
+        let now = Utc::now();
+
+        // Build the index set from all repositories, each from a snapshot
+        // signed by one of the keys the manifest names for it.
         let mut index_set = PackageIndexSet::new();
-        for (repo_name, repo_config) in &manifest.repositories {
-            let repo = DebianRepository::new(&self.client, repo_name, repo_config);
-            let index = repo.fetch_index(arch).await?;
-            index_set.add_index(repo_name.clone(), index);
+        let mut repositories = Vec::new();
+        for (name, config) in &manifest.repositories {
+            let path = manifest.resolve_path(&config.signed_by);
+            let keyring = Keyring::load(&path).map_err(|source| ResolveServiceError::Keyring {
+                name: name.clone(),
+                path: config.signed_by.clone(),
+                source: Box::new(source),
+            })?;
+            let repository_error = |source| ResolveServiceError::Repository {
+                name: name.clone(),
+                source: Box::new(source),
+            };
+
+            let repo = DebianRepository::new(&self.client, name, config, &keyring);
+            let snapshot = repo.fetch_release(now).await.map_err(repository_error)?;
+            let index = repo
+                .fetch_index(&snapshot, arch)
+                .await
+                .map_err(repository_error)?;
+            index_set.add_index(name.clone(), index);
+            repositories.push(ResolvedRepository {
+                name: name.clone(),
+                date: snapshot.release.date,
+                inrelease: snapshot.inrelease,
+                signed_by: snapshot.signers,
+            });
         }
 
         let requests: Vec<Request> = manifest
@@ -145,6 +200,7 @@ impl ResolveService {
             .collect::<Result<_, _>>()?;
 
         Ok(ResolvedManifest {
+            repositories,
             packages,
             unmet: resolution.unmet,
             graph: resolution.graph,

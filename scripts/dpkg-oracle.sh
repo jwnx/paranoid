@@ -25,6 +25,7 @@ architecture = "$arch"
 url = "https://deb.debian.org/debian"
 distribution = "bookworm"
 components = ["main"]
+signed_by = "$root/examples/keys/debian-archive-bookworm-automatic.asc"
 
 [[packages]]
 name = "dpkg"

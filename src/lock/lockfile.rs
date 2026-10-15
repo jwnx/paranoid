@@ -10,7 +10,8 @@ use crate::arch::Architecture;
 use crate::config::{Manifest, PackageSpec, RepositoryConfig};
 use crate::hash::Sha256;
 use crate::oci::Digest;
-use crate::resolve::ResolvedManifest;
+use crate::repository::debian::{Keyring, KeyringError};
+use crate::resolve::{ResolvedManifest, ResolvedRepository};
 
 /// A locked package entry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -24,13 +25,7 @@ pub struct LockedPackage {
     pub repository: String,
     /// Whether this package was requested directly in the manifest.
     /// `false` means it was pulled in as a transitive dependency.
-    /// Defaults to `true` for lock files generated before this field existed.
-    #[serde(default = "default_true")]
     pub direct: bool,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 /// A single dependency edge in the lock file.
@@ -49,14 +44,18 @@ pub struct LockFile {
     /// Used to detect when the lock file is stale.
     pub config_hash: String,
 
+    /// The signed repository snapshots the packages were resolved from.
+    #[serde(rename = "repository", default)]
+    pub repositories: Vec<ResolvedRepository>,
+
     /// All locked packages.
     #[serde(rename = "package")]
     pub packages: Vec<LockedPackage>,
 
     /// Dependency graph edges: parent → [children].
     ///
-    /// This is the union of all per-root-package graphs.
-    /// Defaults to empty for lock files generated before this field existed.
+    /// This is the union of all per-root-package graphs. An empty graph
+    /// serializes to nothing, hence the default.
     #[serde(rename = "dep", default)]
     pub deps: Vec<DepEdge>,
 }
@@ -72,6 +71,23 @@ pub enum LockFileError {
 
     #[error("serialize error: {0}")]
     Serialize(#[from] toml::ser::Error),
+
+    #[error(
+        "the lock records no signed repository snapshots; it predates signature checking, run `paranoid lock` again"
+    )]
+    Unsigned,
+
+    #[error(
+        "package '{package}' comes from repository '{repository}', which the lock doesn't record"
+    )]
+    UnknownRepository { package: String, repository: String },
+
+    #[error("repository '{repository}': {source}")]
+    Keyring {
+        repository: String,
+        #[source]
+        source: Box<KeyringError>,
+    },
 }
 
 /// How one package differs between two lock files.
@@ -141,6 +157,7 @@ impl LockFile {
 
         Self {
             config_hash,
+            repositories: resolved.repositories,
             packages,
             deps,
         }
@@ -153,8 +170,21 @@ impl LockFile {
     }
 
     /// Parse a lock file from a string.
+    ///
+    /// Every package must come from a signed snapshot the lock records.
     fn parse(content: &str) -> Result<Self, LockFileError> {
         let lock: LockFile = toml::from_str(content)?;
+        if lock.repositories.is_empty() {
+            return Err(LockFileError::Unsigned);
+        }
+        for pkg in &lock.packages {
+            if !lock.repositories.iter().any(|r| r.name == pkg.repository) {
+                return Err(LockFileError::UnknownRepository {
+                    package: pkg.name.clone(),
+                    repository: pkg.repository.clone(),
+                });
+            }
+        }
         Ok(lock)
     }
 
@@ -187,6 +217,34 @@ impl LockFile {
     pub fn content_hash(&self) -> Result<String, LockFileError> {
         let content = toml::to_string(self)?;
         Ok(Digest::from_bytes(content.as_bytes()).to_string())
+    }
+
+    /// Whether the lock still stands for the manifest: it was resolved from
+    /// this manifest, and each snapshot it records was signed by a key the
+    /// manifest still trusts for that repository. The config hash covers
+    /// the `signed_by` path but not what's in the file, hence the second
+    /// check.
+    pub fn is_current(&self, manifest: &Manifest) -> Result<bool, LockFileError> {
+        if !self.matches_config(manifest) {
+            return Ok(false);
+        }
+        for repo in &self.repositories {
+            let Some(config) = manifest.repositories.get(&repo.name) else {
+                return Ok(false);
+            };
+            let keyring =
+                Keyring::load(&manifest.resolve_path(&config.signed_by)).map_err(|source| {
+                    LockFileError::Keyring {
+                        repository: repo.name.clone(),
+                        source: Box::new(source),
+                    }
+                })?;
+            let trusted = keyring.fingerprints();
+            if !repo.signed_by.iter().any(|fp| trusted.contains(fp)) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Check if this lock file matches a manifest's config hash.
@@ -298,7 +356,11 @@ mod tests {
     use crate::resolve::ResolvedPackage;
 
     fn make_manifest() -> Manifest {
-        let config = r#"
+        Manifest::from_str(&make_manifest_toml()).unwrap()
+    }
+
+    fn make_manifest_toml() -> String {
+        r#"
 [image]
 architecture = "amd64"
 
@@ -306,22 +368,33 @@ architecture = "amd64"
 url = "https://deb.debian.org/debian"
 distribution = "bookworm"
 components = ["main"]
+signed_by = "keys/debian.asc"
 
 [[packages]]
 name = "bash"
 
 [[packages]]
 name = "coreutils"
-"#;
-        Manifest::from_str(config).unwrap()
+"#
+        .to_string()
     }
 
     // Valid SHA256 hashes for tests (64 hex chars)
     const TEST_HASH_1: &str = "a665a45920422f9d417e4867efdc4fb8a04a1f3fff1fa07e998e86f7f7a27ae3";
     const TEST_HASH_2: &str = "b3a8e0e1f9ab1bfe3a36f231f676f78bb30a519d2b21e6c530c0eee8ebb4a5d0";
 
+    fn make_repository() -> ResolvedRepository {
+        ResolvedRepository {
+            name: "debian".to_string(),
+            date: "2026-07-11T10:16:37Z".parse().unwrap(),
+            inrelease: TEST_HASH_2.parse().unwrap(),
+            signed_by: vec![],
+        }
+    }
+
     fn make_resolved() -> ResolvedManifest {
         ResolvedManifest {
+            repositories: vec![make_repository()],
             packages: vec![
                 ResolvedPackage {
                     name: "bash".to_string(),
@@ -386,12 +459,7 @@ name = "coreutils"
         assert_eq!(parsed.deps[0].children, vec!["coreutils"]);
     }
 
-    #[test]
-    fn test_old_lock_file_without_deps_parses_ok() {
-        // A lock file without the [dep] section should parse with empty deps.
-        let content = r#"
-config_hash = "sha256:aaaa"
-
+    const ONE_PACKAGE: &str = r#"
 [[package]]
 name = "bash"
 version = "5.0"
@@ -400,13 +468,36 @@ sha256 = "a665a45920422f9d417e4867efdc4fb8a04a1f3fff1fa07e998e86f7f7a27ae3"
 filename = "pool/main/b/bash/bash_5.0_amd64.deb"
 size = 1000
 repository = "debian"
+direct = true
 "#;
-        let lock = LockFile::from_str(content).unwrap();
-        assert!(
-            lock.deps.is_empty(),
-            "old lock files should have empty deps"
+
+    #[test]
+    fn records_repository_snapshots() {
+        let lock = LockFile::from_resolved(&make_manifest(), make_resolved());
+        let serialized = lock.serialize().unwrap();
+        assert!(serialized.contains(&format!(
+            "[[repository]]\nname = \"debian\"\ndate = \"2026-07-11T10:16:37Z\"\ninrelease = \"{TEST_HASH_2}\""
+        )));
+        let parsed = LockFile::from_str(&serialized).unwrap();
+        assert_eq!(parsed.repositories, [make_repository()]);
+    }
+
+    #[test]
+    fn rejects_locks_without_signed_snapshots() {
+        let unsigned = format!("config_hash = \"sha256:aaaa\"\n{ONE_PACKAGE}");
+        assert!(matches!(
+            LockFile::from_str(&unsigned),
+            Err(LockFileError::Unsigned)
+        ));
+
+        let elsewhere = format!(
+            "config_hash = \"sha256:aaaa\"\n\n[[repository]]\nname = \"other\"\n\
+             date = \"2026-07-11T10:16:37Z\"\ninrelease = \"{TEST_HASH_2}\"\nsigned_by = []\n{ONE_PACKAGE}"
         );
-        assert!(lock.packages[0].direct, "direct should default to true");
+        assert_eq!(
+            LockFile::from_str(&elsewhere).unwrap_err().to_string(),
+            "package 'bash' comes from repository 'debian', which the lock doesn't record"
+        );
     }
 
     #[test]
@@ -444,6 +535,7 @@ repository = "debian"
 url = "https://deb.debian.org/debian"
 distribution = "bookworm"
 components = ["main"]
+signed_by = "keys/debian.asc"
 
 [[packages]]
 name = "bash"
@@ -453,6 +545,7 @@ name = "bash"
 url = "https://deb.debian.org/debian"
 distribution = "bookworm"
 components = ["main"]
+signed_by = "keys/debian.asc"
 
 [[packages]]
 name = "bash"
@@ -476,7 +569,7 @@ name = "vim"
         let with_version = |version: &str| {
             let config = format!(
                 "[repositories.debian]\nurl = \"https://deb.debian.org/debian\"\n\
-                 distribution = \"bookworm\"\ncomponents = [\"main\"]\n\n\
+                 distribution = \"bookworm\"\ncomponents = [\"main\"]\nsigned_by = \"keys/debian.asc\"\n\n\
                  [[packages]]\nname = \"bash\"\nversion = \"{version}\"\n"
             );
             LockFile::compute_config_hash(&Manifest::from_str(&config).unwrap())
@@ -501,6 +594,7 @@ name = "vim"
 url = "https://deb.debian.org/debian"
 distribution = "bookworm"
 components = ["main"]
+signed_by = "keys/debian.asc"
 
 [[packages]]
 name = "vim"
@@ -525,6 +619,40 @@ name = "vim"
     }
 
     #[test]
+    fn is_current_needs_a_signer_the_manifest_still_trusts() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("debian.asc");
+        let write_key = |name: &str| {
+            let testdata = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src/repository/debian/testdata")
+                .join(name);
+            std::fs::copy(testdata, &key).unwrap();
+        };
+        let manifest_path = dir.path().join("paranoid.toml");
+        let toml = make_manifest_toml().replace("keys/debian.asc", "debian.asc");
+        std::fs::write(&manifest_path, toml).unwrap();
+        let manifest = Manifest::from_file(&manifest_path).unwrap();
+
+        let mut lock = LockFile::from_resolved(&manifest, make_resolved());
+        lock.repositories[0].signed_by =
+            vec![serde_json::from_str("\"B8B80B5B623EAB6AD8775C45B7C5D7D6350947F8\"").unwrap()];
+
+        write_key("debian-archive-bookworm-automatic.asc");
+        assert!(lock.is_current(&manifest).unwrap());
+
+        // Same path, different key: the config hash can't tell.
+        write_key("debian-archive-bookworm-security-automatic.asc");
+        assert!(lock.matches_config(&manifest));
+        assert!(!lock.is_current(&manifest).unwrap());
+
+        std::fs::remove_file(&key).unwrap();
+        assert!(matches!(
+            lock.is_current(&manifest),
+            Err(LockFileError::Keyring { .. })
+        ));
+    }
+
+    #[test]
     fn test_content_hash() {
         let manifest = make_manifest();
         let resolved = make_resolved();
@@ -539,6 +667,7 @@ name = "vim"
     fn diff_reports_added_changed_and_removed() {
         let lock = |pkgs: &[(&str, &str)]| LockFile {
             config_hash: String::new(),
+            repositories: vec![],
             packages: pkgs
                 .iter()
                 .map(|(name, version)| LockedPackage {

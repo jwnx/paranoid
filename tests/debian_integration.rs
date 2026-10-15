@@ -302,6 +302,14 @@ fn test_parse_full_packages_file() {
     println!("Successfully parsed {} packages", index.len());
 }
 
+/// The key that signs bookworm, relative to the crate root (where cargo
+/// runs integration tests).
+const KEY: &str = "examples/keys/debian-archive-bookworm-automatic.asc";
+
+/// A real Debian key that doesn't sign bookworm's main archive.
+const WRONG_KEY: &str =
+    "src/repository/debian/testdata/debian-archive-bookworm-security-automatic.asc";
+
 /// Test the DebianRepository can fetch and parse packages from a real mirror.
 /// This test is ignored by default as it requires network access.
 #[tokio::test]
@@ -309,19 +317,25 @@ fn test_parse_full_packages_file() {
 async fn test_debian_repository_fetch_packages() {
     use paranoid::config::RepositoryConfig;
     use paranoid::http::Client;
-    use paranoid::repository::debian::DebianRepository;
+    use paranoid::repository::debian::{DebianRepository, Keyring};
 
     let client = Client::new().expect("Should create client");
     let config = RepositoryConfig {
         url: url::Url::parse("https://deb.debian.org/debian").unwrap(),
         distribution: "bookworm".to_string(),
         components: vec!["main".to_string()],
+        signed_by: KEY.into(),
     };
-    let repo = DebianRepository::new(&client, "debian", &config);
+    let keyring = Keyring::load(KEY.as_ref()).expect("Should load keyring");
+    let repo = DebianRepository::new(&client, "debian", &config, &keyring);
 
     // Fetch the full index
+    let snapshot = repo
+        .fetch_release(chrono::Utc::now())
+        .await
+        .expect("Should fetch a signed release");
     let index = repo
-        .fetch_index(Architecture::Amd64)
+        .fetch_index(&snapshot, Architecture::Amd64)
         .await
         .expect("Should fetch index");
 
@@ -349,38 +363,61 @@ async fn test_debian_repository_fetch_packages() {
 async fn test_debian_repository_fetch_release() {
     use paranoid::config::RepositoryConfig;
     use paranoid::http::Client;
-    use paranoid::repository::debian::DebianRepository;
+    use paranoid::repository::debian::{DebianRepository, Keyring};
 
     let client = Client::new().expect("Should create client");
     let config = RepositoryConfig {
         url: url::Url::parse("https://deb.debian.org/debian").unwrap(),
         distribution: "bookworm".to_string(),
         components: vec!["main".to_string()],
+        signed_by: KEY.into(),
     };
-    let repo = DebianRepository::new(&client, "debian", &config);
+    let keyring = Keyring::load(KEY.as_ref()).expect("Should load keyring");
+    let repo = DebianRepository::new(&client, "debian", &config, &keyring);
 
-    let release_content = repo
-        .fetch_release()
+    let snapshot = repo
+        .fetch_release(chrono::Utc::now())
         .await
-        .expect("Should fetch Release file");
+        .expect("Should fetch a signed release");
 
-    // Release file should contain expected fields
+    assert_eq!(snapshot.release.codename.as_deref(), Some("bookworm"));
+    assert!(snapshot.release.acquire_by_hash);
     assert!(
-        release_content.contains("Origin: Debian"),
-        "Should contain Origin field"
+        snapshot.release.packages_index("main", "amd64").is_ok(),
+        "Should list the main/amd64 Packages index"
     );
-    assert!(
-        release_content.contains("Codename: bookworm"),
-        "Should contain Codename field"
+    assert_eq!(
+        snapshot
+            .signers
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        ["B8B80B5B623EAB6AD8775C45B7C5D7D6350947F8"]
     );
-    assert!(
-        release_content.contains("Components:"),
-        "Should contain Components field"
-    );
+}
 
-    println!(
-        "Successfully fetched Release file ({} bytes)",
-        release_content.len()
+/// The wrong key must stop resolution before anything is trusted.
+#[tokio::test]
+#[ignore]
+async fn test_debian_repository_rejects_the_wrong_key() {
+    use paranoid::config::RepositoryConfig;
+    use paranoid::http::Client;
+    use paranoid::repository::debian::{DebianRepository, DebianRepositoryError, Keyring};
+
+    let client = Client::new().expect("Should create client");
+    let config = RepositoryConfig {
+        url: url::Url::parse("https://deb.debian.org/debian").unwrap(),
+        distribution: "bookworm".to_string(),
+        components: vec!["main".to_string()],
+        signed_by: WRONG_KEY.into(),
+    };
+    let keyring = Keyring::load(WRONG_KEY.as_ref()).expect("Should load keyring");
+    let repo = DebianRepository::new(&client, "debian", &config, &keyring);
+
+    let err = repo.fetch_release(chrono::Utc::now()).await.unwrap_err();
+    assert!(
+        matches!(err, DebianRepositoryError::Signature { .. }),
+        "expected a signature error, got: {err}"
     );
 }
 
@@ -401,6 +438,7 @@ architecture = "amd64"
 url = "https://deb.debian.org/debian"
 distribution = "bookworm"
 components = ["main"]
+signed_by = "examples/keys/debian-archive-bookworm-automatic.asc"
 
 [[packages]]
 name = "ca-certificates"
@@ -448,6 +486,7 @@ architecture = "amd64"
 url = "https://deb.debian.org/debian"
 distribution = "bookworm"
 components = ["main"]
+signed_by = "examples/keys/debian-archive-bookworm-automatic.asc"
 
 [[packages]]
 name = "ca-certificates"
@@ -510,6 +549,7 @@ architecture = "amd64"
 url = "https://deb.debian.org/debian"
 distribution = "bookworm"
 components = ["main"]
+signed_by = "examples/keys/debian-archive-bookworm-automatic.asc"
 
 [[packages]]
 name = "ca-certificates"
@@ -569,6 +609,7 @@ architecture = "amd64"
 url = "https://deb.debian.org/debian"
 distribution = "bookworm"
 components = ["main"]
+signed_by = "examples/keys/debian-archive-bookworm-automatic.asc"
 
 [[packages]]
 name = "base-files"

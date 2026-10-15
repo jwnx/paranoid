@@ -66,25 +66,6 @@ impl Client {
         Ok(bytes.to_vec())
     }
 
-    /// Fetch a URL and return the response body as a string.
-    pub async fn fetch_text(&self, url: &str) -> Result<String, ClientError> {
-        let response = self.fetch_response(url).await?;
-        let text = response.text().await?;
-        Ok(text)
-    }
-
-    /// Fetch a gzip-compressed file and decompress it.
-    pub async fn fetch_gzip(&self, url: &str) -> Result<String, ClientError> {
-        let bytes = self.fetch_bytes(url).await?;
-        Self::decompress_gzip(&bytes)
-    }
-
-    /// Fetch an xz-compressed file and decompress it.
-    pub async fn fetch_xz(&self, url: &str) -> Result<String, ClientError> {
-        let bytes = self.fetch_bytes(url).await?;
-        Self::decompress_xz(&bytes)
-    }
-
     /// Decompress gzip data.
     pub fn decompress_gzip(data: &[u8]) -> Result<String, ClientError> {
         let mut decoder = GzDecoder::new(data);

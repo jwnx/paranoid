@@ -3,8 +3,8 @@
 The October 2026 tidy-up fixed image building: the rootfs is assembled in
 memory, builds are reproducible, extraction can't escape, and there is one
 progress model, one hash type and a thin `main.rs`. Resolution and trust
-were left alone on purpose. They are next, in this order, because each one
-changes what the lock file contains.
+came next, since each changed what the lock file contains; both are done
+apart from the notes below.
 
 ## 1. Resolver
 
@@ -23,22 +23,31 @@ check them against dpkg and apt. What's left:
 
 ## 2. Trust chain
 
-The tool is called paranoid, but nothing anchors trust today. The SHA-256
-values in the lock come from `Packages` files fetched without checking
-`InRelease`, over mirrors that may be plain HTTP. `fetch_release` exists
-but is never called.
+Every repository names its keys with `signed_by`. `lock` verifies
+`InRelease` against them (`keyring.rs`), checks each `Packages` index
+against the signed Release (`release.rs`), and records the snapshot in the
+lock. `scripts/trust-oracle.sh` breaks a signed repository ten ways and
+checks paranoid against apt. What's left:
 
-1. Fetch `InRelease` and verify its signature against a configured keyring
-   (`sequoia-openpgp`, or shell out to `gpgv`).
-2. Parse its `SHA256:` table and verify each `Packages` file before
-   parsing it.
-3. Record the Release digest in the lock, so `build` can show which signed
-   snapshot a lock came from.
+- Only `InRelease` is read. Some third-party repositories publish only a
+  `Release` with a detached `Release.gpg`. Support that if one is needed.
+- Designated revokers aren't honored. Debian's archive keys name several,
+  and a revocation they issue only counts once the revoker's key is in the
+  keyring. gpgv behaves the same, but apt users get revocations through
+  keyring package updates and paranoid users don't.
+- `build` trusts the checksums in the lock. A `paranoid verify` could fetch
+  the recorded `InRelease` back from a snapshot archive, check it against
+  the keys, and check the lock against it.
+- An unknown signer is reported by the key ID or fingerprint in the
+  signature, which for Debian is a subkey; the primary fingerprint would be
+  friendlier, but we can't know it without the key.
 
 ## 3. Policy
 
 - `lock` writes a lock even with unmet dependencies, and `build` builds
-  from a stale lock with only a warning. Both should fail by default, with
+  from a stale lock with only a warning. A lock is stale when the manifest
+  changed or none of the keys that signed its snapshots are trusted any
+  more (`LockFile::is_current`). Both should fail by default, with
   `--allow-unmet` / `--allow-stale` to opt out.
 
 ## 4. Smaller cleanups

@@ -57,11 +57,16 @@ pub async fn run(args: BuildArgs, quiet: bool) -> Result<(), CliError> {
         return Err(CliError::missing_lock(&lock_path));
     }
     let lock = LockFile::from_file(&lock_path).map_err(CliError::lock)?;
-    if !lock.matches_config(&manifest) {
-        st::warning(format!(
+    match lock.is_current(&manifest) {
+        Ok(true) => {}
+        Ok(false) => st::warning(format!(
             "{} may be stale — run `paranoid lock` first",
             lock_path.display()
-        ));
+        )),
+        Err(e) => st::warning(format!(
+            "could not check {} against the manifest: {e}",
+            lock_path.display()
+        )),
     }
 
     let options = BuildOptions {

@@ -21,6 +21,10 @@ pub struct Manifest {
     #[serde(default)]
     pub packages: Vec<PackageSpec>,
     pub entrypoint: Option<EntrypointConfig>,
+    /// The directory paths in the manifest are relative to: the manifest's
+    /// own directory, or the current directory when parsed from a string.
+    #[serde(skip)]
+    dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -42,6 +46,9 @@ pub struct RepositoryConfig {
     pub url: Url,
     pub distribution: String,
     pub components: Vec<String>,
+    /// OpenPGP keys allowed to sign the repository's `InRelease`, relative
+    /// to the manifest. Like apt's `Signed-By`, but required.
+    pub signed_by: PathBuf,
 }
 
 /// Deserialize any `FromStr` type from a string, so aliases and validation
@@ -195,7 +202,14 @@ impl Manifest {
     pub fn from_file(path: &Path) -> Result<Self, ManifestError> {
         let format = Self::detect_format(path)?;
         let content = std::fs::read_to_string(path)?;
-        Self::from_str_with_format(&content, format)
+        let mut manifest = Self::from_str_with_format(&content, format)?;
+        manifest.dir = path.parent().unwrap_or(Path::new("")).to_path_buf();
+        Ok(manifest)
+    }
+
+    /// Resolve a path written in the manifest against its directory.
+    pub fn resolve_path(&self, path: &Path) -> PathBuf {
+        self.dir.join(path)
     }
 
     /// Detects the config format from a file's extension.
@@ -276,6 +290,13 @@ impl Manifest {
                 });
             }
 
+            if repo.signed_by.as_os_str().is_empty() {
+                return Err(ManifestError::Validation {
+                    field: "repositories",
+                    message: format!("repository '{}' has an empty signed_by", name),
+                });
+            }
+
             if repo.components.is_empty() {
                 return Err(ManifestError::Validation {
                     field: "repositories",
@@ -330,6 +351,7 @@ architecture = "amd64"
 url = "https://deb.debian.org/debian"
 distribution = "bookworm"
 components = ["main", "contrib"]
+signed_by = "keys/debian.asc"
 
 [[packages]]
 name = "nginx"
@@ -389,6 +411,7 @@ PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
 url = "https://deb.debian.org/debian"
 distribution = "bookworm"
 components = ["main"]
+signed_by = "keys/debian.asc"
 
 [[packages]]
 name = "bash"
@@ -429,6 +452,7 @@ name = "bash"
 url = "https://deb.debian.org/debian"
 distribution = "bookworm"
 components = ["main"]
+signed_by = "keys/debian.asc"
 "#;
 
         let result = Manifest::from_str(config);
@@ -463,6 +487,7 @@ url = "https://deb.debian.org/debian"
 url = "ftp://deb.debian.org/debian"
 distribution = "bookworm"
 components = ["main"]
+signed_by = "keys/debian.asc"
 
 [[packages]]
 name = "bash"
@@ -484,6 +509,7 @@ architecture = "arm64"
 url = "https://deb.debian.org/debian"
 distribution = "bookworm"
 components = ["main"]
+signed_by = "keys/debian.asc"
 
 [[packages]]
 name = "vim"
@@ -511,6 +537,7 @@ source = "https://github.com/example/node-image"
 url = "https://deb.debian.org/debian"
 distribution = "bookworm"
 components = ["main"]
+signed_by = "keys/debian.asc"
 
 [[packages]]
 name = "nodejs"
@@ -541,6 +568,7 @@ repositories:
     components:
       - main
       - contrib
+    signed_by: keys/debian.asc
 
 packages:
   - name: nginx
@@ -573,7 +601,8 @@ packages:
     "debian": {
       "url": "https://deb.debian.org/debian",
       "distribution": "bookworm",
-      "components": ["main"]
+      "components": ["main"],
+      "signed_by": "keys/debian.asc"
     }
   },
   "packages": [
@@ -652,6 +681,7 @@ repositories:
 url = "https://deb.debian.org/debian"
 distribution = "bookworm"
 components = ["main"]
+signed_by = "keys/debian.asc"
 
 [[packages]]
 name = "bash"
@@ -675,6 +705,7 @@ repositories:
     url: https://deb.debian.org/debian
     distribution: bookworm
     components: [main]
+    signed_by: keys/debian.asc
 packages:
   - name: vim
 "#,
@@ -709,6 +740,7 @@ packages:
 url = "https://deb.debian.org/debian"
 distribution = "bookworm"
 components = ["main"]
+signed_by = "keys/debian.asc"
 [[packages]]
 name = "bash"
 "#,
@@ -723,6 +755,7 @@ repositories:
     url: https://deb.debian.org/debian
     distribution: bookworm
     components: [main]
+    signed_by: keys/debian.asc
 packages:
   - name: bash
 "#,
@@ -744,6 +777,7 @@ packages:
 url = "https://deb.debian.org/debian"
 distribution = "bookworm"
 components = ["main"]
+signed_by = "keys/debian.asc"
 
 [[packages]]
 name = "bash"
@@ -801,11 +835,13 @@ name = "bash"
 url = "https://deb.debian.org/debian"
 distribution = "bookworm"
 components = ["main"]
+signed_by = "keys/debian.asc"
 
 [repositories.alpha]
 url = "https://deb.debian.org/debian-security"
 distribution = "bookworm-security"
 components = ["main"]
+signed_by = "keys/debian.asc"
 
 [[packages]]
 name = "bash"
@@ -821,7 +857,7 @@ name = "bash"
         for version in ["> 1.0", ">= ", "1.0-", "abc:1"] {
             let config = format!(
                 "[repositories.debian]\nurl = \"https://deb.debian.org/debian\"\n\
-                 distribution = \"bookworm\"\ncomponents = [\"main\"]\n\n\
+                 distribution = \"bookworm\"\ncomponents = [\"main\"]\nsigned_by = \"keys/debian.asc\"\n\n\
                  [[packages]]\nname = \"bash\"\nversion = \"{version}\"\n"
             );
             assert!(

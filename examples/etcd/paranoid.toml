@@ -6,6 +6,7 @@ architecture = "arm64"
 url = "https://deb.debian.org/debian"
 distribution = "bookworm"
 components = ["main"]
+signed_by = "../keys/debian-archive-bookworm-automatic.asc"
 
 [[packages]]
 name = "etcd"
