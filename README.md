@@ -95,7 +95,7 @@ v18.20.4
 ## MANIFEST
 
 `paranoid.toml` (or `.yaml`, `.yml`, `.json`; exactly one per directory).
-Unknown fields are an error, not a warning.
+A misspelled or unknown field makes paranoid reject the manifest.
 
 ```toml
 [image]
@@ -163,8 +163,8 @@ removed; if not, it does nothing unless you pass `--force`. Commit the lock.
 ```
 
 - Every `.deb` is checked against the lock's SHA-256, whether it came off
-  the network or out of the cache. A bad cache entry is an error, not a
-  silent re-download.
+  the network or out of the cache. If a cached file doesn't match, the
+  build stops; `--force-download` fetches it again.
 - Packages are unpacked in lock order into an in-memory tree. Nothing is
   written to the host filesystem except the cache and the final image, so a
   hostile package can't escape through symlinks or `..`. Symlinks inside
@@ -188,7 +188,7 @@ What holds today:
   same lock + same SOURCE_DATE_EPOCH      ─▶  same image digest
   package contents                        ─▶  checked against the lock
   host filesystem                         ─▶  untouched by package contents
-  file ownership in the image             ─▶  from the package, not from you
+  file ownership in the image             ─▶  taken from the package
 ```
 
 What does **not** hold yet:
@@ -231,14 +231,14 @@ src/
   oci/         layers, config, manifest, layout and tarball writers
   build.rs     the build pipeline, library side
   report.rs    progress events (Phase, Event, Reporter)
-  cli/         one module per subcommand, all thin
+  cli/         one module per subcommand, each a wrapper over the library
 ```
 
 ## STATUS
 
-Early. The lock format and the library API will change, especially when
-signature checking lands and the lock starts recording which signed
-Release it came from.
+paranoid is early in development. The lock format and the library API will
+change, especially once signature checking lands and the lock starts
+recording which signed Release it came from.
 
 ```
                                                                   PARANOID(1)
