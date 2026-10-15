@@ -59,5 +59,3 @@ checks paranoid against apt. What's left:
   tests need.
 - The HTTP client has no timeouts, and decompresses `Packages` into a
   `String`, so one non-UTF-8 `Description` fails a whole repository.
-- `examples/etcd` asks for a package named `etcd`, which bookworm doesn't
-  have (it's `etcd-server`).

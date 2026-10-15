@@ -9,7 +9,10 @@ components = ["main"]
 signed_by = "../keys/debian-archive-bookworm-automatic.asc"
 
 [[packages]]
-name = "etcd"
+name = "etcd-server"
+
+[[packages]]
+name = "etcd-client"
 
 [entrypoint]
 cmd = ["etcdctl"]
