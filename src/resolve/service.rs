@@ -12,8 +12,8 @@ use crate::config::Manifest;
 use crate::hash::{ParseSha256Error, Sha256};
 use crate::http::{Client, ClientError};
 use crate::repository::debian::{
-    DebianPackage, DebianRepository, DebianRepositoryError, Fingerprint, Keyring, KeyringError,
-    PackageIndexSet, Request, ResolveError, UnmetDependency, resolve,
+    DebianPackage, DebianRepository, DebianRepositoryError, Fingerprint, Hold, Keyring,
+    KeyringError, Origin, PackageIndexSet, Request, ResolveError, UnmetDependency, resolve,
 };
 
 /// Errors that can occur during resolution.
@@ -39,6 +39,9 @@ pub enum ResolveServiceError {
 
     #[error("resolve error: {0}")]
     Resolve(#[from] ResolveError),
+
+    #[error("the hold on '{name}' matches no package in the resolution")]
+    UnusedHold { name: String },
 
     #[error("package '{package}' has an invalid SHA256 in the repository index")]
     InvalidChecksum {
@@ -195,7 +198,26 @@ impl ResolveService {
             })
             .collect();
 
-        let resolution = resolve(&index_set, &requests, arch)?;
+        let holds: Vec<Hold> = manifest
+            .holds
+            .iter()
+            .map(|(name, hold)| Hold {
+                name: name.clone(),
+                version: hold.version.clone(),
+                repository: hold.repository.clone(),
+                origin: Origin::Hold,
+            })
+            .collect();
+
+        let resolution = resolve(&index_set, &requests, &holds, arch)?;
+        // A hold on nothing is most likely a misspelled name.
+        if let Some(name) = manifest
+            .holds
+            .keys()
+            .find(|name| !resolution.packages.iter().any(|r| &r.package.name == *name))
+        {
+            return Err(ResolveServiceError::UnusedHold { name: name.clone() });
+        }
         let packages = resolution
             .packages
             .iter()

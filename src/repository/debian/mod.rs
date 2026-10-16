@@ -31,6 +31,7 @@ pub use provides::ProvidesEntry;
 pub use release::{IndexFile, ParseReleaseError, Release, ReleaseError};
 pub use repository::{DebianRepository, DebianRepositoryError, Snapshot};
 pub use resolver::{
-    Origin, Request, Requirement, Resolution, ResolveError, Resolved, UnmetDependency, resolve,
+    Hold, Origin, Request, Requirement, Resolution, ResolveError, Resolved, UnmetDependency,
+    resolve,
 };
 pub use version::{DebianVersion, ParseDebianVersionError};

@@ -79,11 +79,27 @@ impl fmt::Display for Request {
     }
 }
 
-/// Who asked for a package: the manifest, or another package.
+/// A requirement on a package wherever it ends up in the resolution,
+/// without asking for the package: apt's pinning, for one package.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hold {
+    pub name: String,
+    pub version: Option<VersionConstraint<DebianVersion>>,
+    /// Only take the package from this repository.
+    pub repository: Option<String>,
+    /// Who holds it, for error messages.
+    pub origin: Origin,
+}
+
+/// Who asked for a package, or for a version of it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Origin {
     Manifest,
     Package(String),
+    /// A hold in the manifest.
+    Hold,
+    /// The version another image of the same set resolved to.
+    Image(String),
 }
 
 impl fmt::Display for Origin {
@@ -91,6 +107,8 @@ impl fmt::Display for Origin {
         match self {
             Origin::Manifest => f.write_str("the manifest"),
             Origin::Package(name) => f.write_str(name),
+            Origin::Hold => f.write_str("a hold"),
+            Origin::Image(name) => write!(f, "image '{name}'"),
         }
     }
 }
@@ -160,6 +178,13 @@ pub enum ResolveError {
         requirements: Vec<Requirement>,
     },
 
+    #[error("'{name}' is pinned to repository '{first}' and to '{second}'")]
+    ConflictingPins {
+        name: String,
+        first: String,
+        second: String,
+    },
+
     #[error("'{package}' {field} '{relation}', but '{other}' is also needed")]
     Conflicts {
         package: String,
@@ -190,7 +215,8 @@ pub struct Resolution<'a> {
     pub unmet: Vec<UnmetDependency>,
 }
 
-/// Resolve `requests`, and everything they depend on, for `arch`.
+/// Resolve `requests`, and everything they depend on, for `arch`, with
+/// `holds` applied to whichever packages they name end up selected.
 ///
 /// Fails if a request matches no package, if requirements on a package
 /// can't all be met, or if selected packages conflict. A dependency that
@@ -198,13 +224,45 @@ pub struct Resolution<'a> {
 pub fn resolve<'a>(
     index: &'a PackageIndexSet,
     requests: &[Request],
+    holds: &[Hold],
     arch: Architecture,
 ) -> Result<Resolution<'a>, ResolveError> {
-    let pins: HashMap<&str, &str> = requests
+    let mut pins: HashMap<&str, &str> = HashMap::new();
+    let wanted = holds
         .iter()
-        .filter_map(|r| Some((r.name.as_str(), r.repository.as_deref()?)))
-        .collect();
+        .map(|h| (h.name.as_str(), h.repository.as_deref()))
+        .chain(
+            requests
+                .iter()
+                .map(|r| (r.name.as_str(), r.repository.as_deref())),
+        );
+    for (name, repository) in wanted {
+        let Some(repository) = repository else {
+            continue;
+        };
+        match pins.insert(name, repository) {
+            Some(first) if first != repository => {
+                return Err(ResolveError::ConflictingPins {
+                    name: name.to_string(),
+                    first: first.to_string(),
+                    second: repository.to_string(),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    // A hold is a requirement known before the first pass.
     let mut learned: HashMap<String, Vec<Requirement>> = HashMap::new();
+    for hold in holds.iter().filter(|h| h.version.is_some()) {
+        learned
+            .entry(hold.name.clone())
+            .or_default()
+            .push(Requirement {
+                version: hold.version.clone(),
+                required_by: hold.origin.clone(),
+            });
+    }
 
     loop {
         let mut pass = Pass {
@@ -330,25 +388,46 @@ impl<'a> Pass<'a, '_> {
                 }
                 (None, Some((name, requirements))) => return self.retry(name, requirements),
                 (None, None) => match origin {
-                    Origin::Manifest => {
-                        let request = requests
-                            .iter()
-                            .find(|r| r.spec() == alternatives[0])
-                            .expect("manifest dependencies come from requests");
-                        return Err(ResolveError::NotFound {
-                            request: Box::new(request.clone()),
-                            arch: self.arch,
-                        });
-                    }
                     Origin::Package(required_by) => self.unmet.push(UnmetDependency {
                         required_by,
                         dependency,
                     }),
+                    // Only requests and packages are ever queued.
+                    Origin::Manifest | Origin::Hold | Origin::Image(_) => {
+                        let request = requests
+                            .iter()
+                            .find(|r| r.spec() == alternatives[0])
+                            .expect("manifest dependencies come from requests");
+                        return Err(self.not_found(request));
+                    }
                 },
             }
         }
 
         Ok(Outcome::Done)
+    }
+
+    /// Why nothing satisfies a request: the package exists, but a hold or
+    /// another image rules out every version the request allows, or it
+    /// doesn't exist at all.
+    fn not_found(&self, request: &Request) -> ResolveError {
+        let exists = self
+            .index
+            .packages(&request.name, self.arch)
+            .next()
+            .is_some();
+        let mut requirements = self.requirements_on(&request.name);
+        if exists && !requirements.is_empty() {
+            requirements.push(requirement(&request.spec(), &Origin::Manifest));
+            return ResolveError::Conflict {
+                name: request.name.clone(),
+                requirements,
+            };
+        }
+        ResolveError::NotFound {
+            request: Box::new(request.clone()),
+            arch: self.arch,
+        }
     }
 
     /// The name of a selected package that satisfies `spec`, if any.
@@ -387,6 +466,7 @@ impl<'a> Pass<'a, '_> {
             .map(|p| p.provider)
             .filter(|p| !self.selected.contains_key(p.package.name.as_str()))
             .filter(|p| self.allowed(&spec.name, p) && self.allowed(&p.package.name, p))
+            .filter(|p| self.learned_allows(p.package))
             .collect();
         providers.sort_by(|a, b| {
             let (a, b) = (a.package, b.package);
@@ -437,6 +517,14 @@ impl<'a> Pass<'a, '_> {
         best
     }
 
+    /// Whether everything learned about `package`'s name, holds included,
+    /// allows its version.
+    fn learned_allows(&self, package: &DebianPackage) -> bool {
+        self.learned
+            .get(&package.name)
+            .is_none_or(|known| known.iter().all(|r| r.allows(&package.version)))
+    }
+
     /// Whether `name`'s pin, if any, lets `candidate` be used for it.
     fn allowed(&self, name: &str, candidate: &SourcedPackage<'_>) -> bool {
         self.pins
@@ -483,7 +571,7 @@ impl<'a> Pass<'a, '_> {
                     .or_default()
                     .insert(name.to_string());
             }
-            Origin::Package(_) => {}
+            Origin::Package(_) | Origin::Hold | Origin::Image(_) => {}
         }
     }
 
@@ -624,7 +712,7 @@ mod tests {
         set: &'a PackageIndexSet,
         requests: &[Request],
     ) -> Result<Resolution<'a>, ResolveError> {
-        resolve(set, requests, Architecture::Amd64)
+        resolve(set, requests, &[], Architecture::Amd64)
     }
 
     /// `name=version` for every selected package, sorted.
@@ -996,6 +1084,127 @@ mod tests {
         ]);
         let resolution = run(&set, &requests(&["bash"])).unwrap();
         assert_eq!(resolution.packages[0].repository, "first");
+    }
+
+    fn hold(name: &str, version: Option<&str>, repository: Option<&str>) -> Hold {
+        Hold {
+            name: name.to_string(),
+            version: version.map(|v| v.parse().unwrap()),
+            repository: repository.map(String::from),
+            origin: Origin::Hold,
+        }
+    }
+
+    fn run_held<'a>(
+        set: &'a PackageIndexSet,
+        asked: &[&str],
+        holds: &[Hold],
+    ) -> Result<Resolution<'a>, ResolveError> {
+        resolve(set, &requests(asked), holds, Architecture::Amd64)
+    }
+
+    /// pgBackRest is held for every image, but no image asks for it by
+    /// version: it comes in as a dependency.
+    #[test]
+    fn a_hold_applies_to_a_dependency() {
+        let set = repos(&[(
+            "pgdg",
+            "Package: pgbackrest\nVersion: 2.58.0-1\n\n\
+             Package: pgbackrest\nVersion: 2.59.0-1\n\n\
+             Package: server\nVersion: 1\nDepends: pgbackrest",
+        )]);
+        assert_eq!(
+            resolves_to(&set, &["server"]),
+            ["pgbackrest=2.59.0-1", "server=1"]
+        );
+        let held = run_held(
+            &set,
+            &["server"],
+            &[hold("pgbackrest", Some("= 2.58.0-1"), None)],
+        );
+        assert_eq!(
+            selected(&held.unwrap()),
+            ["pgbackrest=2.58.0-1", "server=1"]
+        );
+    }
+
+    #[test]
+    fn a_hold_without_the_package_changes_nothing() {
+        let set = repos(&[("debian", "Package: bash\nVersion: 5.2")]);
+        let held = run_held(
+            &set,
+            &["bash"],
+            &[hold("pgbackrest", Some("= 2.58.0-1"), None)],
+        );
+        assert_eq!(selected(&held.unwrap()), ["bash=5.2"]);
+    }
+
+    #[test]
+    fn a_hold_can_pin_a_repository() {
+        let set = repos(&[
+            (
+                "debian",
+                "Package: libpq5\nVersion: 15.8\n\nPackage: app\nVersion: 1\nDepends: libpq5",
+            ),
+            ("pgdg", "Package: libpq5\nVersion: 18.6"),
+        ]);
+        let held = run_held(&set, &["app"], &[hold("libpq5", None, Some("debian"))]).unwrap();
+        assert_eq!(selected(&held), ["app=1", "libpq5=15.8"]);
+        assert_eq!(held.packages[1].repository, "debian");
+    }
+
+    #[test]
+    fn a_hold_applies_to_providers() {
+        let set = repos(&[(
+            "debian",
+            "Package: mawk\nVersion: 1.3.4\nProvides: awk\n\n\
+             Package: mawk\nVersion: 1.3.5\nProvides: awk\n\n\
+             Package: app\nVersion: 1\nDepends: awk",
+        )]);
+        let held = run_held(&set, &["app"], &[hold("mawk", Some("= 1.3.4"), None)]);
+        assert_eq!(selected(&held.unwrap()), ["app=1", "mawk=1.3.4"]);
+    }
+
+    #[test]
+    fn a_hold_the_manifest_contradicts_is_a_conflict() {
+        let set = repos(&[(
+            "pgdg",
+            "Package: pgbackrest\nVersion: 2.58.0-1\n\nPackage: pgbackrest\nVersion: 2.59.0-1",
+        )]);
+        let err = run_held(
+            &set,
+            &["pgbackrest (>= 2.59)"],
+            &[hold("pgbackrest", Some("= 2.58.0-1"), None)],
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "no version of 'pgbackrest' satisfies every requirement: \
+             (= 2.58.0-1) from a hold, (>= 2.59) from the manifest"
+        );
+    }
+
+    #[test]
+    fn a_package_pinned_to_two_repositories_is_an_error() {
+        let set = repos(&[
+            ("a", "Package: bash\nVersion: 5.2"),
+            ("b", "Package: bash\nVersion: 5.2"),
+        ]);
+        let requests = [Request::new("bash").repository("a")];
+        let err = resolve(
+            &set,
+            &requests,
+            &[hold("bash", None, Some("b"))],
+            Architecture::Amd64,
+        );
+        assert_eq!(
+            err.unwrap_err(),
+            ResolveError::ConflictingPins {
+                name: "bash".into(),
+                first: "b".into(),
+                second: "a".into(),
+            }
+        );
     }
 
     fn prioritized(repos: &[(&str, i32, &str)]) -> PackageIndexSet {

@@ -136,6 +136,18 @@ pub   rsa4096 2023-01-21 [SC] [expires: 2031-01-19]
 uid                      Debian Archive Automatic Signing Key (12/bookworm) <ftpmaster@debian.org>
 ```
 
+`[holds]` puts a version or a repository on a package wherever it ends
+up, whether the manifest asks for it or another package pulls it in:
+
+```toml
+[holds]
+pgbackrest = "= 2.58.0-1.pgdg13+1"
+libpq5     = { repository = "pgdg" }
+```
+
+A hold that matches no package in the result is an error, since it's
+usually a misspelled name.
+
 When several repositories carry a package, the one with the highest
 `priority` wins, then the highest version, the way apt picks a candidate.
 A negative priority means the repository is never used. Without

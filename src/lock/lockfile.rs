@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::arch::Architecture;
-use crate::config::{Manifest, PackageSpec, RepositoryConfig};
+use crate::config::{HoldSpec, Manifest, PackageSpec, RepositoryConfig};
 use crate::hash::Sha256;
 use crate::oci::Digest;
 use crate::repository::debian::{Keyring, KeyringError};
@@ -298,10 +298,18 @@ impl LockFile {
             architecture: Option<String>,
             repositories: Vec<(&'a str, &'a RepositoryConfig)>,
             packages: Vec<&'a PackageSpec>,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            holds: Vec<(&'a str, &'a HoldSpec)>,
         }
 
         let mut packages: Vec<_> = manifest.packages.iter().collect();
         packages.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut holds_sorted: Vec<_> = manifest
+            .holds
+            .iter()
+            .map(|(n, h)| (n.as_str(), h))
+            .collect();
+        holds_sorted.sort_by_key(|(name, _)| *name);
 
         let inputs = ResolutionInputs {
             architecture: manifest.image.as_ref().map(|i| i.architecture.to_string()),
@@ -311,6 +319,7 @@ impl LockFile {
                 .map(|(name, repo)| (name.as_str(), repo))
                 .collect(),
             packages,
+            holds: holds_sorted,
         };
 
         let json = serde_json::to_vec(&inputs).expect("resolution inputs always serialize");
@@ -716,6 +725,20 @@ name = "vim"
 
         let parsed = LockFile::from_str(&lock.serialize().unwrap()).unwrap();
         assert_eq!(parsed.unmet, lock.unmet);
+    }
+
+    #[test]
+    fn holds_are_resolution_inputs() {
+        let plain = make_manifest();
+        let held = Manifest::from_str(&format!(
+            "{}\n[holds]\nbash = \"= 5.2.15-2\"\n",
+            make_manifest_toml()
+        ))
+        .unwrap();
+        assert_ne!(
+            LockFile::compute_config_hash(&plain),
+            LockFile::compute_config_hash(&held)
+        );
     }
 
     #[test]

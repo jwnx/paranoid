@@ -1,6 +1,6 @@
 mod manifest;
 
 pub use manifest::{
-    ConfigFormat, EntrypointConfig, ImageConfig, Manifest, ManifestError, PackageSpec,
+    ConfigFormat, EntrypointConfig, HoldSpec, ImageConfig, Manifest, ManifestError, PackageSpec,
     RepositoryConfig, SnapshotTime,
 };

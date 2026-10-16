@@ -158,7 +158,7 @@ fn test_ca_certificates_arch_all() {
 /// Resolve one request against the fixture, returning the selected names.
 fn resolve_fixture(request: Request) -> Result<Vec<String>, ResolveError> {
     let index = make_index_set(load_fixture());
-    let resolution = resolve(&index, &[request], Architecture::Amd64)?;
+    let resolution = resolve(&index, &[request], &[], Architecture::Amd64)?;
     Ok(resolution
         .packages
         .iter()

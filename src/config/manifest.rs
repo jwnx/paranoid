@@ -21,6 +21,10 @@ pub struct Manifest {
     pub repositories: IndexMap<String, RepositoryConfig>,
     #[serde(default)]
     pub packages: Vec<PackageSpec>,
+    /// Version or repository requirements on packages wherever they end
+    /// up, asked for or pulled in, by package name.
+    #[serde(default)]
+    pub holds: IndexMap<String, HoldSpec>,
     pub entrypoint: Option<EntrypointConfig>,
     /// The directory paths in the manifest are relative to: the manifest's
     /// own directory, or the current directory when parsed from a string.
@@ -180,6 +184,45 @@ pub struct PackageSpec {
     /// Optional repository name to pin this package to.
     /// If not specified, the package will be searched in all repositories.
     pub repository: Option<String>,
+}
+
+/// A hold: `"= 2.58.0-1"`, or `{ version = "...", repository = "..." }`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct HoldSpec {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<VersionConstraint<DebianVersion>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for HoldSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Table {
+            version: Option<VersionConstraint<DebianVersion>>,
+            repository: Option<String>,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Version(VersionConstraint<DebianVersion>),
+            Table(Table),
+        }
+
+        match Raw::deserialize(deserializer).map_err(|_| {
+            serde::de::Error::custom(
+                "expected a version like \"= 2.58.0-1\", or a table with `version` and/or `repository`",
+            )
+        })? {
+            Raw::Version(version) => Ok(Self {
+                version: Some(version),
+                repository: None,
+            }),
+            Raw::Table(Table { version, repository }) => Ok(Self { version, repository }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -423,6 +466,23 @@ impl Manifest {
             }
         }
 
+        for (name, hold) in &self.holds {
+            if hold.version.is_none() && hold.repository.is_none() {
+                return Err(ManifestError::Validation {
+                    field: "holds",
+                    message: format!("hold on '{name}' sets neither a version nor a repository"),
+                });
+            }
+            if let Some(repo) = &hold.repository
+                && !self.repositories.contains_key(repo)
+            {
+                return Err(ManifestError::Validation {
+                    field: "holds",
+                    message: format!("'{name}' is held to unknown repository '{repo}'"),
+                });
+            }
+        }
+
         Ok(())
     }
 }
@@ -441,6 +501,61 @@ mod tests {
              [[packages]]\nname = \"bash\"\n"
         );
         Manifest::from_str(&toml).map(|m| m.repositories["debian"].clone())
+    }
+
+    #[test]
+    fn parses_holds() {
+        let manifest = Manifest::from_str(
+            r#"
+[repositories.pgdg]
+url = "https://apt.postgresql.org/pub/repos/apt"
+distribution = "trixie-pgdg"
+components = ["main"]
+signed_by = "keys/pgdg.asc"
+
+[holds]
+pgbackrest = "= 2.58.0-1.pgdg13+1"
+libpq5 = { repository = "pgdg" }
+postgresql-17 = { version = ">= 17.11", repository = "pgdg" }
+
+[[packages]]
+name = "pgbackrest"
+"#,
+        )
+        .unwrap();
+        let holds: Vec<_> = manifest
+            .holds
+            .iter()
+            .map(|(name, h)| {
+                let version = h.version.as_ref().map(ToString::to_string);
+                (name.as_str(), version, h.repository.as_deref())
+            })
+            .collect();
+        assert_eq!(
+            holds,
+            [
+                ("pgbackrest", Some("= 2.58.0-1.pgdg13+1".to_string()), None),
+                ("libpq5", None, Some("pgdg")),
+                ("postgresql-17", Some(">= 17.11".to_string()), Some("pgdg")),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_bad_holds() {
+        let with = |holds: &str| {
+            Manifest::from_str(&format!(
+                "[repositories.pgdg]\nurl = \"https://example.org\"\ndistribution = \"x\"\n\
+                 components = [\"main\"]\nsigned_by = \"k.asc\"\n\n[holds]\n{holds}\n\n\
+                 [[packages]]\nname = \"bash\"\n"
+            ))
+            .unwrap_err()
+            .to_string()
+        };
+        assert!(with("x = {}").contains("neither a version nor a repository"));
+        assert!(with("x = { repository = \"nope\" }").contains("unknown repository 'nope'"));
+        assert!(with("x = \">> \"").contains("expected a version"));
+        assert!(with("x = { versoin = \"1\" }").contains("expected a version"));
     }
 
     #[test]
