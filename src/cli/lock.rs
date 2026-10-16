@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use clap::Parser;
 
 use paranoid::config::Manifest;
-use paranoid::lock::{Change, LockFile};
+use paranoid::lock::{Change, ChangeKind, LockDiff, LockFile};
 use paranoid::resolve::ResolveService;
 
 use super::error::CliError;
@@ -87,23 +87,19 @@ pub async fn run(args: LockArgs, quiet: bool) -> Result<(), CliError> {
     lock.write(&output).map_err(CliError::lock)?;
 
     if !quiet {
-        let changes = existing.as_ref().map(|old| old.diff(&lock));
+        let diff = existing.as_ref().map(|old| old.diff(&lock));
         let packages = match lock.images.len() {
             1 => format!("{} packages", lock.packages.len()),
             n => format!("{} packages in {n} images", lock.packages.len()),
         };
-        match changes.as_deref() {
+        match diff {
             None => eprintln!("({packages})"),
-            Some([]) => eprintln!("({packages}, no changes)"),
-            Some(changes) => {
-                let count = |pred: fn(&Change) -> bool| changes.iter().filter(|c| pred(c)).count();
-                eprintln!(
-                    "(+{} ~{} -{})",
-                    count(|c| matches!(c, Change::Added { .. })),
-                    count(|c| matches!(c, Change::Changed { .. })),
-                    count(|c| matches!(c, Change::Removed { .. })),
-                );
-                changes.iter().for_each(print_change);
+            Some(diff) if diff.is_empty() => eprintln!("({packages}, no changes)"),
+            Some(diff) => {
+                // Name images when there's more than one, before or after.
+                let several = lock.images.len() > 1
+                    || existing.as_ref().is_some_and(|old| old.images.len() > 1);
+                print_diff(&diff, several);
             }
         }
         st::footer(&output, &lock.content_hash().map_err(CliError::lock)?);
@@ -136,16 +132,43 @@ pub fn check_unmet(lock: &LockFile, allow: bool) -> Result<(), CliError> {
     Ok(())
 }
 
-fn print_change(change: &Change<'_>) {
-    let (sigil, style, detail) = match change {
-        Change::Added { version, .. } => ("+", st::added(), version.to_string()),
-        Change::Changed { from, to, .. } => ("~", st::changed(), format!("{from} → {to}")),
-        Change::Removed { version, .. } => ("-", st::removed(), version.to_string()),
+fn print_diff(diff: &LockDiff<'_>, several: bool) {
+    let count =
+        |pred: fn(&ChangeKind) -> bool| diff.changes.iter().filter(|c| pred(&c.kind)).count();
+    eprintln!(
+        "(+{} ~{} -{})",
+        count(|k| matches!(k, ChangeKind::Added { .. })),
+        count(|k| matches!(k, ChangeKind::Changed { .. })),
+        count(|k| matches!(k, ChangeKind::Removed { .. })),
+    );
+    for image in &diff.added_images {
+        eprintln!("  {} image {image}", st::added().apply_to("+"));
+    }
+    for image in &diff.removed_images {
+        eprintln!("  {} image {image}", st::removed().apply_to("-"));
+    }
+    for change in &diff.changes {
+        print_change(change, several);
+    }
+}
+
+fn print_change(change: &Change<'_>, several: bool) {
+    let (sigil, style, detail) = match &change.kind {
+        ChangeKind::Added { version } => ("+", st::added(), version.to_string()),
+        ChangeKind::Changed { from, to } => ("~", st::changed(), format!("{from} → {to}")),
+        ChangeKind::Removed { version } => ("-", st::removed(), version.to_string()),
+    };
+    let images = if several {
+        format!(
+            " {}",
+            st::dim().apply_to(format!("in {}", change.images.join(", ")))
+        )
+    } else {
+        String::new()
     };
     eprintln!(
-        "  {} {} {}",
+        "  {} {} {detail}{images}",
         style.apply_to(sigil),
-        style.apply_to(change.name()),
-        detail
+        style.apply_to(change.name),
     );
 }

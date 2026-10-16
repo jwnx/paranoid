@@ -66,8 +66,6 @@ image digests as from their own locks. What's left:
   an error rather than a reason to choose differently. A joint search over
   every image would find more solutions, at the resolver's cost (see
   section 1).
-- The lock diff is by package. A change that only moves a package in or
-  out of one image doesn't show which.
 - Architecture is set-wide. A multi-architecture set would need one
   resolution per architecture, and a rule for what "one version" means
   across them.

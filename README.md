@@ -258,6 +258,9 @@ different states of a moving repository.
 `{image}` in `-o` is replaced by the image's id, and is required when
 building more than one; the default is `{image}.tar`.
 
+When the lock changes, `paranoid lock` lists what changed in which images,
+including a package that only moved into or out of one.
+
 ## LOCK
 
 `paranoid lock` fetches each repository's `InRelease` and checks its
