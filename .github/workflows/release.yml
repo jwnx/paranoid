@@ -2,7 +2,10 @@
 #
 # Push an annotated tag whose message is the release notes:
 #
-#   git tag -a v0.2.0 -F notes.md && git push origin v0.2.0
+#   git tag -a v0.2.0 --cleanup=verbatim -F notes.md && git push origin v0.2.0
+#
+# (--cleanup=verbatim keeps Markdown headings, which git would otherwise
+# strip as comments.)
 #
 # The release is created as a draft, with the binaries, SHA256SUMS and build
 # provenance attestations, for a person to read and publish. Running the
@@ -127,5 +130,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          gh release create "$GITHUB_REF_NAME" --draft --verify-tag --notes-from-tag \
+          # The notes are the annotated tag's message. gh's --notes-from-tag
+          # reads it from a local clone, which this job doesn't have, so we
+          # ask the API.
+          object=$(gh api "repos/$GH_REPO/git/ref/tags/$GITHUB_REF_NAME" --jq .object)
+          if [ "$(jq -r .type <<<"$object")" != tag ]; then
+            echo "$GITHUB_REF_NAME is a lightweight tag; release tags are annotated, with the notes as their message" >&2
+            exit 1
+          fi
+          gh api "repos/$GH_REPO/git/tags/$(jq -r .sha <<<"$object")" --jq .message |
+            sed '/^-----BEGIN PGP SIGNATURE-----$/,$d' >notes.md
+          gh release create "$GITHUB_REF_NAME" --draft --verify-tag --notes-file notes.md \
             --title "paranoid ${GITHUB_REF_NAME#v}" dist/*.tar.gz dist/SHA256SUMS
