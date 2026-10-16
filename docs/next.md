@@ -86,5 +86,11 @@ image digests as from their own locks. What's left:
   `DebianVersion`.
 - Most modules are `pub`. Shrink the library surface to what the CLI and
   tests need.
+- `build` peaks at about 7× the size of the image it writes: 2 GB for the
+  281 MB `examples/postgres` builder, and v0.1.0 needed 2.4 GB for MPG's
+  `pg17-builder`. The rootfs keeps every file in memory, and the layer is
+  built and compressed in memory on top. A 2 GB container can't build a
+  builder image. Streaming the layer straight from the rootfs to the
+  compressor, and from there to its blob, would remove the two copies.
 - The HTTP client has no timeouts, and decompresses `Packages` into a
   `String`, so one non-UTF-8 `Description` fails a whole repository.
