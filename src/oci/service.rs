@@ -11,7 +11,7 @@ use crate::rootfs::Rootfs;
 
 use super::digest::Digest;
 use super::error::{OciError, OciImageResult};
-use super::layer::{Compression, Layer};
+use super::layer::{Compression, Layer, output_temp_file};
 use super::spec::{
     ContainerConfig, Descriptor, History, ImageConfig, ImageIndex, ImageManifest, MediaType,
     OciLayout,
@@ -593,7 +593,7 @@ fn write_tarball(path: &Path, files: &[(String, Content)]) -> Result<(), OciErro
         _ => Path::new("."),
     };
 
-    let temp = tempfile::NamedTempFile::new_in(dir).map_err(write_err)?;
+    let temp = output_temp_file(dir).map_err(write_err)?;
     let mut builder = tar::Builder::new(BufWriter::new(temp));
 
     let header = |kind, mode, size| {
@@ -832,6 +832,40 @@ mod tests {
             let mode = fs::metadata(&dir).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o755);
         }
+    }
+
+    /// Images are ordinary files: the layer and the tarball get the mode
+    /// any new file gets under the current umask, not tempfile's 0600.
+    #[cfg(unix)]
+    #[test]
+    fn images_get_the_mode_of_any_new_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+
+        let output = TempDir::new().unwrap();
+        let reference = output.path().join("reference");
+        fs::write(&reference, "").unwrap();
+
+        let tarball = output.path().join("image.tar");
+        let _ = write_image(
+            &OciConfig::new(),
+            &test_rootfs(),
+            &ImageOutput::Tarball(tarball.clone()),
+            &(),
+        )
+        .unwrap();
+        assert_eq!(mode(&tarball), mode(&reference));
+
+        let layout = output.path().join("layout");
+        let result = write_image(
+            &OciConfig::new(),
+            &test_rootfs(),
+            &ImageOutput::Layout(layout.clone()),
+            &(),
+        )
+        .unwrap();
+        let layer = layout.join("blobs/sha256").join(result.layer_digest.hash());
+        assert_eq!(mode(&layer), mode(&reference));
     }
 
     #[test]

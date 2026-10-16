@@ -122,7 +122,7 @@ impl Layer {
         dir: &Path,
     ) -> Result<Self, OciError> {
         let err = |e: io::Error| OciError::LayerCreation(format!("failed to build tar: {e}"));
-        let file = NamedTempFile::new_in(dir).map_err(err)?;
+        let file = output_temp_file(dir).map_err(err)?;
 
         let compressed = HashingWriter::new(BufWriter::new(file));
         let tar = HashingWriter::new(compression.encoder(compressed).map_err(err)?);
@@ -183,6 +183,20 @@ impl Layer {
     pub fn media_type(&self) -> MediaType {
         self.compression.media_type()
     }
+}
+
+/// A temporary file in `dir` that becomes part of the output once renamed
+/// into place. tempfile creates files private (0600) and a rename keeps
+/// that, so we ask for 0666 instead, which the umask turns into what any
+/// other new file gets: the same as `fs::write`.
+pub(super) fn output_temp_file(dir: &Path) -> io::Result<NamedTempFile> {
+    let mut builder = tempfile::Builder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o666));
+    }
+    builder.tempfile_in(dir)
 }
 
 /// Write every rootfs node as a tar entry, in path order, to `out`.
