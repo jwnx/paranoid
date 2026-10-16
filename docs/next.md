@@ -89,6 +89,12 @@ That works, but it shows three gaps:
   catches it after the fact. Seven locks also verify the same five
   repositories seven times.
 
+Until paranoid handles this, the external check can detect the timing bug
+exactly. Every lock records the SHA-256 of each repository's `InRelease`
+in its `[[repository]]` table. If all seven locks show the same `inrelease`
+for `pgdg` and `pgdg-archive`, they resolved against the same state of
+PGDG. If any differ, re-lock them.
+
 What a fix needs to provide:
 
 - One set of repositories fetched and verified once per lock, so every
