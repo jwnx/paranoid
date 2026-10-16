@@ -189,6 +189,7 @@ fn test_resolver_fallback_to_arch_all() {
     let resolution = resolve(
         &index,
         &[Request::new("ca-certificates")],
+        &[],
         Architecture::Amd64,
     )
     .expect("Should resolve ca-certificates via arch:all");
