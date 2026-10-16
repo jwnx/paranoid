@@ -1,3 +1,5 @@
+paranoid = "~0.3"
+
 [image]
 name = "etcd"
 architecture = "arm64"
