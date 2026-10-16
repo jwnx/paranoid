@@ -93,6 +93,8 @@ v18.20.4
 A misspelled or unknown field makes paranoid reject the manifest.
 
 ```toml
+paranoid     = "~0.3"            # optional, the paranoid versions to use
+
 [image]
 name         = "node"            # optional, also the title label
 tag          = "latest"          # optional, defaults to latest
@@ -101,6 +103,7 @@ description  = "..."             # optional, OCI label
 authors      = "..."             # optional, OCI label
 source       = "..."             # optional, OCI label
 unconfigured = false             # optional, see BUILD
+output       = "node.tar"        # optional, see BUILD
 
 [repositories.debian]            # on a tie, the first repository wins
 url          = "https://deb.debian.org/debian"
@@ -119,6 +122,11 @@ cmd     = ["node"]               # becomes the image ENTRYPOINT
 workdir = "/app"
 env     = { NODE_ENV = "production" }
 ```
+
+Image digests depend on the paranoid that builds them as well as on the
+lock: a new release may compress differently. `paranoid` takes a Cargo
+version requirement, and every command refuses a manifest that the running
+binary doesn't meet, rather than quietly producing another digest.
 
 `signed_by` is required. It names a file of OpenPGP public keys, armored or
 binary, relative to the manifest; apt calls the same thing `Signed-By`.
@@ -241,7 +249,7 @@ packages = ["build-essential", "postgresql-server-dev-17"]
 ```
 
 An image may set `name`, `tag`, `description`, `authors`, `source`,
-`unconfigured` and `entrypoint`, which override `[defaults]`.
+`unconfigured`, `entrypoint` and `output`, which override `[defaults]`.
 `examples/postgres` is a small working set.
 
 `paranoid lock` fetches and verifies every repository once and resolves
@@ -257,8 +265,9 @@ image on its own, since that is how two images end up resolved against
 different states of a moving repository.
 
 `paranoid build` builds every image, or the ones named with `--image`.
-`{image}` in `-o` is replaced by the image's id, and is required when
-building more than one; the default is `{image}.tar`.
+`{image}` in `-o` or `output` is replaced by the image's id. `-o` needs it
+when building more than one image, and two images can't share an `output`;
+with neither, images go to `{image}.tar`.
 
 When the lock changes, `paranoid lock` lists what changed in which images,
 including a package that only moved into or out of one.
@@ -360,12 +369,13 @@ the same flag.
   next to the output, so a build needs about as much memory as the
   unpacked image. The compressor is fed fixed-size chunks, which keeps its
   output independent of how the tar writes fall.
-- Output is a tarball for `podman load` / `docker load` if `-o` ends in
-  `.tar`, otherwise an OCI image layout directory. Either is written next
-  to its destination and renamed into place, so a failed build leaves the
-  previous image as it was. A layout replaces the previous one whole,
-  stale blobs included, and only ever replaces a layout or an empty
-  directory.
+- Output goes to `-o`, else to the manifest's `output` (relative to the
+  manifest), else to `image.tar`. A path ending in `.tar` gets a tarball
+  for `podman load` / `docker load`, anything else an OCI image layout
+  directory. Either is written next to its destination and renamed into
+  place, so a failed build leaves the previous image as it was. A layout
+  replaces the previous one whole, stale blobs included, and only ever
+  replaces a layout or an empty directory.
 - A stale lock stops the build before anything is downloaded. That means
   the manifest changed since the lock was written, or none of the keys that
   signed it are in `signed_by` any more. `--allow-stale` builds from it

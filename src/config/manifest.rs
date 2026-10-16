@@ -1,8 +1,10 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 use indexmap::IndexMap;
+use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
@@ -20,6 +22,9 @@ use crate::version::VersionConstraint;
 /// repositories at the same time, into one lock.
 #[derive(Debug, Clone)]
 pub struct Manifest {
+    /// The paranoid versions this manifest builds with. Image digests
+    /// depend on the binary, so a manifest can insist on one.
+    pub paranoid: Option<VersionReq>,
     /// Repositories in declaration order. When several carry the same
     /// package at the same version, the earlier one wins.
     pub repositories: IndexMap<String, RepositoryConfig>,
@@ -35,6 +40,13 @@ pub struct Manifest {
     /// The directory paths in the manifest are relative to: the manifest's
     /// own directory, or the current directory when parsed from a string.
     dir: PathBuf,
+}
+
+/// The version of this paranoid.
+pub fn running_version() -> Version {
+    env!("CARGO_PKG_VERSION")
+        .parse()
+        .expect("Cargo.toml has a valid version")
 }
 
 /// The id of the image in a single-image manifest.
@@ -56,12 +68,17 @@ pub struct ImageSpec {
     /// What the image asks for, groups expanded.
     pub packages: Vec<PackageSpec>,
     pub entrypoint: Option<EntrypointConfig>,
+    /// Where `build` writes the image, as written: relative to the
+    /// manifest, with `{image}` standing for the image's id. See
+    /// [`Manifest::output`].
+    pub output: Option<String>,
 }
 
 /// A manifest as written, in either form.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawManifest {
+    paranoid: Option<String>,
     #[serde(default)]
     repositories: IndexMap<String, RepositoryConfig>,
     #[serde(default)]
@@ -94,6 +111,7 @@ struct RawImageConfig {
     source: Option<String>,
     #[serde(default)]
     unconfigured: bool,
+    output: Option<String>,
 }
 
 /// `[defaults]`: what every image of a set starts from.
@@ -108,6 +126,7 @@ struct RawDefaults {
     source: Option<String>,
     unconfigured: Option<bool>,
     entrypoint: Option<EntrypointConfig>,
+    output: Option<String>,
 }
 
 /// `[images.<id>]`.
@@ -125,11 +144,23 @@ struct RawImage {
     #[serde(default)]
     packages: Vec<String>,
     entrypoint: Option<EntrypointConfig>,
+    output: Option<String>,
 }
 
 impl RawManifest {
     fn into_manifest(self) -> Result<Manifest, ManifestError> {
         let invalid = |field, message: String| ManifestError::Validation { field, message };
+        let paranoid = self
+            .paranoid
+            .map(|req| {
+                req.parse::<VersionReq>().map_err(|e| {
+                    invalid(
+                        "paranoid",
+                        format!("'{req}' is not a version requirement: {e}"),
+                    )
+                })
+            })
+            .transpose()?;
         let single = self.image.is_some() || !self.packages.is_empty() || self.entrypoint.is_some();
         let set = self.defaults.is_some() || !self.groups.is_empty() || !self.images.is_empty();
         if single && set {
@@ -154,6 +185,7 @@ impl RawManifest {
                         unconfigured: i.unconfigured,
                         packages: self.packages,
                         entrypoint: self.entrypoint,
+                        output: i.output,
                     },
                 ),
                 None => (
@@ -166,6 +198,7 @@ impl RawManifest {
                 ),
             };
             return Ok(Manifest {
+                paranoid,
                 repositories: self.repositories,
                 holds: self.holds,
                 architecture,
@@ -219,6 +252,7 @@ impl RawManifest {
                     })
                     .collect(),
                 entrypoint: raw.entrypoint.or_else(|| defaults.entrypoint.clone()),
+                output: raw.output.or_else(|| defaults.output.clone()),
             };
             images.insert(id, image);
         }
@@ -230,6 +264,7 @@ impl RawManifest {
         }
 
         Ok(Manifest {
+            paranoid,
             repositories: self.repositories,
             holds: self.holds,
             architecture: defaults.architecture,
@@ -466,6 +501,12 @@ pub enum ManifestError {
     #[error("multiple config files found: {files:?}. Please keep only one.")]
     MultipleFound { files: Vec<PathBuf> },
 
+    #[error("this manifest requires paranoid {required}, but this is paranoid {running}")]
+    Version {
+        required: VersionReq,
+        running: Version,
+    },
+
     #[error("validation error in '{field}': {message}")]
     Validation {
         field: &'static str,
@@ -593,7 +634,26 @@ impl Manifest {
     fn from_raw(raw: RawManifest) -> Result<Self, ManifestError> {
         let manifest = raw.into_manifest()?;
         manifest.validate()?;
+        manifest.check_version(&running_version())?;
         Ok(manifest)
+    }
+
+    /// Fail unless `running` meets the manifest's `paranoid` requirement.
+    pub fn check_version(&self, running: &Version) -> Result<(), ManifestError> {
+        match &self.paranoid {
+            Some(required) if !required.matches(running) => Err(ManifestError::Version {
+                required: required.clone(),
+                running: running.clone(),
+            }),
+            _ => Ok(()),
+        }
+    }
+
+    /// Where `build` writes image `id`, if the manifest says: its `output`
+    /// with `{image}` replaced, relative to the manifest.
+    pub fn output(&self, id: &str) -> Option<PathBuf> {
+        let template = self.images.get(id)?.output.as_ref()?;
+        Some(self.resolve_path(Path::new(&template.replace("{image}", id))))
     }
 
     /// Whether the manifest describes a set of images (`[images.*]`).
@@ -673,6 +733,23 @@ impl Manifest {
                     message: format!(
                         "package '{}' is pinned to unknown repository '{}'",
                         pkg.name, repo
+                    ),
+                });
+            }
+        }
+
+        let mut outputs: HashMap<PathBuf, &str> = HashMap::new();
+        for id in self.images.keys() {
+            let Some(output) = self.output(id) else {
+                continue;
+            };
+            if let Some(other) = outputs.insert(output.clone(), id) {
+                return Err(ManifestError::Validation {
+                    field: "output",
+                    message: format!(
+                        "images '{other}' and '{id}' would both be written to '{}'; \
+                         put {{image}} in output",
+                        output.display()
                     ),
                 });
             }
@@ -873,6 +950,67 @@ entrypoint = { cmd = ["make"] }
             ))
             .contains("unknown field `architecture`")
         );
+    }
+
+    #[test]
+    fn outputs_come_from_defaults_or_the_image() {
+        let manifest = set(
+            "[defaults]\narchitecture = \"amd64\"\noutput = \"oci/{image}\"\n\n\
+             [images.a]\npackages = [\"bash\"]\n\n\
+             [images.b]\npackages = [\"bash\"]\noutput = \"b.tar\"\n",
+        )
+        .unwrap();
+        assert_eq!(manifest.output("a"), Some(PathBuf::from("oci/a")));
+        assert_eq!(manifest.output("b"), Some(PathBuf::from("b.tar")));
+        assert_eq!(manifest.output("c"), None);
+
+        let single = Manifest::from_str(&format!(
+            "{SET_REPOS}\n[image]\narchitecture = \"amd64\"\noutput = \"out\"\n\n\
+             [[packages]]\nname = \"bash\"\n"
+        ))
+        .unwrap();
+        assert_eq!(single.output(DEFAULT_IMAGE), Some(PathBuf::from("out")));
+    }
+
+    #[test]
+    fn two_images_cant_share_an_output() {
+        let err = set(
+            "[defaults]\narchitecture = \"amd64\"\noutput = \"image.tar\"\n\n\
+             [images.a]\npackages = [\"bash\"]\n\n[images.b]\npackages = [\"bash\"]\n",
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "validation error in 'output': images 'a' and 'b' would both be written to \
+             'image.tar'; put {image} in output"
+        );
+    }
+
+    #[test]
+    fn checks_the_required_paranoid_version() {
+        let with = |req: &str| {
+            Manifest::from_str(&format!(
+                "paranoid = \"{req}\"\n{SET_REPOS}\n[[packages]]\nname = \"bash\"\n"
+            ))
+        };
+        let running = running_version();
+        let compatible = format!("~{}.{}", running.major, running.minor);
+        assert!(with(&compatible).is_ok());
+
+        let manifest = with(&compatible).unwrap();
+        let err = manifest
+            .check_version(&Version::new(running.major, running.minor + 1, 0))
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "this manifest requires paranoid {compatible}, but this is paranoid {}.{}.0",
+                running.major,
+                running.minor + 1
+            )
+        );
+        assert!(with("=0.0.1").is_err());
+        assert!(with("not a version").is_err());
     }
 
     #[test]

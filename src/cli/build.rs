@@ -33,7 +33,8 @@ pub struct BuildArgs {
     /// Ends with `.tar` → writes a tarball loadable by `podman load` / `docker load`.
     /// Otherwise → writes an OCI image layout directory. `{image}` is
     /// replaced by the image's id, and is required when building several.
-    /// Defaults to `image.tar`, or `{image}.tar` for a set.
+    /// Defaults to the manifest's `output`, then to `image.tar`, or
+    /// `{image}.tar` for a set.
     #[arg(short, long, value_name = "PATH")]
     output: Option<PathBuf>,
 
@@ -102,20 +103,29 @@ pub async fn run(args: BuildArgs, quiet: bool) -> Result<(), CliError> {
             known.join(", ")
         )));
     }
-    let template = args.output.unwrap_or_else(|| {
-        PathBuf::from(if manifest.is_set() {
-            "{image}.tar"
-        } else {
-            "image.tar"
-        })
+    // `-o` wins, then each image's `output`, then `{image}.tar` here.
+    let default = PathBuf::from(if manifest.is_set() {
+        "{image}.tar"
+    } else {
+        "image.tar"
     });
-    if images.len() > 1 && !template.to_string_lossy().contains("{image}") {
-        return Err(CliError::output_template(&template));
+    let template = args.output.as_ref();
+    if let Some(template) = template
+        && images.len() > 1
+        && !template.to_string_lossy().contains("{image}")
+    {
+        return Err(CliError::output_template(template));
     }
+    let output_for = |id: &str| match template {
+        Some(t) => PathBuf::from(t.to_string_lossy().replace("{image}", id)),
+        None => manifest
+            .output(id)
+            .unwrap_or_else(|| PathBuf::from(default.to_string_lossy().replace("{image}", id))),
+    };
     let created = source_date_epoch()?;
 
     for id in &images {
-        let output = PathBuf::from(template.to_string_lossy().replace("{image}", id));
+        let output = output_for(id);
         let options = BuildOptions {
             download: DownloadConfig {
                 jobs: args.jobs,
