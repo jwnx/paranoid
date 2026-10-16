@@ -331,7 +331,7 @@ the same flag.
 
 ```
   lock ─▶ fetch ─▶ verify ─▶ unpack ─▶ rootfs ─▶ layer ─▶ image
-           │        sha256    data.tar  in memory  tar+gz   OCI
+           │        sha256    data.tar  in memory  streamed OCI
            └─ cache  <user cache dir>/paranoid/sha256/xx/<hash>.deb
                      (~/.cache on Linux, ~/Library/Caches on macOS)
 ```
@@ -351,6 +351,10 @@ the same flag.
 - Ownership, modes and link targets come from the packages. Every mtime is
   clamped and the image `created` time comes from `SOURCE_DATE_EPOCH`
   (default: the epoch).
+- The layer is streamed from the tree through gzip into a temporary file
+  next to the output, so a build needs about as much memory as the
+  unpacked image. The compressor is fed fixed-size chunks, which keeps its
+  output independent of how the tar writes fall.
 - Output is a tarball for `podman load` / `docker load` if `-o` ends in
   `.tar`, otherwise an OCI image layout directory.
 - A stale lock stops the build before anything is downloaded. That means

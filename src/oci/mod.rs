@@ -30,6 +30,7 @@
 
 mod digest;
 mod error;
+mod gzip;
 mod layer;
 mod layout;
 mod service;

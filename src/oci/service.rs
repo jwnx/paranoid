@@ -1,6 +1,7 @@
 //! OCI image configuration and generation.
 
 use std::fs;
+use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 
 use crate::arch::Architecture;
@@ -338,9 +339,10 @@ const IMAGE_STEPS: u64 = 3;
 
 /// Build a single-layer image from `rootfs` and write it to `output`.
 ///
-/// The image is assembled in memory as a sorted list of files (blobs,
-/// `oci-layout`, `index.json`) and then written out, so a layout directory
-/// and a tarball always hold byte-identical content.
+/// The image is assembled as a sorted list of files (blobs, `oci-layout`,
+/// `index.json`) and then written out, so a layout directory and a tarball
+/// always hold byte-identical content. The layer is streamed to a temporary
+/// file next to the output; everything else is small and kept in memory.
 pub fn write_image(
     config: &OciConfig,
     rootfs: &Rootfs,
@@ -359,7 +361,7 @@ pub fn write_image(
         total: IMAGE_STEPS,
     });
 
-    let layer = Layer::from_rootfs(rootfs, config.compression)?;
+    let layer = Layer::from_rootfs(rootfs, config.compression, &output.scratch_dir()?)?;
     step("layer");
 
     let image_config = serde_json::to_vec_pretty(&config.image_config(layer.diff_id()))?;
@@ -383,17 +385,20 @@ pub fn write_image(
     let total_size = layer.size() + image_config.len() as u64 + manifest.len() as u64;
     let layer_digest = *layer.digest();
     let blob = |digest: &Digest| format!("blobs/sha256/{}", digest.hash());
-    let mut files: Vec<(String, Vec<u8>)> = vec![
-        (blob(&layer_digest), layer.into_data()),
-        (blob(&config_digest), image_config),
-        (blob(&manifest_digest), manifest),
-        ("oci-layout".to_string(), serde_json::to_vec(&OciLayout)?),
-        ("index.json".to_string(), index),
+    let mut files: Vec<(String, Content)> = vec![
+        (blob(&layer_digest), Content::Layer(layer)),
+        (blob(&config_digest), Content::Bytes(image_config)),
+        (blob(&manifest_digest), Content::Bytes(manifest)),
+        (
+            "oci-layout".to_string(),
+            Content::Bytes(serde_json::to_vec(&OciLayout)?),
+        ),
+        ("index.json".to_string(), Content::Bytes(index)),
     ];
-    files.sort();
+    files.sort_by(|a, b| a.0.cmp(&b.0));
 
     match output {
-        ImageOutput::Layout(dir) => write_layout(dir, &files)?,
+        ImageOutput::Layout(dir) => write_layout(dir, files)?,
         ImageOutput::Tarball(path) => write_tarball(path, &files)?,
     }
     step("write");
@@ -411,6 +416,30 @@ pub fn write_image(
         layer_digest,
         total_size,
     })
+}
+
+/// The contents of one file of an image.
+enum Content {
+    Bytes(Vec<u8>),
+    Layer(Layer),
+}
+
+impl ImageOutput {
+    /// Where to stage the layer: on the filesystem the image goes to.
+    fn scratch_dir(&self) -> Result<PathBuf, OciError> {
+        let dir = match self {
+            ImageOutput::Layout(dir) => dir.as_path(),
+            ImageOutput::Tarball(path) => match path.parent() {
+                Some(p) if !p.as_os_str().is_empty() => p,
+                _ => Path::new("."),
+            },
+        };
+        fs::create_dir_all(dir).map_err(|source| OciError::CreateOutputDir {
+            path: dir.to_path_buf(),
+            source,
+        })?;
+        Ok(dir.to_path_buf())
+    }
 }
 
 impl OciConfig {
@@ -463,8 +492,8 @@ impl OciConfig {
     }
 }
 
-fn write_layout(dir: &Path, files: &[(String, Vec<u8>)]) -> Result<(), OciError> {
-    for (name, data) in files {
+fn write_layout(dir: &Path, files: Vec<(String, Content)>) -> Result<(), OciError> {
+    for (name, content) in files {
         let path = dir.join(name);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|source| OciError::CreateOutputDir {
@@ -472,14 +501,18 @@ fn write_layout(dir: &Path, files: &[(String, Vec<u8>)]) -> Result<(), OciError>
                 source,
             })?;
         }
-        fs::write(&path, data).map_err(|source| OciError::WriteFile { path, source })?;
+        match content {
+            Content::Bytes(data) => fs::write(&path, data),
+            Content::Layer(layer) => layer.persist(&path),
+        }
+        .map_err(|source| OciError::WriteFile { path, source })?;
     }
     Ok(())
 }
 
 /// Write the layout as a tarball with fixed metadata, through a temp file
 /// in the same directory so a failed write never leaves a partial image.
-fn write_tarball(path: &Path, files: &[(String, Vec<u8>)]) -> Result<(), OciError> {
+fn write_tarball(path: &Path, files: &[(String, Content)]) -> Result<(), OciError> {
     let write_err = |source| OciError::WriteFile {
         path: path.to_path_buf(),
         source,
@@ -490,7 +523,7 @@ fn write_tarball(path: &Path, files: &[(String, Vec<u8>)]) -> Result<(), OciErro
     };
 
     let temp = tempfile::NamedTempFile::new_in(dir).map_err(write_err)?;
-    let mut builder = tar::Builder::new(temp);
+    let mut builder = tar::Builder::new(BufWriter::new(temp));
 
     let header = |kind, mode, size| {
         let mut h = tar::Header::new_gnu();
@@ -511,14 +544,26 @@ fn write_tarball(path: &Path, files: &[(String, Vec<u8>)]) -> Result<(), OciErro
             )
             .map_err(write_err)?;
     }
-    for (name, data) in files {
-        let mut h = header(tar::EntryType::Regular, 0o644, data.len() as u64);
-        builder
-            .append_data(&mut h, name, data.as_slice())
-            .map_err(write_err)?;
+    for (name, content) in files {
+        match content {
+            Content::Bytes(data) => {
+                let mut h = header(tar::EntryType::Regular, 0o644, data.len() as u64);
+                builder.append_data(&mut h, name, data.as_slice())
+            }
+            Content::Layer(layer) => {
+                let mut h = header(tar::EntryType::Regular, 0o644, layer.size());
+                layer
+                    .reader()
+                    .and_then(|r| builder.append_data(&mut h, name, r))
+            }
+        }
+        .map_err(write_err)?;
     }
 
-    let temp = builder.into_inner().map_err(write_err)?;
+    let temp = builder
+        .into_inner()
+        .and_then(|w| w.into_inner().map_err(|e| e.into_error()))
+        .map_err(write_err)?;
     temp.persist(path).map_err(|e| write_err(e.error))?;
     Ok(())
 }

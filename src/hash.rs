@@ -5,6 +5,7 @@
 //! a `sha256:` prefix on top, see [`crate::oci::Digest`]).
 
 use std::fmt;
+use std::io::{self, Write};
 use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
@@ -28,6 +29,42 @@ impl Sha256 {
 
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+}
+
+/// A writer that hashes and counts what passes through it on the way to
+/// `inner`.
+pub struct HashingWriter<W> {
+    inner: W,
+    hasher: sha2::Sha256,
+    len: u64,
+}
+
+impl<W: Write> HashingWriter<W> {
+    pub fn new(inner: W) -> Self {
+        Self {
+            inner,
+            hasher: sha2::Sha256::new(),
+            len: 0,
+        }
+    }
+
+    /// The inner writer, and the hash and length of everything written.
+    pub fn finish(self) -> (W, Sha256, u64) {
+        (self.inner, Sha256(self.hasher.finalize().into()), self.len)
+    }
+}
+
+impl<W: Write> Write for HashingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        self.len += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -97,6 +134,17 @@ mod tests {
         ] {
             assert!(bad.parse::<Sha256>().is_err(), "accepted {bad:?}");
         }
+    }
+
+    #[test]
+    fn hashing_writer_matches_hashing_at_once() {
+        let mut writer = HashingWriter::new(Vec::new());
+        writer.write_all(b"hello ").unwrap();
+        writer.write_all(b"world").unwrap();
+        let (data, hash, len) = writer.finish();
+        assert_eq!(data, b"hello world");
+        assert_eq!(hash, Sha256::of(b"hello world"));
+        assert_eq!(len, 11);
     }
 
     #[test]
