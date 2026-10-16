@@ -79,7 +79,7 @@ pub async fn run(args: LockArgs, quiet: bool) -> Result<(), CliError> {
     }
 
     let lock = LockFile::from_resolved(&manifest, resolved);
-    if !lock.unmet.is_empty() && !quiet {
+    if lock.unmet().next().is_some() && !quiet {
         // Finish the progress line before the warning or error.
         eprintln!();
     }
@@ -88,9 +88,13 @@ pub async fn run(args: LockArgs, quiet: bool) -> Result<(), CliError> {
 
     if !quiet {
         let changes = existing.as_ref().map(|old| old.diff(&lock));
+        let packages = match lock.images.len() {
+            1 => format!("{} packages", lock.packages.len()),
+            n => format!("{} packages in {n} images", lock.packages.len()),
+        };
         match changes.as_deref() {
-            None => eprintln!("({} packages)", lock.packages.len()),
-            Some([]) => eprintln!("({} packages, no changes)", lock.packages.len()),
+            None => eprintln!("({packages})"),
+            Some([]) => eprintln!("({packages}, no changes)"),
             Some(changes) => {
                 let count = |pred: fn(&Change) -> bool| changes.iter().filter(|c| pred(c)).count();
                 eprintln!(
@@ -111,10 +115,22 @@ pub async fn run(args: LockArgs, quiet: bool) -> Result<(), CliError> {
 /// Fail on unmet dependencies unless they are allowed, in which case warn
 /// about each one.
 pub fn check_unmet(lock: &LockFile, allow: bool) -> Result<(), CliError> {
-    if !allow && !lock.unmet.is_empty() {
-        return Err(CliError::unmet(&lock.unmet));
+    // Name the image only when there's more than one.
+    let several = lock.images.len() > 1;
+    let unmet: Vec<String> = lock
+        .unmet()
+        .map(|(image, unmet)| {
+            if several {
+                format!("image '{image}': {unmet}")
+            } else {
+                unmet.to_string()
+            }
+        })
+        .collect();
+    if !allow && !unmet.is_empty() {
+        return Err(CliError::unmet(&unmet));
     }
-    for unmet in &lock.unmet {
+    for unmet in &unmet {
         st::warning(format!("unmet dependency: {unmet}"));
     }
     Ok(())

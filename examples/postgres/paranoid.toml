@@ -1,0 +1,28 @@
+# Two images from one resolution: a PostgreSQL server, and the headers to
+# build extensions for it. They share one lock, so the headers always
+# match the server that loads what they build.
+
+[repositories.debian]
+url = "https://deb.debian.org/debian"
+distribution = "bookworm"
+components = ["main"]
+signed_by = "../keys/debian-archive-bookworm-automatic.asc"
+
+[defaults]
+architecture = "arm64"
+
+[groups]
+base = ["bash", "coreutils"]
+
+[images.server]
+name = "postgres"
+groups = ["base"]
+packages = ["postgresql-15"]
+
+[images.builder]
+name = "postgres-builder"
+groups = ["base"]
+packages = ["postgresql-server-dev-15", "make"]
+
+[images.server.entrypoint]
+cmd = ["/usr/lib/postgresql/15/bin/postgres"]

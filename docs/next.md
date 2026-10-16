@@ -50,95 +50,27 @@ checks paranoid against apt. What's left:
   signature, which for Debian is a subkey; the primary fingerprint would be
   friendlier, but we can't know it without the key.
 
-## 3. Several images from one resolution
+## 3. Image sets
 
-A manifest describes one image and a lock records one resolution. Real
-users build families of images from the same repositories, and paranoid
-gives them no way to say so.
+One manifest can describe several images (`[defaults]`, `[groups]`,
+`[images.*]`), resolved against the same repository snapshots into one
+lock, with one version per package across the set, holds that apply to
+every image, and binaries of one source required to share a source
+version. The MPG data plane's seven bases lock as one set: identical to
+their separate locks except for two GDAL packages the source rule caught,
+and building `pg17` and `pgbackrest-server` from the set gives the same
+image digests as from their own locks. What's left:
 
-The first user is the MPG data plane (superfly/mpg, `build/paranoid` on
-the `jwnx-exp-paranoid-dataplane-images` worktree). It builds seven bases:
-the pg16 and pg17 runtimes, each with and without PostGIS, a builder per
-PostgreSQL major that compiles extensions for the matching runtime, and
-the pgBackRest repository server. All seven use the same five repositories
-(three suites of a snapshot.debian.org snapshot, PGDG, and PGDG's
-apt-archive at priority 100), the same keys and the same 28 essential
-packages. Today a Python script writes the seven manifests, a shell script
-runs `lock` and `build` in each directory, and the same Python script
-checks the seven locks against each other afterwards.
-
-That works, but it shows three gaps:
-
-- **Duplication.** Repositories, keys and package sets are repeated in
-  every manifest, because there is no include or inheritance.
-- **Agreement between images.** Some packages must be identical across
-  images, and only a check outside paranoid enforces it:
-  - pgBackRest must be the same version on the repository host and on
-    every database host. It is held (`version = "..."`), and the hold is
-    repeated in five manifests.
-  - Extensions are built against the builder's
-    `postgresql-server-dev-17` and loaded by the runtime's
-    `postgresql-17`. They are different binary packages from the same
-    source package, and must be the same build.
-- **Resolving at different times.** This is the real bug. Each lock
-  fetches and verifies every repository's `InRelease` on its own. For
-  snapshot.debian.org that's harmless, since a snapshot never changes. PGDG
-  has no snapshots, though. If PGDG publishes 17.12 between locking
-  `pg17-builder` and locking `pg17`, the builder gets 17.12 headers and the
-  runtime gets 17.11, and nothing in paranoid notices. The external check
-  catches it after the fact. Seven locks also verify the same five
-  repositories seven times.
-
-Until paranoid handles this, the external check can detect the timing bug
-exactly. Every lock records the SHA-256 of each repository's `InRelease`
-in its `[[repository]]` table. If all seven locks show the same `inrelease`
-for `pgdg` and `pgdg-archive`, they resolved against the same state of
-PGDG. If any differ, re-lock them.
-
-What a fix needs to provide:
-
-- One set of repositories fetched and verified once per lock, so every
-  image resolves against the same snapshot of each repository, recorded
-  once.
-- A way to share repositories, keys and package lists between images
-  without copying them.
-- Holds that apply across images, defined once.
-- Each image still gets exactly its own dependency closure: the builder's
-  compilers must not leak into a runtime.
-- A clear answer when two images need incompatible versions of the same
-  package. For example, Cargo's unified lock allows one version per package
-  across the workspace and reports a conflict instead of choosing.
-- `build` of a single image, and of all of them.
-- Arguably, a generic form of the server/server-dev rule: binary packages
-  built from the same source package should come from the same *source
-  version* across the set. That's the version in `Source: name (version)`,
-  or the package's own version when the field has none. The binary
-  versions themselves can't be compared: a binNMU rebuilds some binaries
-  without a new source and gives them a `+bN` suffix, so in bookworm main
-  1,794 of 34,171 sources ship binaries at different versions
-  (`libcaf-dev` is `0.17.6-2.1+b1`, `libcaf-doc` from the same source is
-  `0.17.6-2.1`). The rule holds naturally when everything resolves from
-  one snapshot, but stating it turns a silent mismatch (say, from a hold
-  on only one of the binaries) into an error.
-
-Questions to settle:
-
-- Is this one manifest with several `[images.*]` tables, or several
-  manifests that include a shared one? Includes solve the duplication but
-  not the timing; one lock for the set solves both.
-- Is the unit of locking the whole set, or can one image be re-locked
-  alone? With PGDG moving, re-locking alone reintroduces the timing bug.
-- How does the config hash and staleness work when one image's package list
-  changes? Is the whole lock stale, or only that image?
-- What does `inspect lock` show, and what does the lock diff look like for
-  review, when one change touches several images?
-- Per-image settings (`unconfigured`, entrypoint, name, architecture): can
-  images in one set differ in architecture? MPG only needs amd64 today.
-
-Out of scope: what the MPG images do after paranoid builds them. Creating
-the postgres user with a fixed uid, `create_main_cluster = false` and the
-locale are set up by MPG's own `configure.sh`, which runs `dpkg --configure`
-in a Dockerfile, and that stays there.
+- Images are resolved in manifest order, and the first image to select a
+  package fixes its version. A later image that needs another version is
+  an error rather than a reason to choose differently. A joint search over
+  every image would find more solutions, at the resolver's cost (see
+  section 1).
+- The lock diff is by package. A change that only moves a package in or
+  out of one image doesn't show which.
+- Architecture is set-wide. A multi-architecture set would need one
+  resolution per architecture, and a rule for what "one version" means
+  across them.
 
 ## 4. Smaller cleanups
 

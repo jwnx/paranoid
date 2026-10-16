@@ -13,8 +13,10 @@ use crate::hash::{ParseSha256Error, Sha256};
 use crate::http::{Client, ClientError};
 use crate::repository::debian::{
     DebianPackage, DebianRepository, DebianRepositoryError, Fingerprint, Hold, Keyring,
-    KeyringError, Origin, PackageIndexSet, Request, ResolveError, UnmetDependency, resolve,
+    KeyringError, Origin, PackageIndexSet, Request, ResolveError, UnmetDependency, check_sources,
+    resolve,
 };
+use crate::version::{VersionConstraint, VersionRelation};
 
 /// Errors that can occur during resolution.
 #[derive(Debug, Error)]
@@ -40,6 +42,13 @@ pub enum ResolveServiceError {
     #[error("resolve error: {0}")]
     Resolve(#[from] ResolveError),
 
+    #[error("image '{image}': {source}")]
+    Image {
+        image: String,
+        #[source]
+        source: ResolveError,
+    },
+
     #[error("the hold on '{name}' matches no package in the resolution")]
     UnusedHold { name: String },
 
@@ -62,9 +71,6 @@ pub struct ResolvedPackage {
     pub size: u64,
     /// The repository this package came from.
     pub repository: String,
-    /// Whether this package was requested directly in the manifest
-    /// (`true`) or pulled in as a transitive dependency (`false`).
-    pub direct: bool,
 }
 
 impl ResolvedPackage {
@@ -75,7 +81,6 @@ impl ResolvedPackage {
     pub fn from_debian_package(
         pkg: &DebianPackage,
         repository: impl Into<String>,
-        direct: bool,
     ) -> Result<Self, ResolveServiceError> {
         let sha256 = pkg
             .sha256
@@ -92,7 +97,6 @@ impl ResolvedPackage {
             filename: pkg.filename.clone(),
             size: pkg.size,
             repository: repository.into(),
-            direct,
         })
     }
 }
@@ -110,17 +114,30 @@ pub struct ResolvedRepository {
     pub signed_by: Vec<Fingerprint>,
 }
 
-/// The complete resolution result.
+/// One image's part of a resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedImage {
+    /// The image's id in the manifest.
+    pub id: String,
+    /// Every package in the image, sorted.
+    pub packages: Vec<String>,
+    /// The packages the manifest asks for, sorted.
+    pub direct: Vec<String>,
+    /// Dependency graph: parent name → sorted list of child names.
+    pub graph: BTreeMap<String, Vec<String>>,
+    /// Dependencies nothing in the repositories satisfies.
+    pub unmet: Vec<UnmetDependency>,
+}
+
+/// The complete resolution of a manifest's images.
 #[derive(Debug)]
 pub struct ResolvedManifest {
     /// The repository snapshots, in manifest order.
     pub repositories: Vec<ResolvedRepository>,
-    /// All resolved packages (including transitive dependencies).
+    /// Every package of every image, one version per name, sorted by name.
     pub packages: Vec<ResolvedPackage>,
-    /// Dependencies nothing in the repositories satisfies.
-    pub unmet: Vec<UnmetDependency>,
-    /// Dependency graph: parent name → sorted list of child names.
-    pub graph: BTreeMap<String, Vec<String>>,
+    /// The images, in manifest order.
+    pub images: Vec<ResolvedImage>,
 }
 
 /// Service for resolving packages from a manifest.
@@ -147,10 +164,7 @@ impl ResolveService {
     ) -> Result<ResolvedManifest, ResolveServiceError> {
         // Repository presence, pins and architecture were validated when
         // the manifest was parsed.
-        let arch = manifest
-            .image
-            .as_ref()
-            .map_or(Architecture::Amd64, |i| i.architecture);
+        let arch = manifest.architecture;
 
         let now = Utc::now();
 
@@ -188,7 +202,51 @@ impl ResolveService {
             });
         }
 
-        let requests: Vec<Request> = manifest
+        let (images, chosen) = resolve_images(&index_set, manifest)?;
+        let packages = chosen
+            .iter()
+            .map(|(package, repository)| ResolvedPackage::from_debian_package(package, *repository))
+            .collect::<Result<_, _>>()?;
+
+        Ok(ResolvedManifest {
+            repositories,
+            packages,
+            images,
+        })
+    }
+}
+
+/// Every package any image selected, with the repository it came from,
+/// sorted by name.
+type Selected<'a> = Vec<(&'a DebianPackage, &'a str)>;
+
+/// Resolve every image of `manifest` against `index_set`, in manifest
+/// order.
+fn resolve_images<'a>(
+    index_set: &'a PackageIndexSet,
+    manifest: &Manifest,
+) -> Result<(Vec<ResolvedImage>, Selected<'a>), ResolveServiceError> {
+    let arch = manifest.architecture;
+    let holds: Vec<Hold> = manifest
+        .holds
+        .iter()
+        .map(|(name, hold)| Hold {
+            name: name.clone(),
+            version: hold.version.clone(),
+            repository: hold.repository.clone(),
+            origin: Origin::Hold,
+        })
+        .collect();
+
+    // Images resolve in manifest order against the same indexes. Each
+    // package keeps the version (and repository) the first image to
+    // select it chose: later images get that as a hold, so a package
+    // has one version across the set, and a later image that can't
+    // live with it is a conflict naming the image that chose it.
+    let mut chosen: BTreeMap<&str, (&DebianPackage, &str, &str)> = BTreeMap::new();
+    let mut images = Vec::new();
+    for (id, image) in &manifest.images {
+        let requests: Vec<Request> = image
             .packages
             .iter()
             .map(|spec| Request {
@@ -197,45 +255,229 @@ impl ResolveService {
                 repository: spec.repository.clone(),
             })
             .collect();
+        let mut image_holds = holds.clone();
+        image_holds.extend(chosen.values().map(|&(package, repository, by)| Hold {
+            name: package.name.clone(),
+            version: Some(VersionConstraint::new(
+                VersionRelation::Equal,
+                package.version.clone(),
+            )),
+            repository: Some(repository.to_string()),
+            origin: Origin::Image(by.to_string()),
+        }));
 
-        let holds: Vec<Hold> = manifest
-            .holds
-            .iter()
-            .map(|(name, hold)| Hold {
-                name: name.clone(),
-                version: hold.version.clone(),
-                repository: hold.repository.clone(),
-                origin: Origin::Hold,
-            })
-            .collect();
+        let resolution = resolve(index_set, &requests, &image_holds, arch).map_err(|source| {
+            if manifest.is_set() {
+                ResolveServiceError::Image {
+                    image: id.clone(),
+                    source,
+                }
+            } else {
+                ResolveServiceError::Resolve(source)
+            }
+        })?;
 
-        let resolution = resolve(&index_set, &requests, &holds, arch)?;
-        // A hold on nothing is most likely a misspelled name.
-        if let Some(name) = manifest
-            .holds
-            .keys()
-            .find(|name| !resolution.packages.iter().any(|r| &r.package.name == *name))
-        {
-            return Err(ResolveServiceError::UnusedHold { name: name.clone() });
+        for r in &resolution.packages {
+            chosen
+                .entry(r.package.name.as_str())
+                .or_insert((r.package, r.repository, id.as_str()));
         }
-        let packages = resolution
-            .packages
-            .iter()
-            .map(|r| ResolvedPackage::from_debian_package(r.package, r.repository, r.direct))
-            .collect::<Result<_, _>>()?;
-
-        Ok(ResolvedManifest {
-            repositories,
-            packages,
-            unmet: resolution.unmet,
+        images.push(ResolvedImage {
+            id: id.clone(),
+            packages: resolution
+                .packages
+                .iter()
+                .map(|r| r.package.name.clone())
+                .collect(),
+            direct: resolution
+                .packages
+                .iter()
+                .filter(|r| r.direct)
+                .map(|r| r.package.name.clone())
+                .collect(),
             graph: resolution.graph,
-        })
+            unmet: resolution.unmet,
+        });
     }
+
+    // Each image checked its own sources; the set must agree too.
+    check_sources(chosen.values().map(|(package, _, _)| *package))?;
+
+    // A hold on nothing is most likely a misspelled name.
+    if let Some(name) = manifest
+        .holds
+        .keys()
+        .find(|name| !chosen.contains_key(name.as_str()))
+    {
+        return Err(ResolveServiceError::UnusedHold { name: name.clone() });
+    }
+
+    let chosen = chosen
+        .into_values()
+        .map(|(package, repository, _)| (package, repository))
+        .collect();
+    Ok((images, chosen))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use super::*;
+    use crate::repository::debian::PackageIndex;
+
+    /// An index from `Packages`-style stanzas, amd64 unless they say.
+    fn index(stanzas: &str) -> PackageIndexSet {
+        let text: String = stanzas
+            .split("\n\n")
+            .map(|stanza| {
+                let mut stanza = stanza.trim().to_string();
+                if !stanza.contains("Architecture:") {
+                    stanza.push_str("\nArchitecture: amd64");
+                }
+                format!("{stanza}\nFilename: pool/x.deb\n\n")
+            })
+            .collect();
+        let mut set = PackageIndexSet::new();
+        set.add_index("debian".into(), PackageIndex::from_str(&text).unwrap());
+        set
+    }
+
+    fn manifest(rest: &str) -> Manifest {
+        Manifest::from_str(&format!(
+            "[repositories.debian]\nurl = \"https://deb.debian.org/debian\"\n\
+             distribution = \"trixie\"\ncomponents = [\"main\"]\nsigned_by = \"k.asc\"\n\n\
+             [defaults]\narchitecture = \"amd64\"\n\n{rest}"
+        ))
+        .unwrap()
+    }
+
+    fn versions(selected: &Selected<'_>) -> Vec<String> {
+        selected
+            .iter()
+            .map(|(p, _)| format!("{}={}", p.name, p.version))
+            .collect()
+    }
+
+    const POSTGRES: &str = "\
+Package: libc6\nVersion: 2.41\n\n\
+Package: postgresql-17\nVersion: 17.11-1\nDepends: libc6\n\n\
+Package: postgresql-17\nVersion: 17.12-1\nDepends: libc6\n\n\
+Package: postgresql-server-dev-17\nSource: postgresql-17\nVersion: 17.11-1\n\n\
+Package: postgresql-server-dev-17\nSource: postgresql-17\nVersion: 17.12-1\n\n\
+Package: gcc\nVersion: 14.2\nDepends: libc6";
+
+    #[test]
+    fn each_image_gets_its_own_closure_with_shared_versions() {
+        let set = index(POSTGRES);
+        let manifest = manifest(
+            "[images.runtime]\npackages = [\"postgresql-17\"]\n\n\
+             [images.builder]\npackages = [\"postgresql-server-dev-17\", \"gcc\"]\n",
+        );
+        let (images, selected) = resolve_images(&set, &manifest).unwrap();
+        assert_eq!(images[0].id, "runtime");
+        assert_eq!(images[0].packages, ["libc6", "postgresql-17"]);
+        // The builder's compiler doesn't leak into the runtime.
+        assert_eq!(
+            images[1].packages,
+            ["gcc", "libc6", "postgresql-server-dev-17"]
+        );
+        assert_eq!(images[1].direct, ["gcc", "postgresql-server-dev-17"]);
+        assert_eq!(
+            versions(&selected),
+            [
+                "gcc=14.2",
+                "libc6=2.41",
+                "postgresql-17=17.12-1",
+                "postgresql-server-dev-17=17.12-1",
+            ]
+        );
+    }
+
+    /// A hold on only the headers would build extensions for a server the
+    /// runtime doesn't have. Each image is consistent on its own; only the
+    /// set isn't.
+    #[test]
+    fn the_source_rule_spans_images() {
+        let set = index(POSTGRES);
+        let manifest = manifest(
+            "[holds]\npostgresql-server-dev-17 = \"= 17.11-1\"\n\n\
+             [images.runtime]\npackages = [\"postgresql-17\"]\n\n\
+             [images.builder]\npackages = [\"postgresql-server-dev-17\"]\n",
+        );
+        let err = resolve_images(&set, &manifest).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "resolve error: 'postgresql-17' and 'postgresql-server-dev-17' were built from \
+             different versions of source package 'postgresql-17': 17.12-1 and 17.11-1; hold \
+             one of them to the other's version or repository"
+        );
+    }
+
+    #[test]
+    fn a_later_image_cant_pick_another_version() {
+        let set = index(POSTGRES);
+        let versioned = manifest(
+            "[images.runtime]\npackages = [\"postgresql-17\"]\n\n\
+             [images.old]\npackages = [\"postgresql-17 (<< 17.12)\"]\n",
+        );
+        // Image packages are names; versions go through holds. A name with
+        // a version in it simply isn't a package.
+        assert!(resolve_images(&set, &versioned).is_err());
+
+        let grouped = manifest(
+            "[groups]\nserver = [\"postgresql-17\"]\n\n\
+             [images.runtime]\ngroups = [\"server\"]\n\n\
+             [images.builder]\npackages = [\"postgresql-server-dev-17\"]\n",
+        );
+        let (_, selected) = resolve_images(&set, &grouped).unwrap();
+        assert!(versions(&selected).contains(&"postgresql-17=17.12-1".to_string()));
+    }
+
+    #[test]
+    fn a_conflict_names_the_image_that_chose_the_version() {
+        let set = index(
+            "Package: libpq5\nVersion: 17\n\n\
+             Package: libpq5\nVersion: 18\n\n\
+             Package: old-client\nVersion: 1\nDepends: libpq5 (<< 18)",
+        );
+        let manifest = manifest(
+            "[images.new]\npackages = [\"libpq5\"]\n\n\
+             [images.old]\npackages = [\"old-client\"]\n",
+        );
+        assert_eq!(
+            resolve_images(&set, &manifest).unwrap_err().to_string(),
+            "image 'old': no version of 'libpq5' satisfies every requirement: \
+             (= 18) from image 'new', (<< 18) from old-client"
+        );
+    }
+
+    #[test]
+    fn holds_apply_across_images_and_must_be_used() {
+        let set = index(POSTGRES);
+        let held = manifest(
+            "[holds]\npostgresql-17 = \"= 17.11-1\"\npostgresql-server-dev-17 = \"= 17.11-1\"\n\n\
+             [images.runtime]\npackages = [\"postgresql-17\"]\n\n\
+             [images.builder]\npackages = [\"postgresql-server-dev-17\"]\n",
+        );
+        let (_, selected) = resolve_images(&set, &held).unwrap();
+        assert_eq!(
+            versions(&selected),
+            [
+                "libc6=2.41",
+                "postgresql-17=17.11-1",
+                "postgresql-server-dev-17=17.11-1",
+            ]
+        );
+
+        let typo = manifest(
+            "[holds]\npostgresql-18 = \"= 18.1-1\"\n\n[images.runtime]\npackages = [\"postgresql-17\"]\n",
+        );
+        assert_eq!(
+            resolve_images(&set, &typo).unwrap_err().to_string(),
+            "the hold on 'postgresql-18' matches no package in the resolution"
+        );
+    }
 
     #[test]
     fn test_resolve_service_creation() {

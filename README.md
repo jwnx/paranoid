@@ -63,10 +63,10 @@ If you want a shell in the image, add one, like `bash`, to the package list.
 
 ```
 paranoid lock    [-f MANIFEST] [-o LOCK] [--force] [--allow-unmet]
-paranoid build   [-f MANIFEST] [--lock LOCK] [-o OUT] [--cache-dir DIR]
-                 [--jobs N] [--force-download] [--allow-stale]
-                 [--allow-unmet]
-paranoid inspect lock  [FILE] [--tree]
+paranoid build   [-f MANIFEST] [--lock LOCK] [-o OUT] [--image ID]...
+                 [--cache-dir DIR] [--jobs N] [--force-download]
+                 [--allow-stale] [--allow-unmet]
+paranoid inspect lock  [FILE] [--tree] [--image ID]
 paranoid inspect image [PATH]
 ```
 
@@ -206,6 +206,58 @@ Architectures take Debian names or the usual aliases (`x86_64`, `aarch64`,
 (`armel` → `arm/v5`, `armhf` → `arm/v7`). `all` and `any` are not real
 targets and are rejected.
 
+## IMAGE SETS
+
+Images built from the same repositories usually have to agree with each
+other. A database server and the image that compiles its extensions need
+the same server headers, and a backup tool needs the same version on every
+host. One manifest can describe the whole family, and one lock then covers
+it:
+
+```toml
+[repositories.debian]                    # shared, as before
+...
+
+[defaults]                               # every image starts from these
+architecture = "amd64"                   # one architecture for the set
+unconfigured = true
+
+[holds]                                  # apply to every image
+pgbackrest = "= 2.58.0-1.pgdg13+1"
+
+[groups]                                 # named package lists
+essential = ["base-files", "bash", "coreutils", ...]
+runtime   = ["locales", "pgbackrest", ...]
+
+[images.pg17]
+name     = "mpg-pg17-base"
+groups   = ["essential", "runtime"]
+packages = ["postgresql-17"]
+
+[images.pg17-builder]
+name     = "mpg-pg17-builder-base"
+groups   = ["essential"]
+packages = ["build-essential", "postgresql-server-dev-17"]
+```
+
+An image may set `name`, `tag`, `description`, `authors`, `source`,
+`unconfigured` and `entrypoint`, which override `[defaults]`.
+`examples/postgres` is a small working set.
+
+`paranoid lock` fetches and verifies every repository once and resolves
+each image against that same state, in manifest order. A package has one
+version across the set: whichever image selects it first fixes its version
+for the rest, and an image that can't live with that version is an error
+naming the image that chose it. Each image still gets exactly its own
+dependencies, so a builder's compilers never reach a runtime image. The
+whole set locks together and goes stale together; there's no re-locking one
+image on its own, since that is how two images end up resolved against
+different states of a moving repository.
+
+`paranoid build` builds every image, or the ones named with `--image`.
+`{image}` in `-o` is replaced by the image's id, and is required when
+building more than one; the default is `{image}.tar`.
+
 ## LOCK
 
 `paranoid lock` fetches each repository's `InRelease` and checks its
@@ -230,8 +282,20 @@ sha256       = "01f4330719fd4f65580e16ea5a0527f372fca750e8f588d26deaf09f2d3b1cf4
 filename     = "pool/main/g/glibc/libc6_2.36-9+deb12u14_arm64.deb"
 size         = 2324660
 repository   = "debian"
-direct       = false
+
+[[image]]
+name     = "default"
+packages = ["gcc-12-base", "libbrotli1", "libc-ares2", "libc6", ...]
+direct   = ["nodejs"]
+
+[[image.dep]]
+parent   = "nodejs"
+children = ["libc6", "libnode108"]
 ```
+
+Each package is listed once. Each `[[image]]` names the packages it
+contains, the ones the manifest asked for, and its dependency graph. A
+single-image manifest has one image, `default`; a set has one per image.
 
 Each `[[repository]]` records the snapshot the packages came from: the
 Release's date, the SHA-256 of the `InRelease` file as served, and the keys

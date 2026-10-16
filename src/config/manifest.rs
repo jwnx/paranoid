@@ -11,34 +11,40 @@ use crate::arch::Architecture;
 use crate::repository::DebianVersion;
 use crate::version::VersionConstraint;
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// A manifest: repositories, holds, and the images built from them.
+///
+/// A manifest describes either one image (`[image]` and `[[packages]]`) or
+/// a set of them (`[defaults]`, `[groups]` and `[images.<id>]`). Either way
+/// it's a set: a single image is the set of one, with the id
+/// [`DEFAULT_IMAGE`]. Every image of a set resolves against the same
+/// repositories at the same time, into one lock.
+#[derive(Debug, Clone)]
 pub struct Manifest {
-    pub image: Option<ImageConfig>,
     /// Repositories in declaration order. When several carry the same
     /// package at the same version, the earlier one wins.
-    #[serde(default)]
     pub repositories: IndexMap<String, RepositoryConfig>,
-    #[serde(default)]
-    pub packages: Vec<PackageSpec>,
     /// Version or repository requirements on packages wherever they end
-    /// up, asked for or pulled in, by package name.
-    #[serde(default)]
+    /// up, in any image, by package name.
     pub holds: IndexMap<String, HoldSpec>,
-    pub entrypoint: Option<EntrypointConfig>,
+    /// The architecture of every image.
+    pub architecture: Architecture,
+    /// The images by id, in declaration order.
+    pub images: IndexMap<String, ImageSpec>,
+    /// Written as a set (`[images.*]`) rather than a single `[image]`.
+    set: bool,
     /// The directory paths in the manifest are relative to: the manifest's
     /// own directory, or the current directory when parsed from a string.
-    #[serde(skip)]
     dir: PathBuf,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ImageConfig {
+/// The id of the image in a single-image manifest.
+pub const DEFAULT_IMAGE: &str = "default";
+
+/// One image of a manifest.
+#[derive(Debug, Clone, Default)]
+pub struct ImageSpec {
     pub name: Option<String>,
     pub tag: Option<String>,
-    #[serde(deserialize_with = "deserialize_from_str")]
-    pub architecture: Architecture,
     pub description: Option<String>,
     pub authors: Option<String>,
     pub source: Option<String>,
@@ -46,8 +52,201 @@ pub struct ImageConfig {
     /// would, with its maintainer scripts in place, for `dpkg --configure`
     /// to run later in the image (say, in a Dockerfile). paranoid itself
     /// never runs them.
-    #[serde(default)]
     pub unconfigured: bool,
+    /// What the image asks for, groups expanded.
+    pub packages: Vec<PackageSpec>,
+    pub entrypoint: Option<EntrypointConfig>,
+}
+
+/// A manifest as written, in either form.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawManifest {
+    #[serde(default)]
+    repositories: IndexMap<String, RepositoryConfig>,
+    #[serde(default)]
+    holds: IndexMap<String, HoldSpec>,
+
+    // One image.
+    image: Option<RawImageConfig>,
+    #[serde(default)]
+    packages: Vec<PackageSpec>,
+    entrypoint: Option<EntrypointConfig>,
+
+    // A set of images.
+    defaults: Option<RawDefaults>,
+    #[serde(default)]
+    groups: IndexMap<String, Vec<String>>,
+    #[serde(default)]
+    images: IndexMap<String, RawImage>,
+}
+
+/// `[image]` of a single-image manifest.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawImageConfig {
+    name: Option<String>,
+    tag: Option<String>,
+    #[serde(deserialize_with = "deserialize_from_str")]
+    architecture: Architecture,
+    description: Option<String>,
+    authors: Option<String>,
+    source: Option<String>,
+    #[serde(default)]
+    unconfigured: bool,
+}
+
+/// `[defaults]`: what every image of a set starts from.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDefaults {
+    #[serde(deserialize_with = "deserialize_from_str")]
+    architecture: Architecture,
+    tag: Option<String>,
+    description: Option<String>,
+    authors: Option<String>,
+    source: Option<String>,
+    unconfigured: Option<bool>,
+    entrypoint: Option<EntrypointConfig>,
+}
+
+/// `[images.<id>]`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawImage {
+    name: Option<String>,
+    tag: Option<String>,
+    description: Option<String>,
+    authors: Option<String>,
+    source: Option<String>,
+    unconfigured: Option<bool>,
+    #[serde(default)]
+    groups: Vec<String>,
+    #[serde(default)]
+    packages: Vec<String>,
+    entrypoint: Option<EntrypointConfig>,
+}
+
+impl RawManifest {
+    fn into_manifest(self) -> Result<Manifest, ManifestError> {
+        let invalid = |field, message: String| ManifestError::Validation { field, message };
+        let single = self.image.is_some() || !self.packages.is_empty() || self.entrypoint.is_some();
+        let set = self.defaults.is_some() || !self.groups.is_empty() || !self.images.is_empty();
+        if single && set {
+            return Err(invalid(
+                "images",
+                "describe one image with [image] and [[packages]], or a set with [defaults] \
+                 and [images.*], not both"
+                    .to_string(),
+            ));
+        }
+
+        if !set {
+            let (architecture, image) = match self.image {
+                Some(i) => (
+                    i.architecture,
+                    ImageSpec {
+                        name: i.name,
+                        tag: i.tag,
+                        description: i.description,
+                        authors: i.authors,
+                        source: i.source,
+                        unconfigured: i.unconfigured,
+                        packages: self.packages,
+                        entrypoint: self.entrypoint,
+                    },
+                ),
+                None => (
+                    Architecture::Amd64,
+                    ImageSpec {
+                        packages: self.packages,
+                        entrypoint: self.entrypoint,
+                        ..ImageSpec::default()
+                    },
+                ),
+            };
+            return Ok(Manifest {
+                repositories: self.repositories,
+                holds: self.holds,
+                architecture,
+                images: IndexMap::from([(DEFAULT_IMAGE.to_string(), image)]),
+                set: false,
+                dir: PathBuf::new(),
+            });
+        }
+
+        let defaults = self.defaults.ok_or_else(|| {
+            invalid(
+                "defaults",
+                "a set of images needs [defaults] with an architecture".to_string(),
+            )
+        })?;
+        let mut images = IndexMap::new();
+        for (id, raw) in self.images {
+            if !is_image_id(&id) {
+                return Err(invalid(
+                    "images",
+                    format!("image id '{id}' must be lower-case letters, digits, '.', '-' or '_'"),
+                ));
+            }
+            let mut names: Vec<String> = Vec::new();
+            for group in &raw.groups {
+                let members = self.groups.get(group).ok_or_else(|| {
+                    invalid(
+                        "images",
+                        format!("image '{id}' uses unknown group '{group}'"),
+                    )
+                })?;
+                names.extend(members.iter().cloned());
+            }
+            names.extend(raw.packages);
+            let mut seen = std::collections::HashSet::new();
+            names.retain(|name| seen.insert(name.clone()));
+
+            let image = ImageSpec {
+                name: raw.name,
+                tag: raw.tag.or_else(|| defaults.tag.clone()),
+                description: raw.description.or_else(|| defaults.description.clone()),
+                authors: raw.authors.or_else(|| defaults.authors.clone()),
+                source: raw.source.or_else(|| defaults.source.clone()),
+                unconfigured: raw.unconfigured.or(defaults.unconfigured).unwrap_or(false),
+                packages: names
+                    .into_iter()
+                    .map(|name| PackageSpec {
+                        name,
+                        version: None,
+                        repository: None,
+                    })
+                    .collect(),
+                entrypoint: raw.entrypoint.or_else(|| defaults.entrypoint.clone()),
+            };
+            images.insert(id, image);
+        }
+        if images.is_empty() {
+            return Err(invalid(
+                "images",
+                "a set needs at least one [images.<id>]".to_string(),
+            ));
+        }
+
+        Ok(Manifest {
+            repositories: self.repositories,
+            holds: self.holds,
+            architecture: defaults.architecture,
+            images,
+            set: true,
+            dir: PathBuf::new(),
+        })
+    }
+}
+
+/// Image ids end up in paths (`-o '{image}.tar'`), so keep them tame.
+fn is_image_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| matches!(c, 'a'..='z' | '0'..='9' | '.' | '-' | '_'))
+        && !id.starts_with('.')
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -375,23 +574,31 @@ impl Manifest {
 
     /// Parses a manifest from a TOML string.
     pub fn from_toml(content: &str) -> Result<Self, ManifestError> {
-        let manifest: Manifest = toml::from_str(content)?;
-        manifest.validate()?;
-        Ok(manifest)
+        let raw: RawManifest = toml::from_str(content)?;
+        Self::from_raw(raw)
     }
 
     /// Parses a manifest from a YAML string.
     pub fn from_yaml(content: &str) -> Result<Self, ManifestError> {
-        let manifest: Manifest = serde_yaml::from_str(content)?;
-        manifest.validate()?;
-        Ok(manifest)
+        let raw: RawManifest = serde_yaml::from_str(content)?;
+        Self::from_raw(raw)
     }
 
     /// Parses a manifest from a JSON string.
     pub fn from_json(content: &str) -> Result<Self, ManifestError> {
-        let manifest: Manifest = serde_json::from_str(content)?;
+        let raw: RawManifest = serde_json::from_str(content)?;
+        Self::from_raw(raw)
+    }
+
+    fn from_raw(raw: RawManifest) -> Result<Self, ManifestError> {
+        let manifest = raw.into_manifest()?;
         manifest.validate()?;
         Ok(manifest)
+    }
+
+    /// Whether the manifest describes a set of images (`[images.*]`).
+    pub fn is_set(&self) -> bool {
+        self.set
     }
 
     pub fn validate(&self) -> Result<(), ManifestError> {
@@ -402,15 +609,14 @@ impl Manifest {
             });
         }
 
-        if let Some(image) = &self.image
-            && !image.architecture.is_concrete()
-        {
+        if !self.architecture.is_concrete() {
             return Err(ManifestError::Validation {
-                field: "image.architecture",
-                message: format!(
-                    "'{}' is not a concrete CPU architecture",
-                    image.architecture
-                ),
+                field: if self.set {
+                    "defaults.architecture"
+                } else {
+                    "image.architecture"
+                },
+                message: format!("'{}' is not a concrete CPU architecture", self.architecture),
             });
         }
 
@@ -439,14 +645,20 @@ impl Manifest {
             }
         }
 
-        if self.packages.is_empty() {
-            return Err(ManifestError::Validation {
-                field: "packages",
-                message: "at least one package must be specified".to_string(),
-            });
+        for (id, image) in &self.images {
+            if image.packages.is_empty() {
+                return Err(ManifestError::Validation {
+                    field: "packages",
+                    message: if self.set {
+                        format!("image '{id}' asks for no packages")
+                    } else {
+                        "at least one package must be specified".to_string()
+                    },
+                });
+            }
         }
 
-        for pkg in &self.packages {
+        for pkg in self.images.values().flat_map(|i| &i.packages) {
             if pkg.name.is_empty() {
                 return Err(ManifestError::Validation {
                     field: "packages",
@@ -558,6 +770,120 @@ name = "pgbackrest"
         assert!(with("x = { versoin = \"1\" }").contains("expected a version"));
     }
 
+    const SET_REPOS: &str = r#"
+[repositories.debian]
+url = "https://deb.debian.org/debian"
+distribution = "trixie"
+components = ["main"]
+signed_by = "keys/debian.asc"
+"#;
+
+    fn set(rest: &str) -> Result<Manifest, ManifestError> {
+        Manifest::from_str(&format!("{SET_REPOS}\n{rest}"))
+    }
+
+    #[test]
+    fn parses_a_set_of_images() {
+        let manifest = set(r#"
+[defaults]
+architecture = "arm64"
+unconfigured = true
+tag = "v1"
+entrypoint = { cmd = ["/bin/sh"] }
+
+[holds]
+pgbackrest = "= 2.58.0-1"
+
+[groups]
+essential = ["bash", "coreutils"]
+runtime = ["bash", "pgbackrest"]
+
+[images.pg17]
+name = "mpg-pg17-base"
+groups = ["essential", "runtime"]
+packages = ["postgresql-17", "coreutils"]
+
+[images.pg17-builder]
+name = "mpg-pg17-builder-base"
+groups = ["essential"]
+packages = ["postgresql-server-dev-17"]
+unconfigured = false
+entrypoint = { cmd = ["make"] }
+"#)
+        .unwrap();
+        assert!(manifest.is_set());
+        assert_eq!(manifest.architecture, Architecture::Arm64);
+        let ids: Vec<_> = manifest.images.keys().collect();
+        assert_eq!(ids, ["pg17", "pg17-builder"]);
+
+        let names = |id: &str| -> Vec<String> {
+            manifest.images[id]
+                .packages
+                .iter()
+                .map(|p| p.name.clone())
+                .collect()
+        };
+        // Groups first, in order, then packages; each name once.
+        assert_eq!(
+            names("pg17"),
+            ["bash", "coreutils", "pgbackrest", "postgresql-17"]
+        );
+        assert_eq!(
+            names("pg17-builder"),
+            ["bash", "coreutils", "postgresql-server-dev-17"]
+        );
+
+        let pg17 = &manifest.images["pg17"];
+        assert_eq!(pg17.name.as_deref(), Some("mpg-pg17-base"));
+        assert_eq!(pg17.tag.as_deref(), Some("v1"));
+        assert!(pg17.unconfigured);
+        assert_eq!(pg17.entrypoint.as_ref().unwrap().cmd, ["/bin/sh"]);
+        let builder = &manifest.images["pg17-builder"];
+        assert!(!builder.unconfigured);
+        assert_eq!(builder.entrypoint.as_ref().unwrap().cmd, ["make"]);
+        assert_eq!(manifest.holds.len(), 1);
+    }
+
+    #[test]
+    fn rejects_bad_sets() {
+        let message = |rest: &str| set(rest).unwrap_err().to_string();
+        let one = "[images.a]\npackages = [\"bash\"]\n";
+        assert!(message(one).contains("needs [defaults] with an architecture"));
+        let defaults = "[defaults]\narchitecture = \"amd64\"\n";
+        assert!(
+            message(&format!("{defaults}[images.a]\ngroups = [\"nope\"]\n"))
+                .contains("image 'a' uses unknown group 'nope'")
+        );
+        assert!(
+            message(&format!("{defaults}[images.a]\n")).contains("image 'a' asks for no packages")
+        );
+        assert!(
+            message(&format!("{defaults}[images.A]\npackages = [\"bash\"]\n"))
+                .contains("image id 'A'")
+        );
+        assert!(message(defaults).contains("at least one [images.<id>]"));
+        assert!(
+            message(&format!("{defaults}{one}\n[[packages]]\nname = \"bash\"\n"))
+                .contains("not both")
+        );
+        // Architecture is set-wide.
+        assert!(
+            message(&format!(
+                "{defaults}[images.a]\narchitecture = \"arm64\"\npackages = [\"bash\"]\n"
+            ))
+            .contains("unknown field `architecture`")
+        );
+    }
+
+    #[test]
+    fn a_single_image_is_the_set_of_one() {
+        let manifest =
+            Manifest::from_str(&format!("{SET_REPOS}\n[[packages]]\nname = \"bash\"\n")).unwrap();
+        assert!(!manifest.is_set());
+        assert_eq!(manifest.images.keys().collect::<Vec<_>>(), [DEFAULT_IMAGE]);
+        assert_eq!(manifest.architecture, Architecture::Amd64);
+    }
+
     #[test]
     fn a_snapshot_is_appended_to_the_url() {
         let repo = repository("snapshot = \"20261005T000000Z\"").unwrap();
@@ -632,10 +958,10 @@ PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
 
         let manifest = Manifest::from_str(config).unwrap();
 
-        assert!(manifest.image.is_some());
-        let image = manifest.image.unwrap();
+        assert!(!manifest.is_set());
+        let image = manifest.images[DEFAULT_IMAGE].clone();
         assert_eq!(image.name, Some("my-container".to_string()));
-        assert_eq!(image.architecture, Architecture::Amd64);
+        assert_eq!(manifest.architecture, Architecture::Amd64);
         assert!(image.tag.is_none());
         assert!(image.description.is_none());
         assert!(image.authors.is_none());
@@ -647,20 +973,20 @@ PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
         assert_eq!(debian.distribution, "bookworm");
         assert_eq!(debian.components, vec!["main", "contrib"]);
 
-        assert_eq!(manifest.packages.len(), 2);
-        assert_eq!(manifest.packages[0].name, "nginx");
-        assert!(manifest.packages[0].version.is_none());
-        assert_eq!(manifest.packages[1].name, "curl");
+        assert_eq!(manifest.images[DEFAULT_IMAGE].packages.len(), 2);
+        assert_eq!(manifest.images[DEFAULT_IMAGE].packages[0].name, "nginx");
+        assert!(manifest.images[DEFAULT_IMAGE].packages[0].version.is_none());
+        assert_eq!(manifest.images[DEFAULT_IMAGE].packages[1].name, "curl");
         assert_eq!(
-            manifest.packages[1]
+            manifest.images[DEFAULT_IMAGE].packages[1]
                 .version
                 .as_ref()
                 .map(ToString::to_string),
             Some("= 7.88.1-10".to_string())
         );
 
-        assert!(manifest.entrypoint.is_some());
-        let entrypoint = manifest.entrypoint.unwrap();
+        assert!(manifest.images[DEFAULT_IMAGE].entrypoint.is_some());
+        let entrypoint = manifest.images[DEFAULT_IMAGE].entrypoint.clone().unwrap();
         assert_eq!(entrypoint.cmd, vec!["/usr/sbin/nginx", "-g", "daemon off;"]);
         assert_eq!(entrypoint.workdir, Some("/var/www".to_string()));
         assert!(entrypoint.env.is_some());
@@ -681,11 +1007,11 @@ name = "bash"
 
         let manifest = Manifest::from_str(config).unwrap();
 
-        assert!(manifest.image.is_none());
-        assert!(manifest.entrypoint.is_none());
+        assert!(manifest.images[DEFAULT_IMAGE].name.is_none());
+        assert!(manifest.images[DEFAULT_IMAGE].entrypoint.is_none());
         assert_eq!(manifest.repositories.len(), 1);
-        assert_eq!(manifest.packages.len(), 1);
-        assert_eq!(manifest.packages[0].name, "bash");
+        assert_eq!(manifest.images[DEFAULT_IMAGE].packages.len(), 1);
+        assert_eq!(manifest.images[DEFAULT_IMAGE].packages[0].name, "bash");
     }
 
     #[test]
@@ -779,9 +1105,9 @@ name = "vim"
 
         let manifest = Manifest::from_str(config).unwrap();
 
-        let image = manifest.image.unwrap();
+        let image = manifest.images[DEFAULT_IMAGE].clone();
         assert!(image.name.is_none());
-        assert_eq!(image.architecture, Architecture::Arm64);
+        assert_eq!(manifest.architecture, Architecture::Arm64);
     }
 
     #[test]
@@ -806,7 +1132,7 @@ name = "nodejs"
 "#;
 
         let manifest = Manifest::from_str(config).unwrap();
-        let image = manifest.image.unwrap();
+        let image = manifest.images[DEFAULT_IMAGE].clone();
         assert_eq!(image.name, Some("myapp/node".to_string()));
         assert_eq!(image.tag, Some("1.0".to_string()));
         assert_eq!(image.description, Some("Node.js runtime image".to_string()));
@@ -845,10 +1171,10 @@ packages:
         assert_eq!(debian.url.as_str(), "https://deb.debian.org/debian");
         assert_eq!(debian.components, vec!["main", "contrib"]);
 
-        assert_eq!(manifest.packages.len(), 2);
-        assert_eq!(manifest.packages[0].name, "nginx");
+        assert_eq!(manifest.images[DEFAULT_IMAGE].packages.len(), 2);
+        assert_eq!(manifest.images[DEFAULT_IMAGE].packages[0].name, "nginx");
         assert_eq!(
-            manifest.packages[1]
+            manifest.images[DEFAULT_IMAGE].packages[1]
                 .version
                 .as_ref()
                 .map(ToString::to_string),
@@ -875,8 +1201,8 @@ packages:
         let manifest = Manifest::from_json(config).unwrap();
 
         assert_eq!(manifest.repositories.len(), 1);
-        assert_eq!(manifest.packages.len(), 1);
-        assert_eq!(manifest.packages[0].name, "bash");
+        assert_eq!(manifest.images[DEFAULT_IMAGE].packages.len(), 1);
+        assert_eq!(manifest.images[DEFAULT_IMAGE].packages[0].name, "bash");
     }
 
     #[test]
@@ -952,7 +1278,7 @@ name = "bash"
         .unwrap();
 
         let manifest = Manifest::from_dir(dir.path()).unwrap();
-        assert_eq!(manifest.packages[0].name, "bash");
+        assert_eq!(manifest.images[DEFAULT_IMAGE].packages[0].name, "bash");
     }
 
     #[test]
@@ -975,7 +1301,7 @@ packages:
         .unwrap();
 
         let manifest = Manifest::from_dir(dir.path()).unwrap();
-        assert_eq!(manifest.packages[0].name, "vim");
+        assert_eq!(manifest.images[DEFAULT_IMAGE].packages[0].name, "vim");
     }
 
     #[test]
@@ -1065,7 +1391,7 @@ name = "bash"
     fn architecture_accepts_aliases() {
         let config = format!("[image]\narchitecture = \"x86_64\"\n{REPO_AND_PACKAGE}");
         let manifest = Manifest::from_str(&config).unwrap();
-        assert_eq!(manifest.image.unwrap().architecture, Architecture::Amd64);
+        assert_eq!(manifest.architecture, Architecture::Amd64);
     }
 
     #[test]

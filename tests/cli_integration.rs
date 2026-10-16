@@ -382,7 +382,11 @@ sha256 = "0d5f444f594e48c1e16a41d8fc628a09b24c658916a1274025c2330f2a802bed"
 filename = "pool/main/c/ca-certificates/ca-certificates_20230311+deb12u1_all.deb"
 size = 155260
 repository = "debian"
-direct = true
+
+[[image]]
+name = "default"
+packages = ["ca-certificates"]
+direct = ["ca-certificates"]
 "#,
     )
     .unwrap();
@@ -414,7 +418,7 @@ fn hello_world_with_unmet(dest: &Path) -> PathBuf {
     let lock = dir.join("paranoid.lock");
     let mut content = fs::read_to_string(&lock).unwrap();
     content.push_str(
-        "\n[[unmet]]\nrequired_by = \"ca-certificates\"\ndependency = \"openssl (>= 9)\"\n",
+        "\n[[image.unmet]]\nrequired_by = \"ca-certificates\"\ndependency = \"openssl (>= 9)\"\n",
     );
     fs::write(lock, content).unwrap();
     dir
@@ -612,6 +616,50 @@ fn e2e_lock_build_produces_valid_oci_tarball() {
         entry_names.iter().any(|n| n.starts_with("blobs/sha256/")),
         "missing blobs"
     );
+}
+
+/// A set: one lock for both images, then each built on its own.
+#[test]
+#[ignore]
+fn e2e_set_locks_once_and_builds_each_image() {
+    let tmp = TempDir::new().unwrap();
+    let examples = hello_world_dir().join("..");
+    let manifest = fs::read_to_string(examples.join("postgres/paranoid.toml")).unwrap();
+    let keys = examples.join("keys/");
+    fs::write(
+        tmp.path().join("paranoid.toml"),
+        manifest.replace("../keys/", &keys.display().to_string()),
+    )
+    .unwrap();
+
+    let out = paranoid_in(tmp.path(), &["lock"]);
+    assert!(out.status.success(), "lock failed: {}", stderr(&out));
+    assert!(stderr(&out).contains("in 2 images"), "{}", stderr(&out));
+
+    let inspect = paranoid_in(tmp.path(), &["inspect", "lock"]);
+    assert!(
+        stdout(&inspect).contains("  server: "),
+        "{}",
+        stdout(&inspect)
+    );
+    assert!(
+        stdout(&inspect).contains("  builder: "),
+        "{}",
+        stdout(&inspect)
+    );
+
+    let out = paranoid_in(tmp.path(), &["build", "-o", "{image}.tar"]);
+    assert!(out.status.success(), "build failed: {}", stderr(&out));
+    for image in ["server", "builder"] {
+        assert!(
+            tmp.path().join(format!("{image}.tar")).exists(),
+            "{image}.tar"
+        );
+    }
+
+    let out = paranoid_in(tmp.path(), &["build", "-o", "both.tar"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("{image}"), "{}", stderr(&out));
 }
 
 /// Verify that two builds from the same lock file produce bit-identical

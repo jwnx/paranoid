@@ -7,7 +7,7 @@ use indexmap::IndexMap;
 
 use crate::config::RepositoryConfig;
 use crate::http::{Client, ClientError};
-use crate::lock::{LockFile, LockedPackage};
+use crate::lock::LockedPackage;
 use crate::report::{Event, Phase, Reporter};
 
 use super::cache::PackageCache;
@@ -59,17 +59,17 @@ impl DownloadService {
     /// fail, every failure is returned together.
     pub async fn download_all<'a>(
         &self,
-        lock_file: &'a LockFile,
+        packages: &[&'a LockedPackage],
         repositories: &IndexMap<String, RepositoryConfig>,
         reporter: &dyn Reporter,
     ) -> Result<Vec<Fetched<'a>>, DownloadFailures> {
-        let total_bytes = lock_file.packages.iter().map(|p| p.size).sum();
+        let total_bytes = packages.iter().map(|p| p.size).sum();
         reporter.report(Event::Begin {
             phase: Phase::Download,
             total: total_bytes,
         });
 
-        let downloads = lock_file.packages.iter().map(|package| async move {
+        let downloads = packages.iter().map(|&package| async move {
             let result = self
                 .download(package, repositories.get(&package.repository))
                 .await;

@@ -4,8 +4,6 @@ use std::error::Error;
 use std::fmt;
 use std::path::Path;
 
-use paranoid::lock::LockedUnmet;
-
 /// A top-level CLI error shown to the user before the process exits.
 pub struct CliError(String);
 
@@ -71,7 +69,7 @@ impl CliError {
     }
 
     /// A lock that leaves dependencies unmet, used without `--allow-unmet`.
-    pub fn unmet(unmet: &[LockedUnmet]) -> Self {
+    pub fn unmet(unmet: &[String]) -> Self {
         let s = if unmet.len() == 1 { "y" } else { "ies" };
         let mut msg = format!("{} unmet dependenc{s}:", unmet.len());
         for u in unmet {
@@ -92,6 +90,15 @@ impl CliError {
             "{} is stale: the manifest changed since it was written, or none of the \
              keys that signed it are trusted any more; run `paranoid lock`, or pass \
              --allow-stale to build from it anyway",
+            path.display()
+        ))
+    }
+
+    /// A `-o` that would write every image of a set to the same path.
+    pub fn output_template(path: &Path) -> Self {
+        Self(format!(
+            "building several images to '{}' would overwrite each with the next; \
+             put {{image}} in the path, as in -o '{{image}}.tar', or pick one with --image",
             path.display()
         ))
     }

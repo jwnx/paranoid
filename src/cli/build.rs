@@ -31,9 +31,16 @@ pub struct BuildArgs {
     /// Output path for the OCI image.
     ///
     /// Ends with `.tar` → writes a tarball loadable by `podman load` / `docker load`.
-    /// Otherwise → writes an OCI image layout directory.
-    #[arg(short, long, value_name = "PATH", default_value = "image.tar")]
-    output: PathBuf,
+    /// Otherwise → writes an OCI image layout directory. `{image}` is
+    /// replaced by the image's id, and is required when building several.
+    /// Defaults to `image.tar`, or `{image}.tar` for a set.
+    #[arg(short, long, value_name = "PATH")]
+    output: Option<PathBuf>,
+
+    /// Build only this image of a set; repeat for several. Defaults to
+    /// every image.
+    #[arg(long = "image", value_name = "ID")]
+    images: Vec<String>,
 
     /// Directory to hold downloaded packages (defaults to system cache).
     #[arg(long, value_name = "DIR")]
@@ -83,39 +90,69 @@ pub async fn run(args: BuildArgs, quiet: bool) -> Result<(), CliError> {
     }
     check_unmet(&lock, args.allow_unmet)?;
 
-    let options = BuildOptions {
-        download: DownloadConfig {
-            jobs: args.jobs,
-            force: args.force_download,
-        },
-        cache_dir: args.cache_dir,
-        output: ImageOutput::from_path(&args.output),
-        created: source_date_epoch()?,
+    let images: Vec<String> = if args.images.is_empty() {
+        manifest.images.keys().cloned().collect()
+    } else {
+        args.images
     };
-    // Failures of individual packages are reported as they happen; the
-    // returned error summarizes them.
-    let report = build(&manifest, &lock, &options, &DotsReporter::new(quiet))
-        .await
-        .map_err(CliError::build)?;
+    if let Some(unknown) = images.iter().find(|id| !manifest.images.contains_key(*id)) {
+        let known: Vec<&str> = manifest.images.keys().map(String::as_str).collect();
+        return Err(CliError::config(format!(
+            "no image '{unknown}' in the manifest (it has {})",
+            known.join(", ")
+        )));
+    }
+    let template = args.output.unwrap_or_else(|| {
+        PathBuf::from(if manifest.is_set() {
+            "{image}.tar"
+        } else {
+            "image.tar"
+        })
+    });
+    if images.len() > 1 && !template.to_string_lossy().contains("{image}") {
+        return Err(CliError::output_template(&template));
+    }
+    let created = source_date_epoch()?;
 
-    if !quiet {
-        eprintln!("Done.");
-        eprintln!();
-
-        let output = options.output.path();
-        let name = match manifest.image.as_ref().and_then(|i| i.name.as_ref()) {
-            Some(_) => report.image.reference.clone(),
-            None => output.display().to_string(),
+    for id in &images {
+        let output = PathBuf::from(template.to_string_lossy().replace("{image}", id));
+        let options = BuildOptions {
+            download: DownloadConfig {
+                jobs: args.jobs,
+                force: args.force_download,
+            },
+            cache_dir: args.cache_dir.clone(),
+            output: ImageOutput::from_path(&output),
+            created: created.clone(),
         };
-        eprintln!(
-            "Built {} with {} packages ({} fresh, {} cached) sized {}.",
-            name,
-            lock.packages.len(),
-            report.fresh,
-            report.cached,
-            st::fmt_size(report.image.total_size),
-        );
-        st::footer(output, &report.image.manifest_digest.to_string());
+        if !quiet && images.len() > 1 {
+            eprintln!("== {id}");
+        }
+        // Failures of individual packages are reported as they happen; the
+        // returned error summarizes them.
+        let report = build(&manifest, &lock, id, &options, &DotsReporter::new(quiet))
+            .await
+            .map_err(CliError::build)?;
+
+        if !quiet {
+            eprintln!("Done.");
+            eprintln!();
+
+            let name = match &manifest.images[id].name {
+                Some(_) => report.image.reference.clone(),
+                None => output.display().to_string(),
+            };
+            let packages = lock.image(id).map_or(0, |i| i.packages.len());
+            eprintln!(
+                "Built {} with {} packages ({} fresh, {} cached) sized {}.",
+                name,
+                packages,
+                report.fresh,
+                report.cached,
+                st::fmt_size(report.image.total_size),
+            );
+            st::footer(&output, &report.image.manifest_digest.to_string());
+        }
     }
 
     Ok(())

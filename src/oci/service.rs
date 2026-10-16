@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::arch::Architecture;
-use crate::config::Manifest;
+use crate::config::ImageSpec;
 use crate::report::{Event, Phase, Reporter};
 use crate::rootfs::Rootfs;
 
@@ -239,36 +239,38 @@ impl OciConfig {
     /// `created` is stamped into both the config and the
     /// `org.opencontainers.image.created` label. Callers pick it (e.g. from
     /// `SOURCE_DATE_EPOCH`) so identical inputs produce identical images.
-    pub fn from_manifest(manifest: &Manifest, created: Timestamp) -> Result<Self, OciConfigError> {
+    pub fn from_image(
+        image: &ImageSpec,
+        architecture: Architecture,
+        created: Timestamp,
+    ) -> Result<Self, OciConfigError> {
         const LABEL_PREFIX: &str = "org.opencontainers.image.";
 
         let mut config = Self::new()
             .created(created.clone())
-            .label(format!("{LABEL_PREFIX}created"), created.to_string());
+            .label(format!("{LABEL_PREFIX}created"), created.to_string())
+            .architecture(architecture);
 
-        if let Some(image) = &manifest.image {
-            config = config.architecture(image.architecture);
-            if let Some(name) = &image.name {
-                config = config.try_image_name(name.as_str())?;
-            }
-            if let Some(tag) = &image.tag {
-                config = config.try_image_tag(tag.as_str())?;
-            }
+        if let Some(name) = &image.name {
+            config = config.try_image_name(name.as_str())?;
+        }
+        if let Some(tag) = &image.tag {
+            config = config.try_image_tag(tag.as_str())?;
+        }
 
-            let labels = [
-                ("title", &image.name),
-                ("description", &image.description),
-                ("authors", &image.authors),
-                ("source", &image.source),
-            ];
-            for (key, value) in labels {
-                if let Some(value) = value {
-                    config = config.label(format!("{LABEL_PREFIX}{key}"), value);
-                }
+        let labels = [
+            ("title", &image.name),
+            ("description", &image.description),
+            ("authors", &image.authors),
+            ("source", &image.source),
+        ];
+        for (key, value) in labels {
+            if let Some(value) = value {
+                config = config.label(format!("{LABEL_PREFIX}{key}"), value);
             }
         }
 
-        if let Some(entrypoint) = &manifest.entrypoint {
+        if let Some(entrypoint) = &image.entrypoint {
             config = config.entrypoint(entrypoint.cmd.iter().cloned());
             if let Some(env) = &entrypoint.env {
                 config = config.env(

@@ -405,10 +405,23 @@ impl<'a> Pass<'a, '_> {
                 }
                 (None, Some((name, requirements))) => return self.retry(name, requirements),
                 (None, None) => match origin {
-                    Origin::Package(required_by) => self.unmet.push(UnmetDependency {
-                        required_by,
-                        dependency,
-                    }),
+                    Origin::Package(required_by) => {
+                        // Something would have satisfied it, but a hold or
+                        // another image rules it out: that's a conflict,
+                        // not a missing package.
+                        if let Some(spec) = alternatives.iter().find(|s| self.held_back(s)) {
+                            let mut requirements = self.requirements_on(&spec.name);
+                            requirements.push(requirement(spec, &Origin::Package(required_by)));
+                            return Err(ResolveError::Conflict {
+                                name: spec.name.clone(),
+                                requirements,
+                            });
+                        }
+                        self.unmet.push(UnmetDependency {
+                            required_by,
+                            dependency,
+                        })
+                    }
                     // Only requests and packages are ever queued.
                     Origin::Manifest | Origin::Hold | Origin::Image(_) => {
                         let request = requests
@@ -445,6 +458,19 @@ impl<'a> Pass<'a, '_> {
             request: Box::new(request.clone()),
             arch: self.arch,
         }
+    }
+
+    /// Whether some version of `spec.name` satisfies `spec` and its pin,
+    /// but what's been learned about it (holds, other images) rules every
+    /// such version out.
+    fn held_back(&self, spec: &DependencySpec) -> bool {
+        let Some(learned) = self.learned.get(&spec.name) else {
+            return false;
+        };
+        self.index
+            .packages(&spec.name, self.arch)
+            .filter(|c| satisfies(spec, &c.package.version) && self.allowed(&spec.name, c))
+            .any(|c| !learned.iter().all(|r| r.allows(&c.package.version)))
     }
 
     /// The name of a selected package that satisfies `spec`, if any.
@@ -1228,6 +1254,23 @@ mod tests {
             "no version of 'pgbackrest' satisfies every requirement: \
              (= 2.58.0-1) from a hold, (>= 2.59) from the manifest"
         );
+    }
+
+    #[test]
+    fn a_hold_that_blocks_a_dependency_is_a_conflict_not_unmet() {
+        let set = repos(&[(
+            "debian",
+            "Package: libpq5\nVersion: 17\n\nPackage: libpq5\nVersion: 18\n\n\
+             Package: client\nVersion: 1\nDepends: libpq5 (<< 18)",
+        )]);
+        let err = run_held(&set, &["client"], &[hold("libpq5", Some("= 18"), None)]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "no version of 'libpq5' satisfies every requirement: (= 18) from a hold, \
+             (<< 18) from client"
+        );
+        // Without the hold, it's simply resolved.
+        assert_eq!(resolves_to(&set, &["client"]), ["client=1", "libpq5=17"]);
     }
 
     #[test]

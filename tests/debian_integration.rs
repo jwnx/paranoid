@@ -525,16 +525,16 @@ name = "ca-certificates"
     println!(
         "Resolved {} packages (including {} unmet)",
         result.packages.len(),
-        result.unmet.len()
+        result.images[0].unmet.len()
     );
 
     for pkg in &result.packages {
         println!("  {} {} ({})", pkg.name, pkg.version, pkg.architecture);
     }
 
-    if !result.unmet.is_empty() {
+    if !result.images[0].unmet.is_empty() {
         println!("Unmet dependencies:");
-        for unmet in &result.unmet {
+        for unmet in &result.images[0].unmet {
             println!("  {}", unmet);
         }
     }
@@ -579,7 +579,11 @@ name = "ca-certificates"
         .expect("Should create download service");
 
     let fetched = download_service
-        .download_all(&lock, &manifest.repositories, &())
+        .download_all(
+            &lock.packages.iter().collect::<Vec<_>>(),
+            &manifest.repositories,
+            &(),
+        )
         .await
         .expect("All downloads should succeed");
 
@@ -640,7 +644,11 @@ name = "base-files"
 
     // First download - should fetch from network
     let result1 = download_service
-        .download_all(&lock, &manifest.repositories, &())
+        .download_all(
+            &lock.packages.iter().collect::<Vec<_>>(),
+            &manifest.repositories,
+            &(),
+        )
         .await
         .expect("First download should succeed");
 
@@ -656,7 +664,11 @@ name = "base-files"
 
     // Second download - should use cache
     let result2 = download_service
-        .download_all(&lock, &manifest.repositories, &())
+        .download_all(
+            &lock.packages.iter().collect::<Vec<_>>(),
+            &manifest.repositories,
+            &(),
+        )
         .await
         .expect("Second download should succeed");
 

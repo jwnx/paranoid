@@ -45,6 +45,9 @@ pub struct BuildReport {
 
 #[derive(Debug, Error)]
 pub enum BuildError {
+    #[error("no image '{0}' in the manifest and the lock")]
+    UnknownImage(String),
+
     #[error("invalid image configuration")]
     Config(#[from] OciConfigError),
 
@@ -89,15 +92,21 @@ pub enum BuildError {
     Image(#[from] OciError),
 }
 
-/// Build the image a manifest describes, from the packages in `lock`.
+/// Build one image of a manifest, by id, from its packages in `lock`.
 pub async fn build(
     manifest: &Manifest,
     lock: &LockFile,
+    image: &str,
     options: &BuildOptions,
     reporter: &dyn Reporter,
 ) -> Result<BuildReport, BuildError> {
+    let unknown = || BuildError::UnknownImage(image.to_string());
+    let spec = manifest.images.get(image).ok_or_else(unknown)?;
+    let locked = lock.image(image).ok_or_else(unknown)?;
+    let packages = lock.image_packages(locked);
+
     // Validate the image configuration before doing any work.
-    let config = OciConfig::from_manifest(manifest, options.created.clone())?;
+    let config = OciConfig::from_image(spec, manifest.architecture, options.created.clone())?;
 
     let cache = match &options.cache_dir {
         Some(dir) => PackageCache::with_base_dir(dir.clone())?,
@@ -105,10 +114,10 @@ pub async fn build(
     };
     let downloader = DownloadService::with_cache(cache, options.download.clone())?;
     let fetched = downloader
-        .download_all(lock, &manifest.repositories, reporter)
+        .download_all(&packages, &manifest.repositories, reporter)
         .await?;
 
-    let state = if manifest.image.as_ref().is_some_and(|i| i.unconfigured) {
+    let state = if spec.unconfigured {
         PackageState::Unpacked
     } else {
         PackageState::Installed

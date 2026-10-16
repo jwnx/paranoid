@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 
-use paranoid::lock::LockFile;
+use paranoid::lock::{LockFile, LockedImage, LockedPackage};
 use paranoid::oci::read_image;
 
 use super::error::CliError;
@@ -29,6 +29,10 @@ enum InspectTarget {
         /// Show dependency tree instead of flat table.
         #[arg(long)]
         tree: bool,
+
+        /// Show only this image of a set.
+        #[arg(long, value_name = "ID")]
+        image: Option<String>,
     },
 
     /// Show the contents of a built OCI image (tar or directory layout).
@@ -41,13 +45,34 @@ enum InspectTarget {
 
 pub fn run(args: InspectArgs) -> Result<(), CliError> {
     match args.target {
-        InspectTarget::Lock { path, tree } => {
+        InspectTarget::Lock { path, tree, image } => {
             let lock = LockFile::from_file(&path).map_err(CliError::lock)?;
-            print_lock_summary(&lock);
-            if tree {
-                print_lock_tree(&lock);
-            } else {
-                print_lock_table(&lock);
+            // One image to focus on: the one asked for, or the only one.
+            let focus = match &image {
+                Some(id) => Some(lock.image(id).ok_or_else(|| {
+                    let known: Vec<_> = lock.images.iter().map(|i| i.name.as_str()).collect();
+                    CliError::config(format!(
+                        "no image '{id}' in {} (it has {})",
+                        path.display(),
+                        known.join(", ")
+                    ))
+                })?),
+                None if lock.images.len() == 1 => lock.images.first(),
+                None => None,
+            };
+            print_lock_summary(&lock, focus);
+            match (tree, focus) {
+                (true, Some(image)) => print_lock_tree(&lock, image),
+                (true, None) => {
+                    for (i, image) in lock.images.iter().enumerate() {
+                        if i > 0 {
+                            println!();
+                        }
+                        println!("{}", st::accent().apply_to(format!("== {}", image.name)));
+                        print_lock_tree(&lock, image);
+                    }
+                }
+                (false, focus) => print_lock_table(&lock, focus),
             }
             println!();
             st::footer_stdout(&path, &lock.content_hash().map_err(CliError::lock)?);
@@ -59,19 +84,46 @@ pub fn run(args: InspectArgs) -> Result<(), CliError> {
 
 // ── lock ─────────────────────────────────────────────────────────────────────
 
-fn print_lock_summary(lock: &LockFile) {
-    let total = lock.packages.len();
-    let direct = lock.packages.iter().filter(|p| p.direct).count();
-    let size = st::fmt_size(lock.packages.iter().map(|p| p.size).sum());
+fn print_lock_summary(lock: &LockFile, focus: Option<&LockedImage>) {
+    let count = |packages: &[&LockedPackage], direct: usize| {
+        let total = packages.len();
+        let size = st::fmt_size(packages.iter().map(|p| p.size).sum());
+        if direct < total {
+            format!(
+                "{total} packages, {direct} direct + {} transitive ({size})",
+                total - direct
+            )
+        } else {
+            format!("{total} packages ({size})")
+        }
+    };
 
     println!("Inspect Lockfile");
-    if direct < total {
-        println!(
-            "{total} packages, {direct} direct + {} transitive ({size})",
-            total - direct
-        );
-    } else {
-        println!("{total} packages ({size})");
+    match focus {
+        Some(image) => {
+            let packages = lock.image_packages(image);
+            if lock.images.len() > 1 {
+                println!(
+                    "image {}: {}",
+                    image.name,
+                    count(&packages, image.direct.len())
+                );
+            } else {
+                println!("{}", count(&packages, image.direct.len()));
+            }
+        }
+        None => {
+            let size = st::fmt_size(lock.packages.iter().map(|p| p.size).sum());
+            println!(
+                "{} packages across {} images ({size})",
+                lock.packages.len(),
+                lock.images.len()
+            );
+            for image in &lock.images {
+                let packages = lock.image_packages(image);
+                println!("  {}: {}", image.name, count(&packages, image.direct.len()));
+            }
+        }
     }
     for repo in &lock.repositories {
         let signers: Vec<_> = repo.signed_by.iter().map(ToString::to_string).collect();
@@ -86,14 +138,23 @@ fn print_lock_summary(lock: &LockFile) {
             ))
         );
     }
-    for unmet in &lock.unmet {
-        println!("{}", st::removed().apply_to(format!("unmet: {unmet}")));
+    for (image, unmet) in lock.unmet() {
+        if focus.is_some_and(|f| f.name != image) {
+            continue;
+        }
+        let line = if lock.images.len() > 1 {
+            format!("unmet in {image}: {unmet}")
+        } else {
+            format!("unmet: {unmet}")
+        };
+        println!("{}", st::removed().apply_to(line));
     }
     println!();
 }
 
 /// Packages as a table: direct ones first (bold), then transitive (dimmed).
-fn print_lock_table(lock: &LockFile) {
+/// For a whole set, "direct" means direct in any image.
+fn print_lock_table(lock: &LockFile, focus: Option<&LockedImage>) {
     const W_NAME: usize = 28;
     const W_VER: usize = 20;
     const W_ARCH: usize = 8;
@@ -107,8 +168,21 @@ fn print_lock_table(lock: &LockFile) {
         st::dim().apply_to(row("Package", "Version", "Arch", "Size"))
     );
 
-    let mut packages: Vec<_> = lock.packages.iter().collect();
-    packages.sort_by(|a, b| b.direct.cmp(&a.direct).then(a.name.cmp(&b.name)));
+    let (mut packages, direct): (Vec<_>, HashSet<&str>) = match focus {
+        Some(image) => (
+            lock.image_packages(image),
+            image.direct.iter().map(String::as_str).collect(),
+        ),
+        None => (
+            lock.packages.iter().collect(),
+            lock.images
+                .iter()
+                .flat_map(|i| i.direct.iter().map(String::as_str))
+                .collect(),
+        ),
+    };
+    let is_direct = |p: &LockedPackage| direct.contains(p.name.as_str());
+    packages.sort_by(|a, b| is_direct(b).cmp(&is_direct(a)).then(a.name.cmp(&b.name)));
     for pkg in packages {
         let line = row(
             &st::truncate(&pkg.name, W_NAME),
@@ -116,21 +190,25 @@ fn print_lock_table(lock: &LockFile) {
             pkg.architecture.as_str(),
             &st::fmt_size(pkg.size),
         );
-        let style = if pkg.direct { st::bold() } else { st::dim() };
+        let style = if is_direct(pkg) {
+            st::bold()
+        } else {
+            st::dim()
+        };
         println!("{}", style.apply_to(line));
     }
 }
 
 /// Packages as a dependency tree rooted at the direct packages. A package
 /// already shown elsewhere is marked `(*)` and not expanded again.
-fn print_lock_tree(lock: &LockFile) {
+fn print_lock_tree(lock: &LockFile, image: &LockedImage) {
     let tree = Tree {
         info: lock
             .packages
             .iter()
             .map(|p| (p.name.as_str(), (p.version.as_str(), p.size)))
             .collect(),
-        children: lock
+        children: image
             .deps
             .iter()
             .map(|e| {
@@ -141,12 +219,7 @@ fn print_lock_tree(lock: &LockFile) {
             .collect(),
     };
 
-    let mut roots: Vec<&str> = lock
-        .packages
-        .iter()
-        .filter(|p| p.direct)
-        .map(|p| p.name.as_str())
-        .collect();
+    let mut roots: Vec<&str> = image.direct.iter().map(String::as_str).collect();
     roots.sort();
 
     let mut seen = HashSet::new();

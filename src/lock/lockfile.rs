@@ -23,9 +23,6 @@ pub struct LockedPackage {
     pub filename: String,
     pub size: u64,
     pub repository: String,
-    /// Whether this package was requested directly in the manifest.
-    /// `false` means it was pulled in as a transitive dependency.
-    pub direct: bool,
 }
 
 /// A dependency nothing in the repositories satisfied, which the lock was
@@ -52,7 +49,29 @@ pub struct DepEdge {
     pub children: Vec<String>,
 }
 
+/// One image's part of the lock.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LockedImage {
+    /// The image's id in the manifest.
+    pub name: String,
+    /// Every package in the image, sorted.
+    pub packages: Vec<String>,
+    /// The packages the manifest asks for, sorted.
+    pub direct: Vec<String>,
+    /// Dependencies left unmet, sorted. Empty unless the lock was written
+    /// with `--allow-unmet`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unmet: Vec<LockedUnmet>,
+    /// Dependency graph edges: parent → [children]. An empty graph
+    /// serializes to nothing, hence the default.
+    #[serde(rename = "dep", default)]
+    pub deps: Vec<DepEdge>,
+}
+
 /// The lock file structure.
+///
+/// Packages are listed once, with one version across every image; each
+/// `[[image]]` says which of them it contains.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LockFile {
     /// Hash of the config that generated this lock file.
@@ -63,21 +82,13 @@ pub struct LockFile {
     #[serde(rename = "repository", default)]
     pub repositories: Vec<ResolvedRepository>,
 
-    /// Dependencies left unmet, sorted. Empty unless the lock was written
-    /// with `--allow-unmet`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub unmet: Vec<LockedUnmet>,
-
-    /// All locked packages.
+    /// Every locked package of every image, sorted by name.
     #[serde(rename = "package")]
     pub packages: Vec<LockedPackage>,
 
-    /// Dependency graph edges: parent → [children].
-    ///
-    /// This is the union of all per-root-package graphs. An empty graph
-    /// serializes to nothing, hence the default.
-    #[serde(rename = "dep", default)]
-    pub deps: Vec<DepEdge>,
+    /// The images, in manifest order.
+    #[serde(rename = "image", default)]
+    pub images: Vec<LockedImage>,
 }
 
 /// Errors that can occur when working with lock files.
@@ -96,6 +107,12 @@ pub enum LockFileError {
         "the lock records no signed repository snapshots; it predates signature checking, run `paranoid lock` again"
     )]
     Unsigned,
+
+    #[error("the lock records no images; it predates image sets, run `paranoid lock` again")]
+    NoImages,
+
+    #[error("image '{image}' lists package '{package}', which the lock doesn't record")]
+    UnknownPackage { image: String, package: String },
 
     #[error(
         "package '{package}' comes from repository '{repository}', which the lock doesn't record"
@@ -157,41 +174,72 @@ impl LockFile {
                 filename: p.filename,
                 size: p.size,
                 repository: p.repository,
-                direct: p.direct,
             })
             .collect();
-
-        // Sort packages by name for deterministic output
         packages.sort_by(|a, b| a.name.cmp(&b.name));
 
-        // Serialize the dependency graph as sorted DepEdge list
-        let mut deps: Vec<DepEdge> = resolved
-            .graph
+        let images = resolved
+            .images
             .into_iter()
-            .map(|(parent, mut children)| {
-                children.sort();
-                DepEdge { parent, children }
+            .map(|image| {
+                let mut deps: Vec<DepEdge> = image
+                    .graph
+                    .into_iter()
+                    .map(|(parent, mut children)| {
+                        children.sort();
+                        DepEdge { parent, children }
+                    })
+                    .collect();
+                deps.sort_by(|a, b| a.parent.cmp(&b.parent));
+                let mut unmet: Vec<LockedUnmet> = image
+                    .unmet
+                    .into_iter()
+                    .map(|u| LockedUnmet {
+                        required_by: u.required_by,
+                        dependency: u.dependency.to_string(),
+                    })
+                    .collect();
+                unmet.sort();
+                let sorted = |mut names: Vec<String>| {
+                    names.sort();
+                    names
+                };
+                LockedImage {
+                    name: image.id,
+                    packages: sorted(image.packages),
+                    direct: sorted(image.direct),
+                    unmet,
+                    deps,
+                }
             })
             .collect();
-        deps.sort_by(|a, b| a.parent.cmp(&b.parent));
-
-        let mut unmet: Vec<LockedUnmet> = resolved
-            .unmet
-            .into_iter()
-            .map(|u| LockedUnmet {
-                required_by: u.required_by,
-                dependency: u.dependency.to_string(),
-            })
-            .collect();
-        unmet.sort();
 
         Self {
             config_hash,
             repositories: resolved.repositories,
-            unmet,
             packages,
-            deps,
+            images,
         }
+    }
+
+    /// The image with this id.
+    pub fn image(&self, id: &str) -> Option<&LockedImage> {
+        self.images.iter().find(|i| i.name == id)
+    }
+
+    /// An image's packages, in lock order.
+    pub fn image_packages<'a>(&'a self, image: &'a LockedImage) -> Vec<&'a LockedPackage> {
+        self.packages
+            .iter()
+            .filter(|p| image.packages.contains(&p.name))
+            .collect()
+    }
+
+    /// Every unmet dependency, with the image it's in.
+    pub fn unmet(&self) -> impl Iterator<Item = (&str, &LockedUnmet)> {
+        self.images
+            .iter()
+            .flat_map(|i| i.unmet.iter().map(move |u| (i.name.as_str(), u)))
     }
 
     /// Load a lock file from disk.
@@ -207,6 +255,22 @@ impl LockFile {
         let lock: LockFile = toml::from_str(content)?;
         if lock.repositories.is_empty() {
             return Err(LockFileError::Unsigned);
+        }
+        if lock.images.is_empty() {
+            return Err(LockFileError::NoImages);
+        }
+        for image in &lock.images {
+            let missing = image
+                .packages
+                .iter()
+                .find(|name| !lock.packages.iter().any(|p| &p.name == *name))
+                .or_else(|| image.direct.iter().find(|d| !image.packages.contains(d)));
+            if let Some(name) = missing {
+                return Err(LockFileError::UnknownPackage {
+                    image: image.name.clone(),
+                    package: name.clone(),
+                });
+            }
         }
         for pkg in &lock.packages {
             if !lock.repositories.iter().any(|r| r.name == pkg.repository) {
@@ -295,15 +359,22 @@ impl LockFile {
     fn compute_config_hash(manifest: &Manifest) -> String {
         #[derive(Serialize)]
         struct ResolutionInputs<'a> {
-            architecture: Option<String>,
+            architecture: String,
             repositories: Vec<(&'a str, &'a RepositoryConfig)>,
-            packages: Vec<&'a PackageSpec>,
+            images: Vec<(&'a str, Vec<&'a PackageSpec>)>,
             #[serde(skip_serializing_if = "Vec::is_empty")]
             holds: Vec<(&'a str, &'a HoldSpec)>,
         }
 
-        let mut packages: Vec<_> = manifest.packages.iter().collect();
-        packages.sort_by(|a, b| a.name.cmp(&b.name));
+        let images = manifest
+            .images
+            .iter()
+            .map(|(id, image)| {
+                let mut packages: Vec<_> = image.packages.iter().collect();
+                packages.sort_by(|a, b| a.name.cmp(&b.name));
+                (id.as_str(), packages)
+            })
+            .collect();
         let mut holds_sorted: Vec<_> = manifest
             .holds
             .iter()
@@ -312,13 +383,13 @@ impl LockFile {
         holds_sorted.sort_by_key(|(name, _)| *name);
 
         let inputs = ResolutionInputs {
-            architecture: manifest.image.as_ref().map(|i| i.architecture.to_string()),
+            architecture: manifest.architecture.to_string(),
             repositories: manifest
                 .repositories
                 .iter()
                 .map(|(name, repo)| (name.as_str(), repo))
                 .collect(),
-            packages,
+            images,
             holds: holds_sorted,
         };
 
@@ -393,7 +464,7 @@ mod tests {
 
     use super::*;
     use crate::config::Manifest;
-    use crate::resolve::ResolvedPackage;
+    use crate::resolve::{ResolvedImage, ResolvedPackage};
 
     fn make_manifest() -> Manifest {
         Manifest::from_str(&make_manifest_toml()).unwrap()
@@ -444,7 +515,6 @@ name = "coreutils"
                     filename: "pool/main/b/bash/bash_5.2.15-2_amd64.deb".to_string(),
                     size: 1234567,
                     repository: "debian".to_string(),
-                    direct: true,
                 },
                 ResolvedPackage {
                     name: "coreutils".to_string(),
@@ -454,14 +524,18 @@ name = "coreutils"
                     filename: "pool/main/c/coreutils/coreutils_9.1-1_amd64.deb".to_string(),
                     size: 2345678,
                     repository: "debian".to_string(),
-                    direct: false,
                 },
             ],
-            unmet: vec![],
-            graph: std::collections::BTreeMap::from([(
-                "bash".to_string(),
-                vec!["coreutils".to_string()],
-            )]),
+            images: vec![ResolvedImage {
+                id: "default".to_string(),
+                packages: vec!["bash".to_string(), "coreutils".to_string()],
+                direct: vec!["bash".to_string()],
+                graph: std::collections::BTreeMap::from([(
+                    "bash".to_string(),
+                    vec!["coreutils".to_string()],
+                )]),
+                unmet: vec![],
+            }],
         }
     }
 
@@ -479,10 +553,13 @@ name = "coreutils"
         assert_eq!(lock.packages[0].name, "bash");
         assert_eq!(lock.packages[1].name, "coreutils");
 
-        // Graph edge should be preserved
-        assert_eq!(lock.deps.len(), 1);
-        assert_eq!(lock.deps[0].parent, "bash");
-        assert_eq!(lock.deps[0].children, vec!["coreutils"]);
+        // The image and its graph edge should be preserved
+        let image = &lock.images[0];
+        assert_eq!(image.packages, ["bash", "coreutils"]);
+        assert_eq!(image.direct, ["bash"]);
+        assert_eq!(image.deps.len(), 1);
+        assert_eq!(image.deps[0].parent, "bash");
+        assert_eq!(image.deps[0].children, vec!["coreutils"]);
     }
 
     #[test]
@@ -494,9 +571,7 @@ name = "coreutils"
         let serialized = lock.serialize().unwrap();
         let parsed = LockFile::from_str(&serialized).unwrap();
 
-        assert_eq!(parsed.deps.len(), 1);
-        assert_eq!(parsed.deps[0].parent, "bash");
-        assert_eq!(parsed.deps[0].children, vec!["coreutils"]);
+        assert_eq!(parsed.images, lock.images);
     }
 
     const ONE_PACKAGE: &str = r#"
@@ -508,7 +583,11 @@ sha256 = "a665a45920422f9d417e4867efdc4fb8a04a1f3fff1fa07e998e86f7f7a27ae3"
 filename = "pool/main/b/bash/bash_5.0_amd64.deb"
 size = 1000
 repository = "debian"
-direct = true
+
+[[image]]
+name = "default"
+packages = ["bash"]
+direct = ["bash"]
 "#;
 
     #[test]
@@ -708,13 +787,13 @@ name = "vim"
             dependency: dep.parse().unwrap(),
         };
         let mut resolved = make_resolved();
-        resolved.unmet = vec![
+        resolved.images[0].unmet = vec![
             unmet("coreutils", "libacl1 (>= 2.2)"),
             unmet("bash", "base-files (>= 2.1.12) | debianutils"),
         ];
 
         let lock = LockFile::from_resolved(&make_manifest(), resolved);
-        let shown: Vec<_> = lock.unmet.iter().map(ToString::to_string).collect();
+        let shown: Vec<_> = lock.unmet().map(|(_, u)| u.to_string()).collect();
         assert_eq!(
             shown,
             [
@@ -724,7 +803,7 @@ name = "vim"
         );
 
         let parsed = LockFile::from_str(&lock.serialize().unwrap()).unwrap();
-        assert_eq!(parsed.unmet, lock.unmet);
+        assert_eq!(parsed.images, lock.images);
     }
 
     #[test]
@@ -757,7 +836,6 @@ name = "vim"
         let lock = |pkgs: &[(&str, &str)]| LockFile {
             config_hash: String::new(),
             repositories: vec![],
-            unmet: vec![],
             packages: pkgs
                 .iter()
                 .map(|(name, version)| LockedPackage {
@@ -768,10 +846,9 @@ name = "vim"
                     filename: String::new(),
                     size: 0,
                     repository: "debian".to_string(),
-                    direct: false,
                 })
                 .collect(),
-            deps: Vec::new(),
+            images: Vec::new(),
         };
         let old = lock(&[("bash", "5.1"), ("curl", "7"), ("zlib", "1")]);
         let new = lock(&[("bash", "5.2"), ("curl", "7"), ("libc6", "2.36")]);

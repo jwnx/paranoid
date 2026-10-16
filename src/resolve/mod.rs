@@ -6,5 +6,6 @@
 mod service;
 
 pub use service::{
-    ResolveService, ResolveServiceError, ResolvedManifest, ResolvedPackage, ResolvedRepository,
+    ResolveService, ResolveServiceError, ResolvedImage, ResolvedManifest, ResolvedPackage,
+    ResolvedRepository,
 };
