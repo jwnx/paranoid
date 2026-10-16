@@ -61,11 +61,12 @@ their separate locks except for two GDAL packages the source rule caught,
 and building `pg17` and `pgbackrest-server` from the set gives the same
 image digests as from their own locks. What's left:
 
-- Images are resolved in manifest order, and the first image to select a
-  package fixes its version. A later image that needs another version is
-  an error rather than a reason to choose differently. A joint search over
-  every image would find more solutions, at the resolver's cost (see
-  section 1).
+- Images are resolved in manifest order. When a later image can't live
+  with an earlier image's version, we adopt the later image's versions for
+  the whole set and start over, but only once per package, and only with
+  what that image picks on its own. Sets where every image would have to
+  compromise still fail. A joint search over every image would find those
+  too, at the resolver's cost (see section 1).
 - Architecture is set-wide. A multi-architecture set would need one
   resolution per architecture, and a rule for what "one version" means
   across them.

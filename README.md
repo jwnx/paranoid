@@ -247,8 +247,10 @@ An image may set `name`, `tag`, `description`, `authors`, `source`,
 `paranoid lock` fetches and verifies every repository once and resolves
 each image against that same state, in manifest order. A package has one
 version across the set: whichever image selects it first fixes its version
-for the rest, and an image that can't live with that version is an error
-naming the image that chose it. Each image still gets exactly its own
+for the rest. If a later image can't live with that version, paranoid
+resolves it on its own, holds the whole set to the versions it picks and
+starts over; when the earlier images can't live with those either, it's an
+error naming both images. Each image still gets exactly its own
 dependencies, so a builder's compilers never reach a runtime image. The
 whole set locks together and goes stale together; there's no re-locking one
 image on its own, since that is how two images end up resolved against

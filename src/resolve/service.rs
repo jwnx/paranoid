@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::arch::Architecture;
-use crate::config::Manifest;
+use crate::config::{ImageSpec, Manifest};
 use crate::hash::{ParseSha256Error, Sha256};
 use crate::http::{Client, ClientError};
 use crate::repository::debian::{
@@ -220,14 +220,32 @@ impl ResolveService {
 /// sorted by name.
 type Selected<'a> = Vec<(&'a DebianPackage, &'a str)>;
 
-/// Resolve every image of `manifest` against `index_set`, in manifest
-/// order.
+/// Each selected package's version and repository, with the image that
+/// chose it, by name.
+type Chosen<'a, 'm> = BTreeMap<&'a str, (&'a DebianPackage, &'a str, &'m str)>;
+
+/// An image that couldn't be resolved, and what the images before it chose.
+struct PassFailure<'a, 'm> {
+    image: &'m str,
+    source: ResolveError,
+    chosen: Chosen<'a, 'm>,
+}
+
+/// Resolve every image of `manifest` against `index_set`.
+///
+/// A package has one version across the set. Images resolve in manifest
+/// order, and the first image to select a package fixes its version for
+/// the rest, unless a later image can't live with it: then we resolve that
+/// image without the earlier choices, adopt the versions it picks for the
+/// whole set, and start over. Each retry fixes a package not fixed before,
+/// so this ends; it fails when the earlier images can't live with the later
+/// one's versions either.
 fn resolve_images<'a>(
     index_set: &'a PackageIndexSet,
     manifest: &Manifest,
 ) -> Result<(Vec<ResolvedImage>, Selected<'a>), ResolveServiceError> {
     let arch = manifest.architecture;
-    let holds: Vec<Hold> = manifest
+    let mut holds: Vec<Hold> = manifest
         .holds
         .iter()
         .map(|(name, hold)| Hold {
@@ -238,44 +256,97 @@ fn resolve_images<'a>(
         })
         .collect();
 
-    // Images resolve in manifest order against the same indexes. Each
-    // package keeps the version (and repository) the first image to
-    // select it chose: later images get that as a hold, so a package
-    // has one version across the set, and a later image that can't
-    // live with it is a conflict naming the image that chose it.
-    let mut chosen: BTreeMap<&str, (&DebianPackage, &str, &str)> = BTreeMap::new();
-    let mut images = Vec::new();
-    for (id, image) in &manifest.images {
-        let requests: Vec<Request> = image
-            .packages
+    let (images, chosen) = loop {
+        let failure = match resolve_pass(index_set, manifest, &holds) {
+            Ok(resolved) => break resolved,
+            Err(failure) => failure,
+        };
+        let alone = resolve(
+            index_set,
+            &requests(&manifest.images[failure.image]),
+            &holds,
+            arch,
+        );
+        let learned: Vec<Hold> = alone
             .iter()
-            .map(|spec| Request {
-                name: spec.name.clone(),
-                version: spec.version.clone(),
-                repository: spec.repository.clone(),
+            .flat_map(|alone| &alone.packages)
+            .filter(|r| {
+                let name = r.package.name.as_str();
+                failure
+                    .chosen
+                    .get(name)
+                    .is_some_and(|&(package, repository, _)| {
+                        package.version != r.package.version || repository != r.repository
+                    })
+                    && !is_learned(&holds, name)
             })
+            .map(|r| exact_hold(r.package, r.repository, failure.image))
             .collect();
-        let mut image_holds = holds.clone();
-        image_holds.extend(chosen.values().map(|&(package, repository, by)| Hold {
-            name: package.name.clone(),
-            version: Some(VersionConstraint::new(
-                VersionRelation::Equal,
-                package.version.clone(),
-            )),
-            repository: Some(repository.to_string()),
-            origin: Origin::Image(by.to_string()),
-        }));
-
-        let resolution = resolve(index_set, &requests, &image_holds, arch).map_err(|source| {
-            if manifest.is_set() {
+        if learned.is_empty() {
+            return Err(if manifest.is_set() {
                 ResolveServiceError::Image {
-                    image: id.clone(),
-                    source,
+                    image: failure.image.to_string(),
+                    source: failure.source,
                 }
             } else {
-                ResolveServiceError::Resolve(source)
+                ResolveServiceError::Resolve(failure.source)
+            });
+        }
+        holds.extend(learned);
+    };
+
+    // Each image checked its own sources; the set must agree too.
+    check_sources(chosen.values().map(|(package, _, _)| *package))?;
+
+    // A hold on nothing is most likely a misspelled name.
+    if let Some(name) = manifest
+        .holds
+        .keys()
+        .find(|name| !chosen.contains_key(name.as_str()))
+    {
+        return Err(ResolveServiceError::UnusedHold { name: name.clone() });
+    }
+
+    let chosen = chosen
+        .into_values()
+        .map(|(package, repository, _)| (package, repository))
+        .collect();
+    Ok((images, chosen))
+}
+
+/// Resolve the images in manifest order under `holds`, each package keeping
+/// the version the first image to select it chose.
+fn resolve_pass<'a, 'm>(
+    index_set: &'a PackageIndexSet,
+    manifest: &'m Manifest,
+    holds: &[Hold],
+) -> Result<(Vec<ResolvedImage>, Chosen<'a, 'm>), PassFailure<'a, 'm>> {
+    let mut chosen: Chosen<'a, 'm> = BTreeMap::new();
+    let mut images = Vec::new();
+    for (id, image) in &manifest.images {
+        let mut image_holds = holds.to_vec();
+        image_holds.extend(
+            chosen
+                .values()
+                .filter(|(package, _, _)| !is_learned(holds, &package.name))
+                .map(|&(package, repository, by)| exact_hold(package, repository, by)),
+        );
+
+        let resolution = match resolve(
+            index_set,
+            &requests(image),
+            &image_holds,
+            manifest.architecture,
+        ) {
+            Ok(resolution) => resolution,
+            Err(source) => {
+                return Err(PassFailure {
+                    image: id,
+                    source,
+                    chosen,
+                });
             }
-        })?;
+        };
 
         for r in &resolution.packages {
             chosen
@@ -299,24 +370,40 @@ fn resolve_images<'a>(
             unmet: resolution.unmet,
         });
     }
-
-    // Each image checked its own sources; the set must agree too.
-    check_sources(chosen.values().map(|(package, _, _)| *package))?;
-
-    // A hold on nothing is most likely a misspelled name.
-    if let Some(name) = manifest
-        .holds
-        .keys()
-        .find(|name| !chosen.contains_key(name.as_str()))
-    {
-        return Err(ResolveServiceError::UnusedHold { name: name.clone() });
-    }
-
-    let chosen = chosen
-        .into_values()
-        .map(|(package, repository, _)| (package, repository))
-        .collect();
     Ok((images, chosen))
+}
+
+/// Whether `holds` already fix `name` to a version an image needed.
+fn is_learned(holds: &[Hold], name: &str) -> bool {
+    holds
+        .iter()
+        .any(|h| h.name == name && matches!(h.origin, Origin::Image(_)))
+}
+
+/// The packages an image asks for, as resolver requests.
+fn requests(image: &ImageSpec) -> Vec<Request> {
+    image
+        .packages
+        .iter()
+        .map(|spec| Request {
+            name: spec.name.clone(),
+            version: spec.version.clone(),
+            repository: spec.repository.clone(),
+        })
+        .collect()
+}
+
+/// A hold on exactly this package, as image `by` chose it.
+fn exact_hold(package: &DebianPackage, repository: &str, by: &str) -> Hold {
+    Hold {
+        name: package.name.clone(),
+        version: Some(VersionConstraint::new(
+            VersionRelation::Equal,
+            package.version.clone(),
+        )),
+        repository: Some(repository.to_string()),
+        origin: Origin::Image(by.to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -415,7 +502,7 @@ Package: gcc\nVersion: 14.2\nDepends: libc6";
     }
 
     #[test]
-    fn a_later_image_cant_pick_another_version() {
+    fn image_packages_are_plain_names() {
         let set = index(POSTGRES);
         let versioned = manifest(
             "[images.runtime]\npackages = [\"postgresql-17\"]\n\n\
@@ -434,21 +521,45 @@ Package: gcc\nVersion: 14.2\nDepends: libc6";
         assert!(versions(&selected).contains(&"postgresql-17=17.12-1".to_string()));
     }
 
+    const LIBPQ: &str = "\
+Package: libpq5\nVersion: 17\n\n\
+Package: libpq5\nVersion: 18\n\n\
+Package: old-client\nVersion: 1\nDepends: libpq5 (<< 18)\n\n\
+Package: new-client\nVersion: 1\nDepends: libpq5 (>= 18)";
+
+    /// The first image would take the newest libpq5, but takes the older
+    /// one just as well; the second image can only take the older one.
     #[test]
-    fn a_conflict_names_the_image_that_chose_the_version() {
-        let set = index(
-            "Package: libpq5\nVersion: 17\n\n\
-             Package: libpq5\nVersion: 18\n\n\
-             Package: old-client\nVersion: 1\nDepends: libpq5 (<< 18)",
-        );
+    fn a_later_image_can_move_an_earlier_choice() {
+        let set = index(LIBPQ);
         let manifest = manifest(
             "[images.new]\npackages = [\"libpq5\"]\n\n\
              [images.old]\npackages = [\"old-client\"]\n",
         );
+        let (images, selected) = resolve_images(&set, &manifest).unwrap();
+        assert_eq!(versions(&selected), ["libpq5=17", "old-client=1"]);
+        assert_eq!(images[0].packages, ["libpq5"]);
+
+        // The same set in the other order agrees.
+        let reversed = self::manifest(
+            "[images.old]\npackages = [\"old-client\"]\n\n\
+             [images.new]\npackages = [\"libpq5\"]\n",
+        );
+        let (_, selected) = resolve_images(&set, &reversed).unwrap();
+        assert_eq!(versions(&selected), ["libpq5=17", "old-client=1"]);
+    }
+
+    #[test]
+    fn a_conflict_names_the_image_that_chose_the_version() {
+        let set = index(LIBPQ);
+        let manifest = manifest(
+            "[images.new]\npackages = [\"new-client\"]\n\n\
+             [images.old]\npackages = [\"old-client\"]\n",
+        );
         assert_eq!(
             resolve_images(&set, &manifest).unwrap_err().to_string(),
-            "image 'old': no version of 'libpq5' satisfies every requirement: \
-             (= 18) from image 'new', (<< 18) from old-client"
+            "image 'new': no version of 'libpq5' satisfies every requirement: \
+             (= 17) from image 'old', (>= 18) from new-client"
         );
     }
 
