@@ -361,7 +361,11 @@ the same flag.
   unpacked image. The compressor is fed fixed-size chunks, which keeps its
   output independent of how the tar writes fall.
 - Output is a tarball for `podman load` / `docker load` if `-o` ends in
-  `.tar`, otherwise an OCI image layout directory.
+  `.tar`, otherwise an OCI image layout directory. Either is written next
+  to its destination and renamed into place, so a failed build leaves the
+  previous image as it was. A layout replaces the previous one whole,
+  stale blobs included, and only ever replaces a layout or an empty
+  directory.
 - A stale lock stops the build before anything is downloaded. That means
   the manifest changed since the lock was written, or none of the keys that
   signed it are in `signed_by` any more. `--allow-stale` builds from it

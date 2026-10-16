@@ -24,6 +24,13 @@ pub enum OciError {
         source: std::io::Error,
     },
 
+    /// The output path holds something that isn't an image layout.
+    #[error(
+        "refusing to replace '{}': it isn't an OCI image layout or an empty directory",
+        .0.display()
+    )]
+    NotALayout(PathBuf),
+
     /// Failed to read an existing image.
     #[error("failed to read image '{}'", path.display())]
     ReadImage {

@@ -361,7 +361,34 @@ pub fn write_image(
         total: IMAGE_STEPS,
     });
 
-    let layer = Layer::from_rootfs(rootfs, config.compression, &output.scratch_dir()?)?;
+    // Everything is staged next to the output and moved into place at the
+    // end, so a failed build leaves the previous image as it was.
+    let parent = output.parent_dir()?;
+    let staging = match output {
+        ImageOutput::Layout(_) => Some(
+            tempfile::Builder::new()
+                .prefix(".paranoid-")
+                .tempdir_in(&parent)
+                .map_err(|source| OciError::CreateOutputDir {
+                    path: parent.clone(),
+                    source,
+                })?,
+        ),
+        ImageOutput::Tarball(_) => None,
+    };
+    #[cfg(unix)]
+    if let Some(staging) = &staging {
+        // tempfile makes it private; the layout is an ordinary directory.
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(staging.path(), fs::Permissions::from_mode(0o755)).map_err(
+            |source| OciError::CreateOutputDir {
+                path: staging.path().to_path_buf(),
+                source,
+            },
+        )?;
+    }
+    let scratch = staging.as_ref().map_or(parent.as_path(), |s| s.path());
+    let layer = Layer::from_rootfs(rootfs, config.compression, scratch)?;
     step("layer");
 
     let image_config = serde_json::to_vec_pretty(&config.image_config(layer.diff_id()))?;
@@ -398,7 +425,11 @@ pub fn write_image(
     files.sort_by(|a, b| a.0.cmp(&b.0));
 
     match output {
-        ImageOutput::Layout(dir) => write_layout(dir, files)?,
+        ImageOutput::Layout(dir) => {
+            let staging = staging.expect("layouts are staged");
+            write_layout(staging.path(), files)?;
+            replace_layout(staging, dir)?;
+        }
         ImageOutput::Tarball(path) => write_tarball(path, &files)?,
     }
     step("write");
@@ -425,14 +456,12 @@ enum Content {
 }
 
 impl ImageOutput {
-    /// Where to stage the layer: on the filesystem the image goes to.
-    fn scratch_dir(&self) -> Result<PathBuf, OciError> {
-        let dir = match self {
-            ImageOutput::Layout(dir) => dir.as_path(),
-            ImageOutput::Tarball(path) => match path.parent() {
-                Some(p) if !p.as_os_str().is_empty() => p,
-                _ => Path::new("."),
-            },
+    /// The directory the output goes in, created if need be. We stage
+    /// there, so moving the result into place is a rename.
+    fn parent_dir(&self) -> Result<PathBuf, OciError> {
+        let dir = match self.path().parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
         };
         fs::create_dir_all(dir).map_err(|source| OciError::CreateOutputDir {
             path: dir.to_path_buf(),
@@ -507,6 +536,48 @@ fn write_layout(dir: &Path, files: Vec<(String, Content)>) -> Result<(), OciErro
         }
         .map_err(|source| OciError::WriteFile { path, source })?;
     }
+    Ok(())
+}
+
+/// Swap a staged layout in for `dest`. Whatever was at `dest` goes,
+/// stale blobs included, but only if it's an OCI layout or an empty
+/// directory: a mistyped `-o` mustn't delete someone's work.
+fn replace_layout(staged: tempfile::TempDir, dest: &Path) -> Result<(), OciError> {
+    let write_err = |source| OciError::WriteFile {
+        path: dest.to_path_buf(),
+        source,
+    };
+    let old = match fs::symlink_metadata(dest) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(write_err(e)),
+        Ok(meta) => {
+            let replaceable = meta.is_dir()
+                && (dest.join("oci-layout").is_file()
+                    || fs::read_dir(dest).map_err(write_err)?.next().is_none());
+            if !replaceable {
+                return Err(OciError::NotALayout(dest.to_path_buf()));
+            }
+            // Move the old layout aside, into a directory that removes it
+            // when dropped.
+            let parent = staged.path().parent().unwrap_or(Path::new("."));
+            let trash = tempfile::Builder::new()
+                .prefix(".paranoid-old-")
+                .tempdir_in(parent)
+                .map_err(write_err)?;
+            let aside = trash.path().join("layout");
+            fs::rename(dest, &aside).map_err(write_err)?;
+            Some((trash, aside))
+        }
+    };
+    if let Err(e) = fs::rename(staged.path(), dest) {
+        if let Some((_, aside)) = &old {
+            let _ = fs::rename(aside, dest);
+        }
+        return Err(write_err(e));
+    }
+    // The staged directory is now `dest`; don't let its guard remove it.
+    let _ = staged.keep();
+    drop(old);
     Ok(())
 }
 
@@ -732,6 +803,67 @@ mod tests {
         let events = recorder.0.into_inner().unwrap();
         assert_eq!(events.first().unwrap(), "begin Image 3");
         assert!(events.last().unwrap().starts_with("end Image"));
+    }
+
+    #[test]
+    fn a_layout_replaces_the_previous_one() {
+        let output = TempDir::new().unwrap();
+        let dir = output.path().join("layout");
+        let layout = ImageOutput::Layout(dir.clone());
+        let _ = write_image(&OciConfig::new(), &test_rootfs(), &layout, &()).unwrap();
+        let stale = dir.join("blobs/sha256/stale");
+        fs::write(&stale, "from an earlier lock").unwrap();
+
+        let _ = write_image(
+            &OciConfig::new().try_image_tag("v2").unwrap(),
+            &test_rootfs(),
+            &layout,
+            &(),
+        )
+        .unwrap();
+        assert!(!stale.exists());
+        assert!(dir.join("oci-layout").is_file());
+        // Nothing staged is left behind.
+        let left: Vec<_> = fs::read_dir(output.path()).unwrap().collect();
+        assert_eq!(left.len(), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&dir).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o755);
+        }
+    }
+
+    #[test]
+    fn a_layout_wont_replace_other_directories() {
+        let output = TempDir::new().unwrap();
+        let precious = output.path().join("src");
+        fs::create_dir(&precious).unwrap();
+        fs::write(precious.join("main.rs"), "fn main() {}").unwrap();
+
+        let err = write_image(
+            &OciConfig::new(),
+            &test_rootfs(),
+            &ImageOutput::Layout(precious.clone()),
+            &(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, OciError::NotALayout(_)), "{err}");
+        assert!(precious.join("main.rs").exists());
+        let left: Vec<_> = fs::read_dir(output.path()).unwrap().collect();
+        assert_eq!(left.len(), 1, "staging left behind");
+
+        // An empty directory is fine.
+        let empty = output.path().join("empty");
+        fs::create_dir(&empty).unwrap();
+        let _ = write_image(
+            &OciConfig::new(),
+            &test_rootfs(),
+            &ImageOutput::Layout(empty.clone()),
+            &(),
+        )
+        .unwrap();
+        assert!(empty.join("index.json").is_file());
     }
 
     #[test]
