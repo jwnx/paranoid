@@ -185,6 +185,9 @@ pub enum ResolveError {
         second: String,
     },
 
+    #[error(transparent)]
+    SourceMismatch(Box<SourceMismatch>),
+
     #[error("'{package}' {field} '{relation}', but '{other}' is also needed")]
     Conflicts {
         package: String,
@@ -192,6 +195,19 @@ pub enum ResolveError {
         relation: Box<DependencySpec>,
         other: String,
     },
+}
+
+/// Two packages built from different versions of one source package.
+#[derive(Debug, Error, PartialEq, Eq)]
+#[error(
+    "'{}' and '{}' were built from different versions of source package '{source_package}': \
+     {} and {}; hold one of them to the other's version or repository",
+    first.0, second.0, first.1, second.1
+)]
+pub struct SourceMismatch {
+    pub source_package: String,
+    pub first: (String, DebianVersion),
+    pub second: (String, DebianVersion),
 }
 
 /// A selected package.
@@ -280,6 +296,7 @@ pub fn resolve<'a>(
             Outcome::Done => {
                 let resolution = pass.finish();
                 check_conflicts(&resolution)?;
+                check_sources(resolution.packages.iter().map(|r| r.package))?;
                 return Ok(resolution);
             }
             Outcome::Retry { name, requirements } => {
@@ -632,6 +649,35 @@ fn provides(spec: &DependencySpec, provided: Option<&DebianVersion>) -> bool {
         (Some(constraint), Some(version)) => constraint.is_satisfied_by(version),
         (Some(_), None) => false,
     }
+}
+
+/// Fail if two packages were built from different versions of one source
+/// package, such as a `postgresql-17` and a `postgresql-server-dev-17` from
+/// different releases. Binary versions can differ legitimately (a binNMU
+/// rebuilds some binaries as `+b1`), so source versions are compared.
+pub fn check_sources<'a>(
+    packages: impl IntoIterator<Item = &'a DebianPackage>,
+) -> Result<(), ResolveError> {
+    let mut seen: BTreeMap<&str, (&str, &DebianVersion)> = BTreeMap::new();
+    let mut packages: Vec<&DebianPackage> = packages.into_iter().collect();
+    packages.sort_by(|a, b| a.name.cmp(&b.name));
+    for package in packages {
+        let (source, version) = package.source();
+        match seen.get(source) {
+            Some(&(first, first_version)) if first_version != version => {
+                return Err(ResolveError::SourceMismatch(Box::new(SourceMismatch {
+                    source_package: source.to_string(),
+                    first: (first.to_string(), first_version.clone()),
+                    second: (package.name.clone(), version.clone()),
+                })));
+            }
+            Some(_) => {}
+            None => {
+                seen.insert(source, (&package.name, version));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Fail if a selected package `Conflicts` with or `Breaks` another one,
@@ -1204,6 +1250,43 @@ mod tests {
                 first: "b".into(),
                 second: "a".into(),
             }
+        );
+    }
+
+    /// A hold on only the headers would build extensions against a
+    /// different PostgreSQL than the one that loads them.
+    #[test]
+    fn binaries_of_one_source_must_come_from_one_source_version() {
+        let set = repos(&[(
+            "pgdg",
+            "Package: postgresql-17\nVersion: 17.11-1\n\n\
+             Package: postgresql-17\nVersion: 17.12-1\n\n\
+             Package: postgresql-server-dev-17\nSource: postgresql-17\nVersion: 17.11-1\n\n\
+             Package: postgresql-server-dev-17\nSource: postgresql-17\nVersion: 17.12-1",
+        )]);
+        let asked = ["postgresql-17", "postgresql-server-dev-17"];
+        assert!(run_held(&set, &asked, &[]).is_ok());
+
+        let held = [hold("postgresql-server-dev-17", Some("= 17.11-1"), None)];
+        assert_eq!(
+            run_held(&set, &asked, &held).unwrap_err().to_string(),
+            "'postgresql-17' and 'postgresql-server-dev-17' were built from different \
+             versions of source package 'postgresql-17': 17.12-1 and 17.11-1; hold one of \
+             them to the other's version or repository"
+        );
+    }
+
+    /// A binNMU rebuilds some binaries without a new source upload.
+    #[test]
+    fn binnmus_share_their_source_version() {
+        let set = repos(&[(
+            "debian",
+            "Package: libcaf-dev\nSource: actor-framework (0.17.6-2.1)\nVersion: 0.17.6-2.1+b1\n\n\
+             Package: libcaf-doc\nSource: actor-framework\nVersion: 0.17.6-2.1\nArchitecture: all",
+        )]);
+        assert_eq!(
+            resolves_to(&set, &["libcaf-dev", "libcaf-doc"]),
+            ["libcaf-dev=0.17.6-2.1+b1", "libcaf-doc=0.17.6-2.1"]
         );
     }
 

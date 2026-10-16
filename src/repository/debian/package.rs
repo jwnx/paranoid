@@ -55,6 +55,9 @@ pub struct DebianPackage {
     pub sha256: String,
     pub priority: Option<Priority>,
     pub description: Option<String>,
+    /// The `Source` field: the source package's name, and its version
+    /// when it differs from this package's (after a binNMU, say).
+    pub source: Option<(String, Option<DebianVersion>)>,
 }
 
 impl DebianPackage {
@@ -62,6 +65,16 @@ impl DebianPackage {
     /// `Pre-Depends`, then `Depends`.
     pub fn dependencies(&self) -> impl Iterator<Item = &PackageDependency> {
         self.pre_depends.iter().chain(&self.depends)
+    }
+
+    /// The source package this was built from, and its version: the
+    /// `Source` field's, or this package's own name and version.
+    pub fn source(&self) -> (&str, &DebianVersion) {
+        match &self.source {
+            Some((name, Some(version))) => (name, version),
+            Some((name, None)) => (name, &self.version),
+            None => (&self.name, &self.version),
+        }
     }
 
     /// Packages that must not be installed alongside this one: `Conflicts`,
@@ -72,6 +85,30 @@ impl DebianPackage {
         conflicts.chain(self.breaks.iter().map(|b| ("Breaks", b)))
     }
 }
+
+/// Parse `name` or `name (version)`.
+fn parse_source(value: &str) -> Result<(String, Option<DebianVersion>), ParseSourceError> {
+    let bad = || ParseSourceError(value.to_string());
+    match value.split_once(' ') {
+        None if !value.is_empty() => Ok((value.to_string(), None)),
+        None => Err(bad()),
+        Some((name, version)) => {
+            let version = version
+                .trim()
+                .strip_prefix('(')
+                .and_then(|v| v.strip_suffix(')'))
+                .ok_or_else(bad)?;
+            Ok((
+                name.to_string(),
+                Some(version.trim().parse().map_err(|_| bad())?),
+            ))
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+#[error("expected 'name' or 'name (version)', got '{0}'")]
+struct ParseSourceError(String);
 
 impl FromStr for DebianPackage {
     type Err = ParseDebianPackageError;
@@ -103,6 +140,7 @@ impl FromStr for DebianPackage {
                 "Provides" => pkg.provides = parse_field("Provides", &value, parse_relations)?,
                 "Conflicts" => pkg.conflicts = parse_field("Conflicts", &value, parse_relations)?,
                 "Breaks" => pkg.breaks = parse_field("Breaks", &value, parse_relations)?,
+                "Source" => pkg.source = Some(parse_field("Source", &value, parse_source)?),
                 "Filename" => pkg.filename = value,
                 "Size" => pkg.size = parse_field("Size", &value, str::parse)?,
                 "MD5sum" => pkg.md5sum = value,
@@ -247,6 +285,30 @@ Priority: required"#;
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn reads_the_source_package() {
+        let parse = |source: &str| {
+            DebianPackage::from_str(&format!(
+                "Package: libcaf-dev\nVersion: 1-1+b1\nArchitecture: amd64\n\
+                 Filename: pool/x.deb\n{source}"
+            ))
+        };
+        let source = |pkg: &DebianPackage| {
+            let (name, version) = pkg.source();
+            format!("{name} {version}")
+        };
+        assert_eq!(source(&parse("").unwrap()), "libcaf-dev 1-1+b1");
+        assert_eq!(source(&parse("Source: actor").unwrap()), "actor 1-1+b1");
+        assert_eq!(source(&parse("Source: actor (1-1)").unwrap()), "actor 1-1");
+        for bad in [
+            "Source: actor 1-1",
+            "Source: actor (1-1",
+            "Source: actor ()",
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

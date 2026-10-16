@@ -148,6 +148,12 @@ libpq5     = { repository = "pgdg" }
 A hold that matches no package in the result is an error, since it's
 usually a misspelled name.
 
+Binary packages built from the same source package must come from the same
+version of it, so a `postgresql-17` and a `postgresql-server-dev-17` from
+different releases can't end up side by side. apt allows that; paranoid
+reports it and asks for a hold. The rule compares source versions, since a
+binNMU legitimately gives some binaries of a source a `+bN` version.
+
 When several repositories carry a package, the one with the highest
 `priority` wins, then the highest version, the way apt picks a candidate.
 A negative priority means the repository is never used. Without
