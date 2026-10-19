@@ -130,6 +130,7 @@ pub async fn run(args: BuildArgs, quiet: bool) -> Result<(), CliError> {
             download: DownloadConfig {
                 jobs: args.jobs,
                 force: args.force_download,
+                ..DownloadConfig::default()
             },
             cache_dir: args.cache_dir.clone(),
             output: ImageOutput::from_path(&output),

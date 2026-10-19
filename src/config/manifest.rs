@@ -305,11 +305,11 @@ pub struct RepositoryConfig {
     /// a repository whose Release says `NotAutomatic` (like backports).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<i32>,
-    /// More base URLs serving the same pool, tried in order when a package
-    /// is gone from the repository: PGDG moves superseded versions to
-    /// apt-archive, for one. Only `.deb` downloads use them, and those are
-    /// checked against the lock, so they don't affect resolution and are
-    /// left out of the config hash.
+    /// More base URLs serving the same pool, tried in order when the
+    /// repository doesn't have a package or is down: PGDG moves superseded
+    /// versions to apt-archive, for one. Only `.deb` downloads use them,
+    /// and those are checked against the lock, so they don't affect
+    /// resolution and are left out of the config hash.
     #[serde(default, skip_serializing, deserialize_with = "deserialize_http_urls")]
     pub mirrors: Vec<Url>,
 }

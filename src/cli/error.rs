@@ -4,6 +4,8 @@ use std::error::Error;
 use std::fmt;
 use std::path::Path;
 
+use paranoid::report::render_chain;
+
 /// A top-level CLI error shown to the user before the process exits.
 pub struct CliError(String);
 
@@ -20,24 +22,6 @@ impl fmt::Debug for CliError {
 }
 
 impl Error for CliError {}
-
-/// Render an error and its causes as `outer: cause: root cause`.
-///
-/// Some library errors already include their source in their own message;
-/// a cause whose text is already shown is skipped instead of repeated.
-fn render_chain(error: &dyn Error) -> String {
-    let mut out = error.to_string();
-    let mut source = error.source();
-    while let Some(cause) = source {
-        let text = cause.to_string();
-        if !out.contains(&text) {
-            out.push_str(": ");
-            out.push_str(&text);
-        }
-        source = cause.source();
-    }
-    out
-}
 
 impl CliError {
     /// An error with `context` in front of the full cause chain.

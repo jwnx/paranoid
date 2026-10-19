@@ -1,14 +1,16 @@
 //! Fetching locked packages into a content-addressable cache.
 //!
 //! Downloads run with bounded concurrency, are verified against the lock's
-//! SHA-256 before being cached, and cache hits skip the network.
+//! SHA-256 before being cached, and cache hits skip the network. A source
+//! that's down or doesn't have a package is retried, then skipped for the
+//! next one.
 
 mod cache;
 mod error;
 mod service;
 
 pub use cache::PackageCache;
-pub use error::{DownloadError, DownloadFailures, Fetched};
+pub use error::{DownloadError, DownloadFailures, Fetched, SourceFailure, WrongBytes};
 pub use service::{DownloadConfig, DownloadService};
 
 #[cfg(test)]

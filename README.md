@@ -173,8 +173,8 @@ without its newer or pre-release versions creeping in.
 
 Some repositories drop old versions from their pool, which breaks every
 lock that still names one. PGDG moves them to apt-archive. `mirrors` lists
-more base URLs serving the same pool, which `build` tries in order when a
-package is gone (a 404) from the repository:
+more base URLs serving the same pool, which `build` tries in order when the
+repository doesn't have a package or is down:
 
 ```toml
 [repositories.pgdg]
@@ -188,6 +188,14 @@ mirrors      = ["https://apt-archive.postgresql.org/pub/repos/apt"]
 Whatever a mirror serves is checked against the lock like anything else,
 and mirrors play no part in resolution, so adding one doesn't make the
 lock stale.
+
+`build` tries each source up to three times when it fails with a 5xx, a
+timeout or a dropped connection, half a second apart and then a second,
+and then moves on to the next. Any other failure, such as a 404 or a 403,
+moves on at once. A source that serves bytes that don't match the lock
+stops the build there, without trying the rest, since it's broken or
+tampered with. When no source has a package, the error lists what each
+one answered.
 
 To lock against a fixed point in a repository's history, point `url` at a
 snapshot service and add `snapshot`. The repository becomes `url/snapshot`,

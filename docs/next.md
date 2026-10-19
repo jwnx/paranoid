@@ -90,5 +90,8 @@ image digests as from their own locks. What's left:
   built and compressed in memory. Spilling file contents to a temporary
   file, keeping only metadata in the tree, would bound it by the largest
   package instead.
-- The HTTP client has no timeouts, and decompresses `Packages` into a
-  `String`, so one non-UTF-8 `Description` fails a whole repository.
+- The HTTP client decompresses `Packages` into a `String`, so one
+  non-UTF-8 `Description` fails a whole repository.
+- `lock` doesn't retry: a 5xx from a repository while fetching
+  `InRelease` or `Packages` fails the lock. `build` retries every source
+  and moves on to the next.
