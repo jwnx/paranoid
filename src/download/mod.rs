@@ -16,6 +16,25 @@ pub use error::{
 };
 pub use service::{DownloadConfig, DownloadService, Sources};
 
+/// Every value, or else every error.
+pub(crate) fn all_or_errors<T, E>(
+    results: impl IntoIterator<Item = Result<T, E>>,
+) -> Result<Vec<T>, Vec<E>> {
+    let mut values = Vec::new();
+    let mut errors = Vec::new();
+    for result in results {
+        match result {
+            Ok(value) => values.push(value),
+            Err(error) => errors.push(error),
+        }
+    }
+    if errors.is_empty() {
+        Ok(values)
+    } else {
+        Err(errors)
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test_utils {
     use crate::arch::Architecture;

@@ -455,7 +455,12 @@ The summary at the end of a build says how many packages came from a
 store. Like mirrors, stores play no part in resolution and are left out of
 the config hash, so adding one doesn't make the lock stale.
 
-Stores are read with plain GETs, without credentials.
+Stores are read with plain GETs, without credentials. A store must answer
+a 404 for a package it doesn't have: one that answers 200 with an error
+page, as some CDNs and website-hosting setups do, serves the wrong bytes
+and stops every build. Store, repository and mirror URLs can't carry a
+query, a fragment or credentials, since package paths are appended to
+them and they show up in error messages.
 
 `paranoid cache push` fills a store with the lock's packages it doesn't
 have yet. It takes them from the local cache, or fetches them the way
@@ -468,12 +473,17 @@ Pushed 12 packages (34.1 MB) to https://debs.example.org/paranoid; 330 were ther
 
 Without a URL it pushes to the manifest's store, if it lists exactly one.
 Each package gets a `HEAD`, and a `PUT` if the store doesn't have it or
-has it at the wrong size. With `AWS_ACCESS_KEY_ID` and
+has it at the wrong size, so pushing also repairs a truncated upload. A
+403 to the `HEAD` counts as missing too, since S3 answers that for a
+missing key unless you may list the bucket; if you can't write either,
+the `PUT` says so. Packages to push are fetched the way `build` would,
+except from the store being filled. With `AWS_ACCESS_KEY_ID` and
 `AWS_SECRET_ACCESS_KEY` set (and `AWS_REGION`, by default `us-east-1`),
 requests are signed for S3, so the URL can be an S3-compatible bucket's,
 and the bucket checks each upload against the package's SHA-256. Every
-package is checked against the lock before it's pushed. A directory
-instead of a URL gets the cache's layout, to sync with other tools.
+package is checked against the lock before it's pushed. An existing
+directory instead of a URL gets the cache's layout, to sync with other
+tools.
 
 A typical setup is a bucket anyone can read, a `stores` line in the
 manifest, and `paranoid cache push` after each build on the main branch,

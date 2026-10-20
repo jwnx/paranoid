@@ -97,6 +97,15 @@ impl Retry {
     }
 }
 
+/// What a `HEAD` found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Head {
+    /// A 404.
+    Missing,
+    /// There, with its length if the server said.
+    Present { length: Option<u64> },
+}
+
 /// Generic HTTP client for fetching remote resources.
 #[derive(Debug, Clone)]
 pub struct Client {
@@ -172,24 +181,21 @@ impl Client {
         Ok(body)
     }
 
-    /// Ask for `url`'s length without its body: `None` when it's not
-    /// there (a 404).
-    pub async fn head(
-        &self,
-        url: &str,
-        headers: &[(String, String)],
-    ) -> Result<Option<u64>, ClientError> {
+    /// Ask whether `url` is there, and how long it is, without its body.
+    pub async fn head(&self, url: &str, headers: &[(String, String)]) -> Result<Head, ClientError> {
         let request = headers
             .iter()
             .fold(self.inner.head(url), |r, (name, value)| {
                 r.header(name, value)
             });
         match check_status(url, request.send().await?) {
-            Ok(response) => Ok(response
-                .headers()
-                .get(reqwest::header::CONTENT_LENGTH)
-                .and_then(|v| v.to_str().ok()?.parse().ok())),
-            Err(ClientError::NotFound { .. }) => Ok(None),
+            Ok(response) => Ok(Head::Present {
+                length: response
+                    .headers()
+                    .get(reqwest::header::CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok()?.parse().ok()),
+            }),
+            Err(ClientError::NotFound { .. }) => Ok(Head::Missing),
             Err(e) => Err(e),
         }
     }

@@ -404,13 +404,32 @@ where
 {
     let s = String::deserialize(deserializer)?;
     let url = Url::parse(&s).map_err(serde::de::Error::custom)?;
+    check_base_url(&url).map_err(serde::de::Error::custom)?;
+    Ok(url)
+}
+
+/// Check a URL that paths get appended to: a repository's, a mirror's or a
+/// store's. A query or fragment would end up in front of the path, and
+/// credentials in it would end up in every error message.
+pub fn check_base_url(url: &Url) -> Result<(), String> {
     if url.scheme() != "http" && url.scheme() != "https" {
-        return Err(serde::de::Error::custom(format!(
+        return Err(format!(
             "URL must use http or https scheme, got '{}'",
             url.scheme()
-        )));
+        ));
     }
-    Ok(url)
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(format!(
+            "'{url}' has a query or fragment, but paths are appended to it"
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(format!(
+            "'{}' has credentials in it, which would show up in logs",
+            url.host_str().unwrap_or_default()
+        ));
+    }
+    Ok(())
 }
 
 fn deserialize_http_urls<'de, D>(deserializer: D) -> Result<Vec<Url>, D::Error>
@@ -1075,6 +1094,12 @@ entrypoint = { cmd = ["make"] }
 
         let err = with("stores = [\"s3://bucket\"]").unwrap_err();
         assert!(err.to_string().contains("http or https"), "{err}");
+        let err = with("stores = [\"https://b.example.org/debs?token=x\"]").unwrap_err();
+        assert!(err.to_string().contains("has a query or fragment"), "{err}");
+        let err = with("stores = [\"https://b.example.org/debs#x\"]").unwrap_err();
+        assert!(err.to_string().contains("has a query or fragment"), "{err}");
+        let err = with("stores = [\"https://user:secret@b.example.org/debs\"]").unwrap_err();
+        assert!(err.to_string().contains("has credentials"), "{err}");
         let err = with("store = []").unwrap_err();
         assert!(err.to_string().contains("unknown field"), "{err}");
     }

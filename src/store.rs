@@ -8,14 +8,15 @@
 
 use std::fmt;
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::path::Path;
 
 use futures::stream::{self, StreamExt};
 use thiserror::Error;
 use url::Url;
 
-use crate::download::{DownloadError, Fetched, PackageCache, content_path};
-use crate::http::{Client, ClientError, Credentials, EMPTY_PAYLOAD, Retry};
+use crate::config::check_base_url;
+use crate::download::{DownloadError, Fetched, PackageCache, all_or_errors, content_path};
+use crate::http::{Client, ClientError, Credentials, EMPTY_PAYLOAD, Head, Retry};
 use crate::lock::LockedPackage;
 use crate::report::{Event, Phase, Reporter};
 
@@ -29,6 +30,7 @@ pub enum Store {
     /// An HTTP server that takes `PUT`s, under a base URL.
     Http {
         client: Client,
+        /// Without a trailing slash.
         base: String,
         /// Signs every request for S3 when set.
         credentials: Option<Credentials>,
@@ -38,7 +40,7 @@ pub enum Store {
 
 #[derive(Debug, Error)]
 pub enum StoreError {
-    #[error("'{0}' is neither an http(s) URL nor a directory; for an S3 bucket, use its https URL")]
+    #[error("{0}")]
     Target(String),
 
     #[error(transparent)]
@@ -63,7 +65,7 @@ impl fmt::Display for PushFailures {
                 "{} packages failed to push, the first {name}: {error}",
                 self.0.len()
             ),
-            [] => write!(f, "no packages failed to push"),
+            [] => unreachable!("a failure has at least one package"),
         }
     }
 }
@@ -76,18 +78,21 @@ pub struct PushReport {
 }
 
 impl Store {
-    /// The store at `target`: an `http` or `https` URL, or a directory.
-    /// Requests to a URL are signed for S3 when the environment has AWS
-    /// credentials (see [`Credentials::from_env`]).
+    /// The store at `target`: an `http` or `https` URL, or an existing
+    /// directory. Requests to a URL are signed for S3 when the environment
+    /// has AWS credentials (see [`Credentials::from_env`]).
     pub fn open(target: &str, retry: Retry) -> Result<Self, StoreError> {
         match Url::parse(target) {
             Ok(url) if matches!(url.scheme(), "http" | "https") => {
-                Ok(Self::http(&url, Credentials::from_env(), retry)?)
+                Self::http(&url, Credentials::from_env(), retry)
             }
-            Ok(url) if target.contains("://") => Err(StoreError::Target(url.to_string())),
-            _ => Ok(Self::Dir(PackageCache::with_base_dir(PathBuf::from(
-                target,
-            ))?)),
+            _ if Path::new(target).is_dir() => {
+                Ok(Self::Dir(PackageCache::with_base_dir(target.into())?))
+            }
+            _ => Err(StoreError::Target(format!(
+                "'{target}' is neither an http(s) URL nor a directory; for an S3 bucket, \
+                 use its https URL"
+            ))),
         }
     }
 
@@ -96,13 +101,22 @@ impl Store {
         url: &Url,
         credentials: Option<Credentials>,
         retry: Retry,
-    ) -> Result<Self, ClientError> {
+    ) -> Result<Self, StoreError> {
+        check_base_url(url).map_err(StoreError::Target)?;
         Ok(Self::Http {
             client: Client::new()?,
             base: url.as_str().trim_end_matches('/').to_string(),
             credentials,
             retry,
         })
+    }
+
+    /// Whether this is the store at `url`.
+    pub fn is_at(&self, url: &Url) -> bool {
+        match self {
+            Self::Http { base, .. } => base == url.as_str().trim_end_matches('/'),
+            Self::Dir(_) => false,
+        }
     }
 
     /// Whether requests are signed.
@@ -117,7 +131,9 @@ impl Store {
     }
 
     /// The packages the store doesn't have, in the order given. A package
-    /// of the wrong size counts as missing, so pushing repairs it.
+    /// of the wrong size counts as missing, so pushing repairs it, and so
+    /// does a 403: S3 answers that for a missing key unless we may list
+    /// the bucket. If we really may not write, the upload says so.
     pub async fn missing<'a>(
         &self,
         packages: &[&'a LockedPackage],
@@ -131,7 +147,9 @@ impl Store {
             }
         });
         let results: Vec<_> = stream::iter(checks).buffered(jobs.get()).collect().await;
-        collect(results).map(|missing| missing.into_iter().flatten().collect())
+        all_or_errors(results)
+            .map(|missing| missing.into_iter().flatten().collect())
+            .map_err(PushFailures)
     }
 
     /// Upload packages from the local cache, checking each against the
@@ -172,7 +190,7 @@ impl Store {
             phase: Phase::Push,
             summary: bytes,
         });
-        collect(results)?;
+        all_or_errors(results).map_err(PushFailures)?;
         Ok(PushReport {
             pushed: packages.len(),
             bytes,
@@ -180,65 +198,69 @@ impl Store {
     }
 
     async fn has(&self, package: &LockedPackage) -> Result<bool, StoreError> {
-        match self {
-            Self::Dir(cache) => Ok(cache.get(package).is_some()),
+        let (client, credentials, retry, url) = match self {
+            Self::Dir(cache) => return Ok(cache.get(package).is_some()),
             Self::Http {
                 client,
                 credentials,
                 retry,
-                ..
-            } => {
-                let url = &self.url(package);
-                let (length, _) = retry
-                    .run(|| {
-                        let headers = sign(credentials, "HEAD", url, &[], EMPTY_PAYLOAD);
-                        async move { client.head(url, &headers).await }
-                    })
-                    .await;
-                Ok(length? == Some(package.size))
+                base,
+            } => (
+                client,
+                credentials.as_ref(),
+                retry,
+                object_url(base, package),
+            ),
+        };
+        let url = &url;
+        let (head, _) = retry
+            .run(|| {
+                let headers = sign(credentials, "HEAD", url, &[], EMPTY_PAYLOAD);
+                async move { client.head(url.as_str(), &headers).await }
+            })
+            .await;
+        match head {
+            // Without a length we take the store's word for it.
+            Ok(Head::Present { length }) => Ok(length.is_none_or(|l| l == package.size)),
+            Ok(Head::Missing) => Ok(false),
+            Err(ClientError::Status { status, .. }) if status == reqwest::StatusCode::FORBIDDEN => {
+                Ok(false)
             }
+            Err(e) => Err(e.into()),
         }
     }
 
     async fn put(&self, package: &LockedPackage, data: &[u8]) -> Result<(), StoreError> {
-        match self {
+        let (client, credentials, retry, url) = match self {
             Self::Dir(cache) => {
                 cache.store(package, data)?;
-                Ok(())
+                return Ok(());
             }
             Self::Http {
                 client,
                 credentials,
                 retry,
-                ..
-            } => {
-                let url = &self.url(package);
-                // S3 checks the body against the hash we sign, so a
-                // bucket never keeps a corrupted upload.
-                let hash = package.sha256.to_string();
-                let (result, _) = retry
-                    .run(|| {
-                        let mut headers = sign(
-                            credentials,
-                            "PUT",
-                            url,
-                            &[("content-type", DEB_TYPE)],
-                            &hash,
-                        );
-                        headers.push(("content-type".to_string(), DEB_TYPE.to_string()));
-                        async move { client.put(url, &headers, data).await }
-                    })
-                    .await;
-                Ok(result?)
-            }
-        }
-    }
-
-    fn url(&self, package: &LockedPackage) -> String {
-        match self {
-            Self::Dir(cache) => cache.path_for(package).display().to_string(),
-            Self::Http { base, .. } => format!("{base}/{}", content_path(&package.sha256)),
-        }
+                base,
+            } => (
+                client,
+                credentials.as_ref(),
+                retry,
+                object_url(base, package),
+            ),
+        };
+        // S3 checks the body against the hash we sign, so a bucket never
+        // keeps a corrupted upload.
+        let hash = package.sha256.to_string();
+        let url = &url;
+        let (result, _) = retry
+            .run(|| {
+                let content_type = [("content-type", DEB_TYPE)];
+                let mut headers = sign(credentials, "PUT", url, &content_type, &hash);
+                headers.push(("content-type".to_string(), DEB_TYPE.to_string()));
+                async move { client.put(url.as_str(), &headers, data).await }
+            })
+            .await;
+        Ok(result?)
     }
 }
 
@@ -251,35 +273,25 @@ impl fmt::Display for Store {
     }
 }
 
+/// Where a package lives under a store's base URL.
+fn object_url(base: &str, package: &LockedPackage) -> Url {
+    Url::parse(&format!("{base}/{}", content_path(&package.sha256)))
+        .expect("a valid base URL with a path appended is valid")
+}
+
 /// The headers that sign a request, if there are credentials.
 fn sign(
-    credentials: &Option<Credentials>,
+    credentials: Option<&Credentials>,
     method: &str,
-    url: &str,
+    url: &Url,
     headers: &[(&str, &str)],
     payload_sha256: &str,
 ) -> Vec<(String, String)> {
-    let Some(credentials) = credentials else {
-        return Vec::new();
-    };
-    let url = Url::parse(url).expect("store URLs are valid");
-    credentials.sign(method, &url, headers, payload_sha256, chrono::Utc::now())
-}
-
-/// Every result, or every failure.
-fn collect<T>(results: Vec<Result<T, (String, StoreError)>>) -> Result<Vec<T>, PushFailures> {
-    let mut ok = Vec::new();
-    let mut failures = Vec::new();
-    for result in results {
-        match result {
-            Ok(value) => ok.push(value),
-            Err(failure) => failures.push(failure),
+    match credentials {
+        Some(credentials) => {
+            credentials.sign(method, url, headers, payload_sha256, chrono::Utc::now())
         }
-    }
-    if failures.is_empty() {
-        Ok(ok)
-    } else {
-        Err(PushFailures(failures))
+        None => Vec::new(),
     }
 }
 
@@ -460,22 +472,31 @@ mod tests {
     #[tokio::test]
     async fn reports_what_the_store_refused() {
         let dir = tempfile::TempDir::new().unwrap();
-        let packages = [package("bash", b"bash", dir.path())];
-        let server = TestServer::start(|_| Reply::Status(403)).await;
+        let packages = [
+            package("bash", b"bash", dir.path()),
+            package("dash", b"dash", dir.path()),
+        ];
+        let server = TestServer::start(|request| match request.method.as_str() {
+            "HEAD" => Reply::Status(500),
+            _ => Reply::Status(403),
+        })
+        .await;
         let store = Store::http(&server.url("/").parse().unwrap(), None, quick()).unwrap();
 
-        let all: Vec<&LockedPackage> = packages.iter().collect();
-        let error = store.missing(&all, JOBS).await.unwrap_err();
+        let all: Vec<&LockedPackage> = packages[..1].iter().collect();
+        let error = store.missing(&all, JOBS).await.unwrap_err().to_string();
         assert!(
-            error.to_string().ends_with("answered 403 Forbidden"),
+            error.ends_with("answered 500 Internal Server Error"),
             "{error}"
         );
         let error = store
             .push(&cached(dir.path(), &packages), JOBS, &())
             .await
-            .unwrap_err();
+            .unwrap_err()
+            .to_string();
         assert!(
-            error.to_string().ends_with("answered 403 Forbidden"),
+            error.starts_with("2 packages failed to push, the first bash: http://")
+                && error.ends_with("answered 403 Forbidden"),
             "{error}"
         );
     }
@@ -501,18 +522,56 @@ mod tests {
 
     #[test]
     fn opens_urls_and_directories() {
-        let open = |target| Store::open(target, quick()).map(|s| s.to_string());
+        let open = |target: &str| Store::open(target, quick()).map(|s| s.to_string());
         assert_eq!(
             open("https://bucket.example.org/debs/").unwrap(),
             "https://bucket.example.org/debs"
         );
         let err = open("s3://bucket/debs").unwrap_err().to_string();
         assert!(err.contains("use its https URL"), "{err}");
+        let err = open("https://bucket.example.org/debs?x=1")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("has a query or fragment"), "{err}");
+
         let dir = tempfile::TempDir::new().unwrap();
-        let path = dir.path().join("store");
-        assert_eq!(
-            open(path.to_str().unwrap()).unwrap(),
-            path.display().to_string()
+        let path = dir.path().to_str().unwrap();
+        assert_eq!(open(path).unwrap(), path);
+        let typo = dir.path().join("stroe");
+        let err = open(typo.to_str().unwrap()).unwrap_err().to_string();
+        assert!(
+            err.contains("neither an http(s) URL nor a directory"),
+            "{err}"
         );
+        assert!(!typo.exists());
+    }
+
+    #[test]
+    fn knows_where_it_is() {
+        let store = Store::open("https://bucket.example.org/debs", quick()).unwrap();
+        assert!(store.is_at(&"https://bucket.example.org/debs/".parse().unwrap()));
+        assert!(!store.is_at(&"https://bucket.example.org/other".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn takes_a_403_for_missing_and_no_length_for_present() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let packages = [
+            package("bash", b"bash", dir.path()),
+            package("dash", b"dash", dir.path()),
+        ];
+        let forbidden = format!("/{}", content_path(&packages[0].sha256));
+        let server = TestServer::start(move |request| match request.path == forbidden {
+            true => Reply::Status(403),
+            false => Reply::Status(200),
+        })
+        .await;
+        let store = Store::http(&server.url("/").parse().unwrap(), None, quick()).unwrap();
+        let all: Vec<&LockedPackage> = packages.iter().collect();
+        let missing = store.missing(&all, JOBS).await.unwrap();
+        let names: Vec<&str> = missing.iter().map(|p| p.name.as_str()).collect();
+        // The test server always sends a length, of 0 here, so `dash` is
+        // the wrong size; see `Head` for the case without one.
+        assert_eq!(names, ["bash", "dash"]);
     }
 }

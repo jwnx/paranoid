@@ -4,6 +4,7 @@ use std::num::NonZeroUsize;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use url::Url;
 
 use paranoid::config::Manifest;
 use paranoid::download::{DownloadConfig, DownloadService, PackageCache, Sources};
@@ -88,7 +89,13 @@ async fn push(args: PushArgs, quiet: bool) -> Result<(), CliError> {
         }
     };
     let store = Store::open(&target, Retry::default()).map_err(CliError::push)?;
-    let unsigned = !store.is_signed() && target.contains("://");
+    let unsigned = matches!(
+        store,
+        Store::Http {
+            credentials: None,
+            ..
+        }
+    );
     let refused = |e: PushFailures| {
         if unsigned {
             CliError::push_unsigned(e)
@@ -115,8 +122,20 @@ async fn push(args: PushArgs, quiet: bool) -> Result<(), CliError> {
             ..DownloadConfig::default()
         };
         let downloader = DownloadService::with_cache(cache, config).map_err(CliError::push)?;
+        // Not from the store we're filling: it may hold a broken copy,
+        // which is why we're pushing.
+        let stores: Vec<Url> = manifest
+            .stores
+            .iter()
+            .filter(|url| !store.is_at(url))
+            .cloned()
+            .collect();
+        let sources = Sources {
+            stores: &stores,
+            repositories: &manifest.repositories,
+        };
         let fetched = downloader
-            .download_all(&missing, Sources::of(&manifest), &reporter)
+            .download_all(&missing, sources, &reporter)
             .await
             .map_err(CliError::push)?;
         Some(

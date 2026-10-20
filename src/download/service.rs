@@ -140,14 +140,7 @@ impl DownloadService {
             summary: total_bytes,
         });
 
-        let (fetched, failures): (Vec<_>, Vec<_>) = results.into_iter().partition(Result::is_ok);
-        if failures.is_empty() {
-            Ok(fetched.into_iter().map(Result::unwrap).collect())
-        } else {
-            Err(DownloadFailures(
-                failures.into_iter().map(Result::unwrap_err).collect(),
-            ))
-        }
+        super::all_or_errors(results).map_err(DownloadFailures)
     }
 
     /// Make one package available in the cache.
