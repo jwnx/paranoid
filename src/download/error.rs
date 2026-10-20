@@ -90,6 +90,17 @@ impl fmt::Display for SourceFailure {
     }
 }
 
+/// Where a package came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// It was already in the local cache.
+    Cache,
+    /// A store had it.
+    Store,
+    /// Its repository, or one of the repository's mirrors.
+    Repository,
+}
+
 /// A package available in the local cache.
 #[derive(Debug, Clone)]
 pub struct Fetched<'a> {
@@ -97,8 +108,7 @@ pub struct Fetched<'a> {
     pub package: &'a LockedPackage,
     /// Path to the cached `.deb`.
     pub path: PathBuf,
-    /// Whether it was already cached before this run.
-    pub from_cache: bool,
+    pub origin: Origin,
 }
 
 /// One or more packages failed to download.

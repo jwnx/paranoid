@@ -35,6 +35,11 @@ pub struct Manifest {
     pub architecture: Architecture,
     /// The images by id, in declaration order.
     pub images: IndexMap<String, ImageSpec>,
+    /// Stores to fetch packages from by their SHA-256, before trying their
+    /// repositories: `<store>/sha256/<2 hex>/<sha256>.deb`, the layout of
+    /// the local cache. Like `mirrors`, they're left out of the config
+    /// hash.
+    pub stores: Vec<Url>,
     /// Written as a set (`[images.*]`) rather than a single `[image]`.
     set: bool,
     /// The directory paths in the manifest are relative to: the manifest's
@@ -83,6 +88,7 @@ struct RawManifest {
     repositories: IndexMap<String, RepositoryConfig>,
     #[serde(default)]
     holds: IndexMap<String, HoldSpec>,
+    download: Option<RawDownload>,
 
     // One image.
     image: Option<RawImageConfig>,
@@ -96,6 +102,14 @@ struct RawManifest {
     groups: IndexMap<String, Vec<String>>,
     #[serde(default)]
     images: IndexMap<String, RawImage>,
+}
+
+/// `[download]`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDownload {
+    #[serde(default, deserialize_with = "deserialize_http_urls")]
+    stores: Vec<Url>,
 }
 
 /// `[image]` of a single-image manifest.
@@ -161,6 +175,7 @@ impl RawManifest {
                 })
             })
             .transpose()?;
+        let stores = self.download.unwrap_or_default().stores;
         let single = self.image.is_some() || !self.packages.is_empty() || self.entrypoint.is_some();
         let set = self.defaults.is_some() || !self.groups.is_empty() || !self.images.is_empty();
         if single && set {
@@ -203,6 +218,7 @@ impl RawManifest {
                 holds: self.holds,
                 architecture,
                 images: IndexMap::from([(DEFAULT_IMAGE.to_string(), image)]),
+                stores,
                 set: false,
                 dir: PathBuf::new(),
             });
@@ -269,6 +285,7 @@ impl RawManifest {
             holds: self.holds,
             architecture: defaults.architecture,
             images,
+            stores,
             set: true,
             dir: PathBuf::new(),
         })
@@ -1039,6 +1056,27 @@ entrypoint = { cmd = ["make"] }
             plain.base_url(),
             "https://snapshot.debian.org/archive/debian"
         );
+    }
+
+    #[test]
+    fn parses_stores() {
+        let with = |download: &str| {
+            Manifest::from_str(&format!(
+                "{SET_REPOS}\n[download]\n{download}\n\n[[packages]]\nname = \"bash\"\n"
+            ))
+        };
+        let manifest =
+            with("stores = [\"https://bucket.example.org/debs/\", \"http://cache.lan\"]").unwrap();
+        let stores: Vec<&str> = manifest.stores.iter().map(Url::as_str).collect();
+        assert_eq!(
+            stores,
+            ["https://bucket.example.org/debs/", "http://cache.lan/"]
+        );
+
+        let err = with("stores = [\"s3://bucket\"]").unwrap_err();
+        assert!(err.to_string().contains("http or https"), "{err}");
+        let err = with("store = []").unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{err}");
     }
 
     #[test]

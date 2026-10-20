@@ -670,6 +670,17 @@ direct = ["bash"]
     }
 
     #[test]
+    fn stores_stay_out_of_the_config_hash() {
+        let without = make_manifest();
+        let mut with = without.clone();
+        with.stores = vec!["https://bucket.example.org/debs".parse().unwrap()];
+        assert_eq!(
+            LockFile::compute_config_hash(&without),
+            LockFile::compute_config_hash(&with)
+        );
+    }
+
+    #[test]
     fn test_config_hash_changes() {
         let config1 = r#"
 [repositories.debian]

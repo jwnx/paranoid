@@ -415,6 +415,40 @@ root, the same as with apt. The image needs whatever they call (a shell,
 Perl for debconf), and since nothing pulls Essential packages in, you
 list them in the manifest.
 
+## CACHE
+
+`build` keeps every package it fetches in the local cache, under its
+SHA-256:
+
+```
+<user cache dir>/paranoid/sha256/<first 2 hex>/<sha256>.deb
+```
+
+A store is the same layout behind a URL: a bucket, or any HTTP server.
+`build` asks the stores listed under `[download]` for each package before
+its repository, in order:
+
+```toml
+[download]
+stores = ["https://debs.example.org/paranoid"]
+```
+
+A store is addressed by hash rather than by pool path, so one store serves
+every repository and every lock. `mirrors` stand in for one repository
+only, and a snapshot repository's URL changes with every snapshot.
+
+Asking a store first is safe only because of the hash check. A store can
+be stale, wrong or tampered with, and the worst it can do is fail the
+build; it can't change an image. In exchange, an outage upstream never
+reaches a package the store has. A store that doesn't have a package, or
+is down, falls through to the next store and then to the repository, the
+same as a mirror, and a store that serves the wrong bytes stops the build.
+The summary at the end of a build says how many packages came from a
+store. Like mirrors, stores play no part in resolution and are left out of
+the config hash, so adding one doesn't make the lock stale.
+
+Stores are read with plain GETs, without credentials.
+
 ## GUARANTEES
 
 What holds today:

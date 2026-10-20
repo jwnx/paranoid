@@ -5,14 +5,16 @@ use std::num::NonZeroUsize;
 use futures::stream::{self, StreamExt};
 use indexmap::IndexMap;
 
-use crate::config::RepositoryConfig;
+use url::Url;
+
+use crate::config::{Manifest, RepositoryConfig};
 use crate::hash::Sha256;
 use crate::http::{Client, Retry};
 use crate::lock::LockedPackage;
 use crate::report::{Event, Phase, Reporter};
 
-use super::cache::PackageCache;
-use super::error::{DownloadError, DownloadFailures, Fetched, SourceFailure, WrongBytes};
+use super::cache::{PackageCache, content_path};
+use super::error::{DownloadError, DownloadFailures, Fetched, Origin, SourceFailure, WrongBytes};
 
 /// Download options.
 #[derive(Debug, Clone)]
@@ -31,6 +33,25 @@ impl Default for DownloadConfig {
             jobs: NonZeroUsize::new(4).unwrap(),
             force: false,
             retry: Retry::default(),
+        }
+    }
+}
+
+/// Where packages can come from.
+#[derive(Debug, Clone, Copy)]
+pub struct Sources<'a> {
+    /// Content-addressed stores, tried first, in order.
+    pub stores: &'a [Url],
+    /// Each package's repository, by name, with its mirrors.
+    pub repositories: &'a IndexMap<String, RepositoryConfig>,
+}
+
+impl<'a> Sources<'a> {
+    /// The stores and repositories of a manifest.
+    pub fn of(manifest: &'a Manifest) -> Self {
+        Self {
+            stores: &manifest.stores,
+            repositories: &manifest.repositories,
         }
     }
 }
@@ -64,7 +85,7 @@ impl DownloadService {
     pub async fn download_all<'a>(
         &self,
         packages: &[&'a LockedPackage],
-        repositories: &IndexMap<String, RepositoryConfig>,
+        sources: Sources<'_>,
         reporter: &dyn Reporter,
     ) -> Result<Vec<Fetched<'a>>, DownloadFailures> {
         let total_bytes = packages.iter().map(|p| p.size).sum();
@@ -74,9 +95,7 @@ impl DownloadService {
         });
 
         let downloads = packages.iter().map(|&package| async move {
-            let result = self
-                .download(package, repositories.get(&package.repository))
-                .await;
+            let result = self.download(package, sources).await;
             match &result {
                 Ok(_) => reporter.report(Event::Advance {
                     phase: Phase::Download,
@@ -116,7 +135,7 @@ impl DownloadService {
     async fn download<'a>(
         &self,
         package: &'a LockedPackage,
-        repo_config: Option<&RepositoryConfig>,
+        sources: Sources<'_>,
     ) -> Result<Fetched<'a>, DownloadError> {
         if !self.config.force
             && let Some(path) = self.cache.get(package)
@@ -124,24 +143,22 @@ impl DownloadService {
             return Ok(Fetched {
                 package,
                 path,
-                from_cache: true,
+                origin: Origin::Cache,
             });
         }
 
-        let repo_config = repo_config
-            .ok_or_else(|| DownloadError::UnknownRepository(package.repository.clone()))?;
-        let data = self.fetch(package, repo_config).await?;
+        let (data, origin) = self.fetch(package, sources).await?;
         let path = self.cache.store(package, &data)?;
 
         Ok(Fetched {
             package,
             path,
-            from_cache: false,
+            origin,
         })
     }
 
-    /// Fetch a package from the first source that has it: its repository,
-    /// then its mirrors.
+    /// Fetch a package from the first source that has it: the stores, its
+    /// repository, then the repository's mirrors.
     ///
     /// A source that's down, or doesn't have the package, isn't a reason to
     /// give up: a transient failure is retried, and then we move on to the
@@ -151,10 +168,10 @@ impl DownloadService {
     async fn fetch(
         &self,
         package: &LockedPackage,
-        repo_config: &RepositoryConfig,
-    ) -> Result<Vec<u8>, DownloadError> {
+        sources: Sources<'_>,
+    ) -> Result<(Vec<u8>, Origin), DownloadError> {
         let mut failures = Vec::new();
-        for url in Self::download_urls(package, repo_config) {
+        for (url, origin) in Self::download_urls(package, sources)? {
             match self
                 .config
                 .retry
@@ -171,7 +188,7 @@ impl DownloadService {
                             actual,
                         })));
                     }
-                    return Ok(data);
+                    return Ok((data, origin));
                 }
                 (Err(error), attempts) => failures.push(SourceFailure {
                     url,
@@ -184,15 +201,28 @@ impl DownloadService {
     }
 
     /// Where a package can be downloaded from, in the order to try.
-    fn download_urls(package: &LockedPackage, repo_config: &RepositoryConfig) -> Vec<String> {
-        let mirrors = repo_config
-            .mirrors
-            .iter()
-            .map(|m| m.as_str().trim_end_matches('/').to_string());
-        std::iter::once(repo_config.base_url())
-            .chain(mirrors)
-            .map(|base| format!("{base}/{}", package.filename))
-            .collect()
+    ///
+    /// The stores come first. Any of them may be wrong, and so may the
+    /// repository; it's the lock's hash that decides, so asking a store
+    /// first costs nothing in safety, and keeps an outage upstream away
+    /// from every package a store has.
+    fn download_urls(
+        package: &LockedPackage,
+        sources: Sources<'_>,
+    ) -> Result<Vec<(String, Origin)>, DownloadError> {
+        let repo_config = sources
+            .repositories
+            .get(&package.repository)
+            .ok_or_else(|| DownloadError::UnknownRepository(package.repository.clone()))?;
+        let base = |url: &Url| url.as_str().trim_end_matches('/').to_string();
+        let stores = sources.stores.iter().map(|store| {
+            let url = format!("{}/{}", base(store), content_path(&package.sha256));
+            (url, Origin::Store)
+        });
+        let repository = std::iter::once(repo_config.base_url())
+            .chain(repo_config.mirrors.iter().map(base))
+            .map(|base| (format!("{base}/{}", package.filename), Origin::Repository));
+        Ok(stores.chain(repository).collect())
     }
 
     /// Get a reference to the cache.
@@ -230,9 +260,25 @@ mod tests {
         }
     }
 
+    /// Where `bash` would be fetched from, with these stores and its
+    /// repository `test`.
+    fn urls_with(stores: &[&str], repo: &RepositoryConfig) -> Vec<String> {
+        let package = make_test_package("bash", Sha256::of(b"bash"));
+        let stores: Vec<Url> = stores.iter().map(|s| s.parse().unwrap()).collect();
+        let repositories = IndexMap::from([("test".to_string(), repo.clone())]);
+        let sources = Sources {
+            stores: &stores,
+            repositories: &repositories,
+        };
+        DownloadService::download_urls(&package, sources)
+            .unwrap()
+            .into_iter()
+            .map(|(url, _)| url)
+            .collect()
+    }
+
     fn urls(repo: &RepositoryConfig) -> Vec<String> {
-        let package = make_test_package("bash", crate::hash::Sha256::of(b"bash"));
-        DownloadService::download_urls(&package, repo)
+        urls_with(&[], repo)
     }
 
     #[test]
@@ -283,6 +329,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn stores_are_tried_first_by_hash() {
+        let repo = repository(
+            "https://deb.debian.org/debian",
+            None,
+            &["https://example.org"],
+        );
+        let hash = Sha256::of(b"bash").to_string();
+        assert_eq!(
+            urls_with(
+                &["https://bucket.example.org/debs/", "http://cache.lan"],
+                &repo
+            ),
+            [
+                format!(
+                    "https://bucket.example.org/debs/sha256/{}/{hash}.deb",
+                    &hash[..2]
+                ),
+                format!("http://cache.lan/sha256/{}/{hash}.deb", &hash[..2]),
+                "https://deb.debian.org/debian/pool/main/b/bash_1.0.0_amd64.deb".to_string(),
+                "https://example.org/pool/main/b/bash_1.0.0_amd64.deb".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_package_needs_its_repository_even_with_a_store() {
+        let package = make_test_package("bash", Sha256::of(b"bash"));
+        let stores = ["https://bucket.example.org/debs".parse().unwrap()];
+        let sources = Sources {
+            stores: &stores,
+            repositories: &IndexMap::new(),
+        };
+        assert!(matches!(
+            DownloadService::download_urls(&package, sources),
+            Err(DownloadError::UnknownRepository(_))
+        ));
+    }
+
     /// A service caching into `dir`, retrying without waiting.
     fn service(dir: &std::path::Path) -> DownloadService {
         let cache = PackageCache::with_base_dir(dir.to_path_buf()).unwrap();
@@ -313,18 +398,40 @@ mod tests {
         format!("http://{}", listener.local_addr().unwrap())
     }
 
-    async fn fetch(sources: &[&str]) -> (Result<Vec<u8>, DownloadError>, tempfile::TempDir) {
+    /// The store path of `bash()`.
+    fn stored() -> String {
+        format!("/{}", content_path(&Sha256::of(DEB)))
+    }
+
+    /// Fetch `bash()` from these stores, then a repository and its mirrors.
+    async fn fetch_from(
+        stores: &[&str],
+        repository_and_mirrors: &[&str],
+    ) -> Result<(Vec<u8>, Origin), DownloadError> {
         let dir = tempfile::TempDir::new().unwrap();
-        let repo = repository(sources[0], None, &sources[1..]);
-        let result = service(dir.path()).fetch(&bash(), &repo).await;
-        (result, dir)
+        let [url, mirrors @ ..] = repository_and_mirrors else {
+            panic!("no repository");
+        };
+        let repositories = IndexMap::from([("test".to_string(), repository(url, None, mirrors))]);
+        let stores: Vec<Url> = stores.iter().map(|s| s.parse().unwrap()).collect();
+        let sources = Sources {
+            stores: &stores,
+            repositories: &repositories,
+        };
+        service(dir.path()).fetch(&bash(), sources).await
+    }
+
+    async fn fetch(repository_and_mirrors: &[&str]) -> Result<Vec<u8>, DownloadError> {
+        fetch_from(&[], repository_and_mirrors)
+            .await
+            .map(|(data, _)| data)
     }
 
     #[tokio::test]
     async fn moves_on_from_a_source_that_is_down() {
         let down = TestServer::start(|_| Reply::Status(503)).await;
         let up = TestServer::start(|_| Reply::Body(DEB.to_vec())).await;
-        let (result, _dir) = fetch(&[&down.url("/"), &refused().await, &up.url("/")]).await;
+        let result = fetch(&[&down.url("/"), &refused().await, &up.url("/")]).await;
         assert_eq!(result.unwrap(), DEB);
         assert_eq!(down.requests(), vec![format!("GET {POOL}"); 3]);
         assert_eq!(up.requests(), [format!("GET {POOL}")]);
@@ -335,7 +442,7 @@ mod tests {
         let gone = TestServer::start(|_| Reply::Status(404)).await;
         let forbidden = TestServer::start(|_| Reply::Status(403)).await;
         let up = TestServer::start(|_| Reply::Body(DEB.to_vec())).await;
-        let (result, _dir) = fetch(&[&gone.url("/"), &forbidden.url("/"), &up.url("/")]).await;
+        let result = fetch(&[&gone.url("/"), &forbidden.url("/"), &up.url("/")]).await;
         assert_eq!(result.unwrap(), DEB);
         assert_eq!(gone.requests().len(), 1);
         assert_eq!(forbidden.requests().len(), 1);
@@ -345,7 +452,7 @@ mod tests {
     async fn never_moves_on_from_the_wrong_bytes() {
         let tampered = TestServer::start(|_| Reply::Body(b"evil bash".to_vec())).await;
         let up = TestServer::start(|_| Reply::Body(DEB.to_vec())).await;
-        let (result, _dir) = fetch(&[&tampered.url("/"), &up.url("/")]).await;
+        let result = fetch(&[&tampered.url("/"), &up.url("/")]).await;
         let error = result.unwrap_err();
         assert!(
             error.to_string().starts_with(&format!(
@@ -362,7 +469,7 @@ mod tests {
         let down = TestServer::start(|_| Reply::Status(502)).await;
         let gone = TestServer::start(|_| Reply::Status(404)).await;
         let refused = refused().await;
-        let (result, _dir) = fetch(&[&down.url("/"), &gone.url("/"), &refused]).await;
+        let result = fetch(&[&down.url("/"), &gone.url("/"), &refused]).await;
         let error = result.unwrap_err().to_string();
         let lines: Vec<&str> = error.lines().collect();
         assert_eq!(lines[0], "no source could serve it:");
@@ -381,17 +488,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_store_spares_the_repository() {
+        let store = TestServer::start(|_| Reply::Body(DEB.to_vec())).await;
+        let repo = TestServer::start(|_| Reply::Body(DEB.to_vec())).await;
+        let result = fetch_from(&[&store.url("/debs")], &[&repo.url("/")]).await;
+        assert_eq!(result.unwrap(), (DEB.to_vec(), Origin::Store));
+        assert_eq!(store.requests(), [format!("GET /debs{}", stored())]);
+        assert!(repo.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_repository_covers_for_a_store() {
+        let missing = TestServer::start(|_| Reply::Status(404)).await;
+        let down = TestServer::start(|_| Reply::Status(500)).await;
+        let repo = TestServer::start(|_| Reply::Body(DEB.to_vec())).await;
+        let result = fetch_from(
+            &[&missing.url("/"), &down.url("/"), &refused().await],
+            &[&repo.url("/")],
+        )
+        .await;
+        assert_eq!(result.unwrap(), (DEB.to_vec(), Origin::Repository));
+        assert_eq!(missing.requests().len(), 1);
+        assert_eq!(down.requests().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_store_with_the_wrong_bytes_stops_the_download() {
+        let store = TestServer::start(|_| Reply::Body(b"evil bash".to_vec())).await;
+        let repo = TestServer::start(|_| Reply::Body(DEB.to_vec())).await;
+        let error = fetch_from(&[&store.url("/")], &[&repo.url("/")])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, DownloadError::WrongBytes(_)), "{error}");
+        assert!(repo.requests().is_empty());
+    }
+
+    #[tokio::test]
     async fn caches_what_it_fetched() {
         let up = TestServer::start(|_| Reply::Body(DEB.to_vec())).await;
         let dir = tempfile::TempDir::new().unwrap();
         let service = service(dir.path());
-        let repo = repository(&up.url("/"), None, &[]);
+        let repositories =
+            IndexMap::from([("test".to_string(), repository(&up.url("/"), None, &[]))]);
+        let sources = Sources {
+            stores: &[],
+            repositories: &repositories,
+        };
         let package = bash();
 
-        let first = service.download(&package, Some(&repo)).await.unwrap();
-        assert!(!first.from_cache);
-        let second = service.download(&package, Some(&repo)).await.unwrap();
-        assert!(second.from_cache);
+        let first = service.download(&package, sources).await.unwrap();
+        assert_eq!(first.origin, Origin::Repository);
+        let second = service.download(&package, sources).await.unwrap();
+        assert_eq!(second.origin, Origin::Cache);
         assert_eq!(std::fs::read(second.path).unwrap(), DEB);
         assert_eq!(up.requests().len(), 1);
     }

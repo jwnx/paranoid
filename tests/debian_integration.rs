@@ -546,7 +546,7 @@ name = "ca-certificates"
 #[ignore]
 async fn test_download_packages() {
     use paranoid::config::Manifest;
-    use paranoid::download::{DownloadConfig, DownloadService, PackageCache};
+    use paranoid::download::{DownloadConfig, DownloadService, PackageCache, Sources};
     use paranoid::lock::LockFile;
     use paranoid::resolve::ResolveService;
     use tempfile::TempDir;
@@ -581,7 +581,7 @@ name = "ca-certificates"
     let fetched = download_service
         .download_all(
             &lock.packages.iter().collect::<Vec<_>>(),
-            &manifest.repositories,
+            Sources::of(&manifest),
             &(),
         )
         .await
@@ -595,11 +595,11 @@ name = "ca-certificates"
             pkg.path
         );
         println!(
-            "  {} {} -> {} (cached: {})",
+            "  {} {} -> {} ({:?})",
             pkg.package.name,
             pkg.package.version,
             pkg.path.display(),
-            pkg.from_cache
+            pkg.origin
         );
     }
 }
@@ -610,7 +610,7 @@ name = "ca-certificates"
 #[ignore]
 async fn test_download_cache_hit() {
     use paranoid::config::Manifest;
-    use paranoid::download::{DownloadConfig, DownloadService, PackageCache};
+    use paranoid::download::{DownloadConfig, DownloadService, Origin, PackageCache, Sources};
     use paranoid::lock::LockFile;
     use paranoid::resolve::ResolveService;
     use tempfile::TempDir;
@@ -646,7 +646,7 @@ name = "base-files"
     let result1 = download_service
         .download_all(
             &lock.packages.iter().collect::<Vec<_>>(),
-            &manifest.repositories,
+            Sources::of(&manifest),
             &(),
         )
         .await
@@ -658,7 +658,7 @@ name = "base-files"
         "Should have downloaded base-files"
     );
     assert!(
-        !first_download.unwrap().from_cache,
+        first_download.unwrap().origin != Origin::Cache,
         "First download should NOT be from cache"
     );
 
@@ -666,7 +666,7 @@ name = "base-files"
     let result2 = download_service
         .download_all(
             &lock.packages.iter().collect::<Vec<_>>(),
-            &manifest.repositories,
+            Sources::of(&manifest),
             &(),
         )
         .await
@@ -675,7 +675,7 @@ name = "base-files"
     let cached_download = result2.iter().find(|p| p.package.name == "base-files");
     assert!(cached_download.is_some(), "Should have base-files");
     assert!(
-        cached_download.unwrap().from_cache,
+        cached_download.unwrap().origin == Origin::Cache,
         "Second download SHOULD be from cache"
     );
 

@@ -154,11 +154,19 @@ pub async fn run(args: BuildArgs, quiet: bool) -> Result<(), CliError> {
                 None => output.display().to_string(),
             };
             let packages = lock.image(id).map_or(0, |i| i.packages.len());
+            // With stores, say how many they served, so a store that
+            // never has anything doesn't go unnoticed.
+            let from_stores = if manifest.stores.is_empty() {
+                String::new()
+            } else {
+                format!(", {} of them from a store", report.from_stores)
+            };
             eprintln!(
-                "Built {} with {} packages ({} fresh, {} cached) sized {}.",
+                "Built {} with {} packages ({} fresh{}, {} cached) sized {}.",
                 name,
                 packages,
                 report.fresh,
+                from_stores,
                 report.cached,
                 st::fmt_size(report.image.total_size),
             );

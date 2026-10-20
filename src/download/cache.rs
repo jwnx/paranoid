@@ -9,6 +9,13 @@ use crate::lock::LockedPackage;
 
 use super::DownloadError;
 
+/// Where a package with this hash lives in a content-addressed store, the
+/// local cache or a remote one: `sha256/<first 2 hex>/<hash>.deb`.
+pub fn content_path(sha256: &Sha256) -> String {
+    let hash = sha256.to_string();
+    format!("sha256/{}/{hash}.deb", &hash[..2])
+}
+
 /// Content-addressable cache for downloaded packages.
 ///
 /// Packages are stored by their SHA256 hash:
@@ -44,12 +51,7 @@ impl PackageCache {
     ///
     /// Returns the path where the package would be stored based on its SHA256 hash.
     pub fn path_for(&self, package: &LockedPackage) -> PathBuf {
-        let hash = package.sha256.to_string();
-        let prefix = &hash[..2];
-        self.base_dir
-            .join("sha256")
-            .join(prefix)
-            .join(format!("{}.deb", hash))
+        self.base_dir.join(content_path(&package.sha256))
     }
 
     /// Check if a package is already cached.

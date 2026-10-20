@@ -11,7 +11,8 @@ use thiserror::Error;
 use crate::config::Manifest;
 use crate::deb::{DebArchive, DebError};
 use crate::download::{
-    DownloadConfig, DownloadError, DownloadFailures, DownloadService, Fetched, PackageCache,
+    DownloadConfig, DownloadError, DownloadFailures, DownloadService, Fetched, Origin,
+    PackageCache, Sources,
 };
 use crate::dpkg::{DpkgDatabase, DpkgError, PackageState};
 use crate::lock::LockFile;
@@ -37,6 +38,8 @@ pub struct BuildReport {
     pub image: OciImageResult,
     /// Packages downloaded during this build.
     pub fresh: usize,
+    /// How many of the fresh packages came from a store.
+    pub from_stores: usize,
     /// Packages served from the cache.
     pub cached: usize,
     /// Entries in the assembled rootfs.
@@ -114,7 +117,7 @@ pub async fn build(
     };
     let downloader = DownloadService::with_cache(cache, options.download.clone())?;
     let fetched = downloader
-        .download_all(&packages, &manifest.repositories, reporter)
+        .download_all(&packages, Sources::of(manifest), reporter)
         .await?;
 
     let state = if spec.unconfigured {
@@ -125,10 +128,12 @@ pub async fn build(
     let rootfs = assemble(&fetched, state, reporter)?;
     let image = crate::oci::write_image(&config, &rootfs, &options.output, reporter)?;
 
-    let cached = fetched.iter().filter(|f| f.from_cache).count();
+    let count = |origin| fetched.iter().filter(|f| f.origin == origin).count();
+    let cached = count(Origin::Cache);
     Ok(BuildReport {
         image,
         fresh: fetched.len() - cached,
+        from_stores: count(Origin::Store),
         cached,
         entries: rootfs.len(),
     })
