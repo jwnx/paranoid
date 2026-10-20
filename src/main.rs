@@ -3,6 +3,7 @@
 //! Subcommands:
 //!   lock     Resolve dependencies and write paranoid.lock
 //!   build    Download packages and build an OCI image from them
+//!   cache    Fill a store with the lock's packages
 //!   inspect  Show the contents of a lock file or built image
 
 use std::process::ExitCode;
@@ -12,6 +13,7 @@ use clap::{Parser, Subcommand};
 mod cli;
 
 use cli::build::BuildArgs;
+use cli::cache::CacheArgs;
 use cli::inspect::InspectArgs;
 use cli::lock::LockArgs;
 use cli::style as st;
@@ -40,6 +42,9 @@ enum Commands {
     /// Download packages and build an OCI image from them.
     Build(BuildArgs),
 
+    /// Fill a store with the lock's packages.
+    Cache(CacheArgs),
+
     /// Show the contents of a lock file or image.
     Inspect(InspectArgs),
 }
@@ -52,6 +57,7 @@ async fn main() -> ExitCode {
     let result = match command {
         Commands::Lock(args) => cli::lock::run(args, quiet).await,
         Commands::Build(args) => cli::build::run(args, quiet).await,
+        Commands::Cache(args) => cli::cache::run(args, quiet).await,
         Commands::Inspect(args) => cli::inspect::run(args),
     };
 

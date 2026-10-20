@@ -141,6 +141,44 @@ impl Client {
         Ok(bytes.to_vec())
     }
 
+    /// Ask for `url`'s length without its body: `None` when it's not
+    /// there (a 404).
+    pub async fn head(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+    ) -> Result<Option<u64>, ClientError> {
+        let request = headers
+            .iter()
+            .fold(self.inner.head(url), |r, (name, value)| {
+                r.header(name, value)
+            });
+        match check_status(url, request.send().await?) {
+            Ok(response) => Ok(response
+                .headers()
+                .get(reqwest::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok()?.parse().ok())),
+            Err(ClientError::NotFound { .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Upload `body` to `url`.
+    pub async fn put(
+        &self,
+        url: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> Result<(), ClientError> {
+        let request = headers
+            .iter()
+            .fold(self.inner.put(url), |r, (name, value)| {
+                r.header(name, value)
+            });
+        check_status(url, request.body(body.to_vec()).send().await?)?;
+        Ok(())
+    }
+
     /// Decompress gzip data.
     pub fn decompress_gzip(data: &[u8]) -> Result<String, ClientError> {
         let mut decoder = GzDecoder::new(data);

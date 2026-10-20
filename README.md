@@ -66,6 +66,8 @@ paranoid lock    [-f MANIFEST] [-o LOCK] [--force] [--allow-unmet]
 paranoid build   [-f MANIFEST] [--lock LOCK] [-o OUT] [--image ID]...
                  [--cache-dir DIR] [--jobs N] [--force-download]
                  [--allow-stale] [--allow-unmet]
+paranoid cache push    [URL|DIR] [-f MANIFEST] [--lock LOCK] [--cache-dir DIR]
+                       [--jobs N]
 paranoid inspect lock  [FILE] [--tree] [--image ID]
 paranoid inspect image [PATH]
 ```
@@ -450,6 +452,28 @@ store. Like mirrors, stores play no part in resolution and are left out of
 the config hash, so adding one doesn't make the lock stale.
 
 Stores are read with plain GETs, without credentials.
+
+`paranoid cache push` fills a store with the lock's packages it doesn't
+have yet. It takes them from the local cache, or fetches them the way
+`build` would:
+
+```
+$ paranoid cache push https://debs.example.org/paranoid
+Pushed 12 packages (34.1 MB) to https://debs.example.org/paranoid; 330 were there already.
+```
+
+Without a URL it pushes to the manifest's store, if it lists exactly one.
+Each package gets a `HEAD`, and a `PUT` if the store doesn't have it or
+has it at the wrong size. With `AWS_ACCESS_KEY_ID` and
+`AWS_SECRET_ACCESS_KEY` set (and `AWS_REGION`, by default `us-east-1`),
+requests are signed for S3, so the URL can be an S3-compatible bucket's,
+and the bucket checks each upload against the package's SHA-256. Every
+package is checked against the lock before it's pushed. A directory
+instead of a URL gets the cache's layout, to sync with other tools.
+
+A typical setup is a bucket anyone can read, a `stores` line in the
+manifest, and `paranoid cache push` after each build on the main branch,
+which is the only place that can write to the bucket.
 
 ## GUARANTEES
 

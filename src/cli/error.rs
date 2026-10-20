@@ -45,6 +45,19 @@ impl CliError {
         Self::wrap("build failed", e)
     }
 
+    pub fn push(e: impl Error) -> Self {
+        Self::wrap("push failed", e)
+    }
+
+    /// A push to a URL without credentials, which a bucket likely refused.
+    pub fn push_unsigned(e: impl Error) -> Self {
+        let Self(message) = Self::push(e);
+        Self(format!(
+            "{message}\nrequests weren't signed; for an S3 bucket, set AWS_ACCESS_KEY_ID \
+             and AWS_SECRET_ACCESS_KEY"
+        ))
+    }
+
     pub fn missing_lock(path: &Path) -> Self {
         Self(format!(
             "lock file '{}' not found — run `paranoid lock` first",

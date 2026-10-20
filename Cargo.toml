@@ -32,6 +32,8 @@ indexmap = { version = "2", features = ["serde"] }
 pgp = { version = "0.20", default-features = false }
 libc = "0.2"
 md-5 = "0.10"
+hmac = "0.12.1"
+percent-encoding = "2.3.2"
 
 [dev-dependencies]
 proptest = "1.6"

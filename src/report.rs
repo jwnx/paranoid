@@ -16,6 +16,8 @@ pub enum Phase {
     Assemble,
     /// Writing the layer and image. Work is measured in steps.
     Image,
+    /// Uploading packages to a store. Work is measured in bytes.
+    Push,
 }
 
 /// Something that happened during a phase.

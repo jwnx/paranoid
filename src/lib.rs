@@ -12,4 +12,5 @@ pub mod report;
 pub mod repository;
 pub mod resolve;
 pub mod rootfs;
+pub mod store;
 pub mod version;

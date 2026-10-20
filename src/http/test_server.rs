@@ -13,16 +13,26 @@ pub struct Request {
     pub path: String,
     /// Header names in lower case.
     pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
     /// How many requests for this method and path there have been,
     /// this one included.
     pub count: usize,
+}
+
+impl Request {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+    }
 }
 
 /// What to do with a request.
 pub enum Reply {
     /// The status, with an empty body.
     Status(u16),
-    /// 200 with this body.
+    /// 200 with this body. A `HEAD` gets its length without it.
     Body(Vec<u8>),
     /// Never answer.
     Hang,
@@ -60,6 +70,11 @@ impl TestServer {
     /// The URL of `path` on this server.
     pub fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base)
+    }
+
+    /// Every request so far, in full.
+    pub fn received(&self) -> Vec<Request> {
+        self.requests.lock().unwrap().clone()
     }
 
     /// Every request so far, as `METHOD /path`.
@@ -101,17 +116,14 @@ async fn serve(mut stream: TcpStream, handler: Arc<Handler>, log: Arc<Mutex<Vec<
         }
         Reply::Close => return,
     };
-    let body = if request.method == "HEAD" {
-        Vec::new()
-    } else {
-        body
-    };
     let head = format!(
         "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
         body.len()
     );
     let _ = stream.write_all(head.as_bytes()).await;
-    let _ = stream.write_all(&body).await;
+    if request.method != "HEAD" {
+        let _ = stream.write_all(&body).await;
+    }
     let _ = stream.shutdown().await;
 }
 
@@ -154,6 +166,7 @@ async fn read_request(stream: &mut TcpStream) -> Option<Request> {
         method,
         path,
         headers,
+        body,
         count: 0,
     })
 }
