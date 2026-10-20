@@ -192,7 +192,9 @@ lock stale.
 `build` tries each source up to three times when it fails with a 5xx, a
 timeout or a dropped connection, half a second apart and then a second,
 and then moves on to the next. Any other failure, such as a 404 or a 403,
-moves on at once. A source that serves bytes that don't match the lock
+moves on at once. A source still failing after its retries is skipped for
+the rest of the build wherever a package has somewhere else to go, so an
+outage costs one package its retries rather than every package. A source that serves bytes that don't match the lock
 stops the build there, without trying the rest, since it's broken or
 tampered with. When no source has a package, the error lists what each
 one answered.

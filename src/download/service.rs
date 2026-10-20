@@ -1,6 +1,8 @@
 //! Download service for parallel package downloads.
 
+use std::collections::HashSet;
 use std::num::NonZeroUsize;
+use std::sync::Mutex;
 
 use futures::stream::{self, StreamExt};
 use indexmap::IndexMap;
@@ -56,11 +58,26 @@ impl<'a> Sources<'a> {
     }
 }
 
+/// One place to fetch one package from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Source {
+    /// The store, repository or mirror, by its base URL.
+    base: String,
+    /// The package under it.
+    url: String,
+    origin: Origin,
+}
+
 /// Downloads packages into a [`PackageCache`].
 pub struct DownloadService {
     client: Client,
     cache: PackageCache,
     config: DownloadConfig,
+    /// Sources that failed a package for a transient reason, retries and
+    /// all. Later packages skip them while they have anywhere else to go,
+    /// so a store that's down costs one package its retries, not every
+    /// package.
+    down: Mutex<HashSet<String>>,
 }
 
 impl DownloadService {
@@ -75,6 +92,7 @@ impl DownloadService {
             client: Client::new()?,
             cache,
             config,
+            down: Mutex::default(),
         })
     }
 
@@ -170,8 +188,19 @@ impl DownloadService {
         package: &LockedPackage,
         sources: Sources<'_>,
     ) -> Result<(Vec<u8>, Origin), DownloadError> {
+        let sources = Self::download_urls(package, sources)?;
+        let down = self.down.lock().unwrap().clone();
+        let all_down = sources.iter().all(|s| down.contains(&s.base));
         let mut failures = Vec::new();
-        for (url, origin) in Self::download_urls(package, sources)? {
+        for Source { base, url, origin } in sources {
+            if down.contains(&base) && !all_down {
+                failures.push(SourceFailure {
+                    url,
+                    error: None,
+                    attempts: 0,
+                });
+                continue;
+            }
             match self
                 .config
                 .retry
@@ -190,11 +219,16 @@ impl DownloadService {
                     }
                     return Ok((data, origin));
                 }
-                (Err(error), attempts) => failures.push(SourceFailure {
-                    url,
-                    error,
-                    attempts,
-                }),
+                (Err(error), attempts) => {
+                    if error.is_transient() {
+                        self.down.lock().unwrap().insert(base);
+                    }
+                    failures.push(SourceFailure {
+                        url,
+                        error: Some(error),
+                        attempts,
+                    });
+                }
             }
         }
         Err(DownloadError::Unavailable(failures))
@@ -209,19 +243,27 @@ impl DownloadService {
     fn download_urls(
         package: &LockedPackage,
         sources: Sources<'_>,
-    ) -> Result<Vec<(String, Origin)>, DownloadError> {
+    ) -> Result<Vec<Source>, DownloadError> {
         let repo_config = sources
             .repositories
             .get(&package.repository)
             .ok_or_else(|| DownloadError::UnknownRepository(package.repository.clone()))?;
         let base = |url: &Url| url.as_str().trim_end_matches('/').to_string();
         let stores = sources.stores.iter().map(|store| {
-            let url = format!("{}/{}", base(store), content_path(&package.sha256));
-            (url, Origin::Store)
+            let base = base(store);
+            Source {
+                url: format!("{base}/{}", content_path(&package.sha256)),
+                base,
+                origin: Origin::Store,
+            }
         });
         let repository = std::iter::once(repo_config.base_url())
             .chain(repo_config.mirrors.iter().map(base))
-            .map(|base| (format!("{base}/{}", package.filename), Origin::Repository));
+            .map(|base| Source {
+                url: format!("{base}/{}", package.filename),
+                base,
+                origin: Origin::Repository,
+            });
         Ok(stores.chain(repository).collect())
     }
 
@@ -273,7 +315,7 @@ mod tests {
         DownloadService::download_urls(&package, sources)
             .unwrap()
             .into_iter()
-            .map(|(url, _)| url)
+            .map(|source| source.url)
             .collect()
     }
 
@@ -521,6 +563,80 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, DownloadError::WrongBytes(_)), "{error}");
         assert!(repo.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn gives_up_on_a_source_that_is_down() {
+        let store = TestServer::start(|_| Reply::Status(503)).await;
+        let repo = TestServer::start(|_| Reply::Body(DEB.to_vec())).await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = service(dir.path());
+        let stores = [store.url("/").parse().unwrap()];
+        let repositories =
+            IndexMap::from([("test".to_string(), repository(&repo.url("/"), None, &[]))]);
+        let sources = Sources {
+            stores: &stores,
+            repositories: &repositories,
+        };
+
+        let mut other = bash();
+        other.filename = "pool/main/o/other.deb".to_string();
+        assert!(service.fetch(&bash(), sources).await.is_ok());
+        assert!(service.fetch(&other, sources).await.is_ok());
+        assert_eq!(store.requests().len(), 3);
+        assert_eq!(repo.requests().len(), 2);
+
+        // Down is only a reason to skip a source while there's another.
+        let repositories =
+            IndexMap::from([("test".to_string(), repository(&store.url("/"), None, &[]))]);
+        let sources = Sources {
+            stores: &[],
+            repositories: &repositories,
+        };
+        assert!(service.fetch(&bash(), sources).await.is_err());
+        let error = service.fetch(&bash(), sources).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "no source could serve it:\n  {}: 503 Service Unavailable (3 attempts)",
+                store.url(POOL)
+            )
+        );
+        assert_eq!(store.requests().len(), 9);
+    }
+
+    #[tokio::test]
+    async fn says_which_sources_it_skipped() {
+        let store = TestServer::start(|_| Reply::Status(503)).await;
+        let repo = TestServer::start(|request| match request.path.as_str() {
+            POOL => Reply::Body(DEB.to_vec()),
+            _ => Reply::Status(404),
+        })
+        .await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let service = service(dir.path());
+        let stores = [store.url("/").parse().unwrap()];
+        let repositories =
+            IndexMap::from([("test".to_string(), repository(&repo.url("/"), None, &[]))]);
+        let sources = Sources {
+            stores: &stores,
+            repositories: &repositories,
+        };
+
+        assert!(service.fetch(&bash(), sources).await.is_ok());
+        let mut gone = make_test_package("gone", Sha256::of(b"gone"));
+        gone.repository = "test".to_string();
+        let error = service.fetch(&gone, sources).await.unwrap_err().to_string();
+        let lines: Vec<&str> = error.lines().collect();
+        assert_eq!(
+            lines[1],
+            format!(
+                "  {}/{}: skipped, it was down earlier in this run",
+                store.url(""),
+                content_path(&gone.sha256)
+            )
+        );
+        assert!(lines[2].ends_with(": 404 Not Found"), "{}", lines[2]);
     }
 
     #[tokio::test]
