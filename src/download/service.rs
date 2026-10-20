@@ -1,7 +1,7 @@
 //! Download service for parallel package downloads.
 
 use std::collections::HashSet;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Mutex;
 
 use futures::stream::{self, StreamExt};
@@ -76,9 +76,8 @@ pub struct DownloadService {
     cache: PackageCache,
     config: DownloadConfig,
     /// Sources that failed a package for a transient reason, retries and
-    /// all. Later packages skip them while they have anywhere else to go,
-    /// so a store that's down costs one package its retries, not every
-    /// package.
+    /// all. Later packages ask them last, and only once, so a store that's
+    /// down costs the packages in flight their retries, not every package.
     down: Mutex<HashSet<String>>,
 }
 
@@ -190,19 +189,30 @@ impl DownloadService {
         package: &LockedPackage,
         sources: Sources<'_>,
     ) -> Result<(Vec<u8>, Origin), DownloadError> {
-        let sources = Self::download_urls(package, sources)?;
-        let down = self.down.lock().unwrap().clone();
-        let all_down = sources.iter().all(|s| down.contains(&s.base));
+        // Sources that were down for an earlier package go last, with one
+        // attempt each, so skipping them can reorder the sources but never
+        // fail a package that one of them would have served.
+        let (up, down): (Vec<_>, Vec<_>) = {
+            let down = self.down.lock().unwrap();
+            Self::download_urls(package, sources)?
+                .into_iter()
+                .partition(|source| !down.contains(&source.base))
+        };
+        let once = match up.is_empty() {
+            // Nowhere else to go: they get their retries as usual.
+            true => self.config.retry,
+            false => Retry {
+                attempts: NonZeroU32::MIN,
+                ..self.config.retry
+            },
+        };
+        let attempts = up
+            .into_iter()
+            .map(|source| (source, self.config.retry))
+            .chain(down.into_iter().map(|source| (source, once)));
+
         let mut failures = Vec::new();
-        for Source { base, url, origin } in sources {
-            if down.contains(&base) && !all_down {
-                failures.push(SourceFailure {
-                    url,
-                    error: None,
-                    attempts: 0,
-                });
-                continue;
-            }
+        for (Source { base, url, origin }, retry) in attempts {
             let wrong = |url, mismatch| {
                 DownloadError::WrongBytes(Box::new(WrongBytes {
                     url,
@@ -210,9 +220,7 @@ impl DownloadService {
                     mismatch,
                 }))
             };
-            match self
-                .config
-                .retry
+            match retry
                 .run(|| self.client.fetch_bytes_limited(&url, package.size))
                 .await
             {
@@ -222,6 +230,7 @@ impl DownloadService {
                         let expected = package.sha256;
                         return Err(wrong(url, Mismatch::Hash { expected, actual }));
                     }
+                    self.down.lock().unwrap().remove(&base);
                     return Ok((data, origin));
                 }
                 (Err(ClientError::TooLarge { .. }), _) => {
@@ -234,7 +243,7 @@ impl DownloadService {
                     }
                     failures.push(SourceFailure {
                         url,
-                        error: Some(error),
+                        error,
                         attempts,
                     });
                 }
@@ -591,7 +600,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gives_up_on_a_source_that_is_down() {
+    async fn puts_a_source_that_is_down_last() {
         let store = TestServer::start(|_| Reply::Status(503)).await;
         let repo = TestServer::start(|_| Reply::Body(DEB.to_vec())).await;
         let dir = tempfile::TempDir::new().unwrap();
@@ -611,14 +620,13 @@ mod tests {
         assert_eq!(store.requests().len(), 3);
         assert_eq!(repo.requests().len(), 2);
 
-        // Down is only a reason to skip a source while there's another.
+        // With nowhere else to go, a down source gets its retries.
         let repositories =
             IndexMap::from([("test".to_string(), repository(&store.url("/"), None, &[]))]);
         let sources = Sources {
             stores: &[],
             repositories: &repositories,
         };
-        assert!(service.fetch(&bash(), sources).await.is_err());
         let error = service.fetch(&bash(), sources).await.unwrap_err();
         assert_eq!(
             error.to_string(),
@@ -627,12 +635,17 @@ mod tests {
                 store.url(POOL)
             )
         );
-        assert_eq!(store.requests().len(), 9);
+        assert_eq!(store.requests().len(), 6);
     }
 
     #[tokio::test]
-    async fn says_which_sources_it_skipped() {
-        let store = TestServer::start(|_| Reply::Status(503)).await;
+    async fn asks_a_down_source_last_but_still_asks() {
+        // Down for the first package's three attempts, then back.
+        let store = TestServer::start(|request| match request.count {
+            1..=3 => Reply::Status(503),
+            _ => Reply::Body(DEB.to_vec()),
+        })
+        .await;
         let repo = TestServer::start(|request| match request.path.as_str() {
             POOL => Reply::Body(DEB.to_vec()),
             _ => Reply::Status(404),
@@ -647,21 +660,27 @@ mod tests {
             stores: &stores,
             repositories: &repositories,
         };
-
-        assert!(service.fetch(&bash(), sources).await.is_ok());
-        let mut gone = make_test_package("gone", Sha256::of(b"gone"));
-        gone.repository = "test".to_string();
-        let error = service.fetch(&gone, sources).await.unwrap_err().to_string();
-        let lines: Vec<&str> = error.lines().collect();
         assert_eq!(
-            lines[1],
-            format!(
-                "  {}/{}: skipped, it was down earlier in this run",
-                store.url(""),
-                content_path(&gone.sha256)
-            )
+            service.fetch(&bash(), sources).await.unwrap().1,
+            Origin::Repository
         );
-        assert!(lines[2].ends_with(": 404 Not Found"), "{}", lines[2]);
+
+        // Gone from the repository: the store, asked last, has it.
+        let mut dropped = bash();
+        dropped.filename = "pool/main/b/dropped.deb".to_string();
+        assert_eq!(
+            service.fetch(&dropped, sources).await.unwrap().1,
+            Origin::Store
+        );
+        let requests = repo.requests();
+        assert_eq!(requests.last().unwrap(), "GET /pool/main/b/dropped.deb");
+        assert_eq!(store.requests().len(), 4);
+
+        // And back in the order.
+        assert_eq!(
+            service.fetch(&bash(), sources).await.unwrap().1,
+            Origin::Store
+        );
     }
 
     #[tokio::test]

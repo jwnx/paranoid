@@ -81,9 +81,7 @@ impl fmt::Display for Mismatch {
 #[derive(Debug)]
 pub struct SourceFailure {
     pub url: String,
-    /// `None` when we didn't ask, because the source was down for an
-    /// earlier package.
-    pub error: Option<ClientError>,
+    pub error: ClientError,
     pub attempts: u32,
 }
 
@@ -98,11 +96,10 @@ impl fmt::Display for SourceFailure {
         // reqwest's own message repeats the URL, so we say what went wrong
         // underneath it.
         let reason = match &self.error {
-            None => "skipped, it was down earlier in this run".to_string(),
-            Some(ClientError::NotFound { .. }) => "404 Not Found".to_string(),
-            Some(ClientError::Status { status, .. }) => status.to_string(),
-            Some(ClientError::Http(e)) if e.is_timeout() => "timed out".to_string(),
-            Some(ClientError::Http(e)) if e.is_connect() => {
+            ClientError::NotFound { .. } => "404 Not Found".to_string(),
+            ClientError::Status { status, .. } => status.to_string(),
+            ClientError::Http(e) if e.is_timeout() => "timed out".to_string(),
+            ClientError::Http(e) if e.is_connect() => {
                 // The layers in between only repeat that it was a connect
                 // error.
                 let mut cause: &dyn std::error::Error = e;
@@ -111,11 +108,11 @@ impl fmt::Display for SourceFailure {
                 }
                 format!("could not connect: {cause}")
             }
-            Some(ClientError::Http(e)) => match e.source() {
+            ClientError::Http(e) => match e.source() {
                 Some(cause) => render_chain(cause),
                 None => e.to_string(),
             },
-            Some(other) => render_chain(other),
+            other => render_chain(other),
         };
         write!(f, "{}: {reason}", self.url)?;
         if self.attempts > 1 {
