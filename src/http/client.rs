@@ -29,21 +29,28 @@ pub enum ClientError {
         url: String,
         status: reqwest::StatusCode,
     },
+
+    #[error("{url} sent more than the {limit} bytes expected")]
+    TooLarge { url: String, limit: u64 },
 }
 
 impl ClientError {
     /// Whether asking again might work: the server was overloaded or
     /// failing, or the network was. A 404 or a 403 will say the same thing
-    /// next time.
+    /// next time, and so will a 501 or a 505.
     pub fn is_transient(&self) -> bool {
+        use reqwest::StatusCode;
         match self {
             Self::Http(e) => !e.is_builder() && !e.is_redirect(),
-            Self::Status { status, .. } => {
-                status.is_server_error()
-                    || *status == reqwest::StatusCode::TOO_MANY_REQUESTS
-                    || *status == reqwest::StatusCode::REQUEST_TIMEOUT
-            }
-            Self::Build(_) | Self::Decompress(_) | Self::NotFound { .. } => false,
+            Self::Status { status, .. } => match *status {
+                StatusCode::NOT_IMPLEMENTED | StatusCode::HTTP_VERSION_NOT_SUPPORTED => false,
+                StatusCode::TOO_MANY_REQUESTS | StatusCode::REQUEST_TIMEOUT => true,
+                status => status.is_server_error(),
+            },
+            Self::Build(_)
+            | Self::Decompress(_)
+            | Self::NotFound { .. }
+            | Self::TooLarge { .. } => false,
         }
     }
 }
@@ -141,6 +148,30 @@ impl Client {
         Ok(bytes.to_vec())
     }
 
+    /// Fetch a URL whose body should be at most `limit` bytes, giving up
+    /// as soon as it's longer, so a broken server can't stream forever.
+    pub async fn fetch_bytes_limited(&self, url: &str, limit: u64) -> Result<Vec<u8>, ClientError> {
+        let mut response = self.fetch_response(url).await?;
+        let too_large = || ClientError::TooLarge {
+            url: url.to_string(),
+            limit,
+        };
+        if response
+            .content_length()
+            .is_some_and(|length| length > limit)
+        {
+            return Err(too_large());
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            if (body.len() + chunk.len()) as u64 > limit {
+                return Err(too_large());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
+    }
+
     /// Ask for `url`'s length without its body: `None` when it's not
     /// there (a 404).
     pub async fn head(
@@ -200,7 +231,9 @@ impl Client {
     }
 }
 
-/// Turn a failure status into an error.
+/// Turn anything but a 2xx into an error. Redirects we could follow were
+/// followed; one left over, like S3's 301 to another region without a
+/// `Location`, is a failure, not a body.
 fn check_status(url: &str, response: reqwest::Response) -> Result<reqwest::Response, ClientError> {
     let status = response.status();
     if status == reqwest::StatusCode::NOT_FOUND {
@@ -208,7 +241,7 @@ fn check_status(url: &str, response: reqwest::Response) -> Result<reqwest::Respo
             url: url.to_string(),
         });
     }
-    if status.is_client_error() || status.is_server_error() {
+    if !status.is_success() {
         return Err(ClientError::Status {
             url: url.to_string(),
             status,
@@ -243,6 +276,8 @@ mod tests {
             "/forbidden" => Reply::Status(403),
             "/busy" => Reply::Status(429),
             "/broken" => Reply::Status(503),
+            "/unimplemented" => Reply::Status(501),
+            "/moved" => Reply::Status(301),
             "/cut" => Reply::Close,
             _ => {
                 let agent = request.headers.iter().find(|(n, _)| n == "user-agent");
@@ -270,6 +305,28 @@ mod tests {
         assert!(fetch("/busy").await.unwrap_err().is_transient());
         assert!(fetch("/broken").await.unwrap_err().is_transient());
         assert!(fetch("/cut").await.unwrap_err().is_transient());
+        assert!(!fetch("/unimplemented").await.unwrap_err().is_transient());
+        let moved = fetch("/moved").await.unwrap_err();
+        assert!(matches!(moved, ClientError::Status { .. }), "{moved:?}");
+        assert!(!moved.is_transient());
+    }
+
+    #[tokio::test]
+    async fn stops_reading_past_the_limit() {
+        let server = TestServer::start(|_| Reply::Body(vec![0; 100_000])).await;
+        let client = Client::new().unwrap();
+        let url = server.url("/");
+        assert_eq!(
+            client
+                .fetch_bytes_limited(&url, 100_000)
+                .await
+                .unwrap()
+                .len(),
+            100_000
+        );
+        let error = client.fetch_bytes_limited(&url, 99_999).await.unwrap_err();
+        assert!(matches!(error, ClientError::TooLarge { .. }), "{error:?}");
+        assert!(!error.is_transient());
     }
 
     #[tokio::test]

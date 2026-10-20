@@ -3,15 +3,17 @@
 //! Downloads run with bounded concurrency, are verified against the lock's
 //! SHA-256 before being cached, and cache hits skip the network. Packages
 //! come from the manifest's stores first, by hash, then from their
-//! repository and its mirrors. A source that's down or doesn't have a
-//! package is retried, then skipped for the next one.
+//! repository and its mirrors. A source that doesn't have a package is
+//! skipped for the next one, and one that's down is retried first.
 
 mod cache;
 mod error;
 mod service;
 
 pub use cache::{PackageCache, content_path};
-pub use error::{DownloadError, DownloadFailures, Fetched, Origin, SourceFailure, WrongBytes};
+pub use error::{
+    DownloadError, DownloadFailures, Fetched, Mismatch, Origin, SourceFailure, WrongBytes,
+};
 pub use service::{DownloadConfig, DownloadService, Sources};
 
 #[cfg(test)]

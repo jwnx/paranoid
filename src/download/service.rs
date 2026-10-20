@@ -11,12 +11,14 @@ use url::Url;
 
 use crate::config::{Manifest, RepositoryConfig};
 use crate::hash::Sha256;
-use crate::http::{Client, Retry};
+use crate::http::{Client, ClientError, Retry};
 use crate::lock::LockedPackage;
 use crate::report::{Event, Phase, Reporter};
 
 use super::cache::{PackageCache, content_path};
-use super::error::{DownloadError, DownloadFailures, Fetched, Origin, SourceFailure, WrongBytes};
+use super::error::{
+    DownloadError, DownloadFailures, Fetched, Mismatch, Origin, SourceFailure, WrongBytes,
+};
 
 /// Download options.
 #[derive(Debug, Clone)]
@@ -201,23 +203,30 @@ impl DownloadService {
                 });
                 continue;
             }
+            let wrong = |url, mismatch| {
+                DownloadError::WrongBytes(Box::new(WrongBytes {
+                    url,
+                    package: package.name.clone(),
+                    mismatch,
+                }))
+            };
             match self
                 .config
                 .retry
-                .run(|| self.client.fetch_bytes(&url))
+                .run(|| self.client.fetch_bytes_limited(&url, package.size))
                 .await
             {
                 (Ok(data), _) => {
                     let actual = Sha256::of(&data);
                     if actual != package.sha256 {
-                        return Err(DownloadError::WrongBytes(Box::new(WrongBytes {
-                            url,
-                            package: package.name.clone(),
-                            expected: package.sha256,
-                            actual,
-                        })));
+                        let expected = package.sha256;
+                        return Err(wrong(url, Mismatch::Hash { expected, actual }));
                     }
                     return Ok((data, origin));
+                }
+                (Err(ClientError::TooLarge { .. }), _) => {
+                    let size = package.size;
+                    return Err(wrong(url, Mismatch::TooLarge { size }));
                 }
                 (Err(error), attempts) => {
                     if error.is_transient() {
@@ -507,6 +516,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn never_reads_more_than_the_lock_says() {
+        let endless = TestServer::start(|_| Reply::Body(vec![b'x'; 1 << 20])).await;
+        let up = TestServer::start(|_| Reply::Body(DEB.to_vec())).await;
+        let error = fetch(&[&endless.url("/"), &up.url("/")]).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "{} served the wrong bytes for bash: more than the {} bytes in the lock",
+                endless.url(POOL),
+                DEB.len()
+            )
+        );
+        assert!(up.requests().is_empty());
+    }
+
+    #[tokio::test]
     async fn says_what_every_source_answered() {
         let down = TestServer::start(|_| Reply::Status(502)).await;
         let gone = TestServer::start(|_| Reply::Status(404)).await;
@@ -521,7 +546,7 @@ mod tests {
         );
         assert_eq!(lines[2], format!("  {}: 404 Not Found", gone.url(POOL)));
         assert!(
-            lines[3].starts_with(&format!("  {refused}{POOL}: "))
+            lines[3].starts_with(&format!("  {refused}{POOL}: could not connect: "))
                 && lines[3].ends_with("(3 attempts)"),
             "{}",
             lines[3]

@@ -46,12 +46,35 @@ pub enum DownloadError {
 /// a reason to try the next one: the source is broken or tampered with, and
 /// someone should know.
 #[derive(Debug, Error)]
-#[error("{url} served the wrong bytes for {package}: expected sha256 {expected}, got {actual}")]
+#[error("{url} served the wrong bytes for {package}: {mismatch}")]
 pub struct WrongBytes {
     pub url: String,
     pub package: String,
-    pub expected: Sha256,
-    pub actual: Sha256,
+    pub mismatch: Mismatch,
+}
+
+/// How a source's bytes differed from the lock's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mismatch {
+    /// More bytes than the package's size; we stopped reading.
+    TooLarge {
+        size: u64,
+    },
+    Hash {
+        expected: Sha256,
+        actual: Sha256,
+    },
+}
+
+impl fmt::Display for Mismatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooLarge { size } => write!(f, "more than the {size} bytes in the lock"),
+            Self::Hash { expected, actual } => {
+                write!(f, "expected sha256 {expected}, got {actual}")
+            }
+        }
+    }
 }
 
 /// What one source answered, after its retries.
@@ -79,6 +102,15 @@ impl fmt::Display for SourceFailure {
             Some(ClientError::NotFound { .. }) => "404 Not Found".to_string(),
             Some(ClientError::Status { status, .. }) => status.to_string(),
             Some(ClientError::Http(e)) if e.is_timeout() => "timed out".to_string(),
+            Some(ClientError::Http(e)) if e.is_connect() => {
+                // The layers in between only repeat that it was a connect
+                // error.
+                let mut cause: &dyn std::error::Error = e;
+                while let Some(next) = cause.source() {
+                    cause = next;
+                }
+                format!("could not connect: {cause}")
+            }
             Some(ClientError::Http(e)) => match e.source() {
                 Some(cause) => render_chain(cause),
                 None => e.to_string(),

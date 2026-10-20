@@ -191,15 +191,19 @@ Whatever a mirror serves is checked against the lock like anything else,
 and mirrors play no part in resolution, so adding one doesn't make the
 lock stale.
 
-`build` tries each source up to three times when it fails with a 5xx, a
-timeout or a dropped connection, half a second apart and then a second,
-and then moves on to the next. Any other failure, such as a 404 or a 403,
-moves on at once. A source still failing after its retries is skipped for
-the rest of the build wherever a package has somewhere else to go, so an
-outage costs one package its retries rather than every package. A source that serves bytes that don't match the lock
-stops the build there, without trying the rest, since it's broken or
-tampered with. When no source has a package, the error lists what each
-one answered.
+`build` tries each source up to three times when the failure might go
+away: a 5xx other than 501 or 505, a 429 or 408, a timeout, a refused or
+dropped connection. It waits half a second, then a second, and then moves
+on to the next source. Any other answer that isn't a 2xx, such as a 404, a
+403 or a redirect it couldn't follow, moves on at once. A source still
+failing after its retries is skipped for the rest of the build wherever a
+package has somewhere else to go, so an outage costs the first few
+packages their retries rather than every package.
+
+A source that serves bytes that don't match the lock, or more bytes than
+the lock says, stops the build there without trying the rest, since it's
+broken or tampered with. When no source has a package, the error lists
+what each one answered.
 
 To lock against a fixed point in a repository's history, point `url` at a
 snapshot service and add `snapshot`. The repository becomes `url/snapshot`,
