@@ -95,7 +95,7 @@ v18.20.4
 A misspelled or unknown field makes paranoid reject the manifest.
 
 ```toml
-paranoid     = "~0.3"            # optional, the paranoid versions to use
+paranoid     = "~0.4"            # optional, the paranoid versions to use
 
 [image]
 name         = "node"            # optional, also the title label

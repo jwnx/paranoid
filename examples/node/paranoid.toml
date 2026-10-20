@@ -1,4 +1,4 @@
-paranoid = "~0.3"
+paranoid = "~0.4"
 
 [image]
 name = "node"
