@@ -1,4 +1,4 @@
-paranoid = "~0.4"
+paranoid = "~0.5"
 
 [image]
 name = "etcd"
