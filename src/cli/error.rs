@@ -41,6 +41,11 @@ impl CliError {
         Self::wrap("lock file error", e)
     }
 
+    /// A lock file named on the command line that can't be read.
+    pub fn read_lock(path: &Path, e: impl Error) -> Self {
+        Self::wrap(&format!("could not read {}", path.display()), e)
+    }
+
     pub fn build(e: impl Error) -> Self {
         Self::wrap("build failed", e)
     }

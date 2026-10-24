@@ -2,9 +2,15 @@
 
 use std::collections::BTreeMap;
 
-use super::{LockFile, LockedImage};
+use serde::Serialize;
+
+use super::{LockFile, LockedImage, LockedPackage};
 
 /// How two lock files differ, image by image.
+///
+/// It serializes to the JSON that `paranoid diff --json` and `paranoid lock
+/// --json` print, which paranoid keeps stable whatever happens to the lock's
+/// own layout: fields may be added, but none removed or changed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LockDiff<'a> {
     /// Images only the newer lock has.
@@ -15,7 +21,17 @@ pub struct LockDiff<'a> {
     pub changes: Vec<Change<'a>>,
 }
 
-impl LockDiff<'_> {
+impl<'a> LockDiff<'a> {
+    /// The diff from no lock at all to `lock`: every image is new.
+    pub fn from_nothing(lock: &'a LockFile) -> Self {
+        Self {
+            added_images: lock.images.iter().map(|i| i.name.as_str()).collect(),
+            ..Self::default()
+        }
+    }
+
+    /// Whether nothing moved: no image or package changed. Two locks can
+    /// still differ in the snapshots they record.
     pub fn is_empty(&self) -> bool {
         self.added_images.is_empty() && self.removed_images.is_empty() && self.changes.is_empty()
     }
@@ -26,6 +42,9 @@ impl LockDiff<'_> {
 pub struct Change<'a> {
     pub name: &'a str,
     pub kind: ChangeKind<'a>,
+    /// The repository the package comes from: the newer lock's, or the
+    /// older one's for a removal.
+    pub repository: &'a str,
     /// The images it changed in, in lock order.
     pub images: Vec<&'a str>,
 }
@@ -39,6 +58,64 @@ pub enum ChangeKind<'a> {
     Removed { version: &'a str },
 }
 
+impl<'a> ChangeKind<'a> {
+    /// The version before and after; `None` where there was none.
+    pub fn versions(&self) -> (Option<&'a str>, Option<&'a str>) {
+        match *self {
+            Self::Changed { from, to } => (Some(from), Some(to)),
+            Self::Added { version } => (None, Some(version)),
+            Self::Removed { version } => (Some(version), None),
+        }
+    }
+}
+
+impl Serialize for LockDiff<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Json<'a> {
+            changed: bool,
+            images: Images<'a>,
+            packages: Vec<Package<'a>>,
+        }
+        #[derive(Serialize)]
+        struct Images<'a> {
+            added: &'a [&'a str],
+            removed: &'a [&'a str],
+        }
+        #[derive(Serialize)]
+        struct Package<'a> {
+            name: &'a str,
+            from: Option<&'a str>,
+            to: Option<&'a str>,
+            repository: &'a str,
+            images: &'a [&'a str],
+        }
+
+        Json {
+            changed: !self.is_empty(),
+            images: Images {
+                added: &self.added_images,
+                removed: &self.removed_images,
+            },
+            packages: self
+                .changes
+                .iter()
+                .map(|c| {
+                    let (from, to) = c.kind.versions();
+                    Package {
+                        name: c.name,
+                        from,
+                        to,
+                        repository: c.repository,
+                        images: &c.images,
+                    }
+                })
+                .collect(),
+        }
+        .serialize(serializer)
+    }
+}
+
 impl LockFile {
     /// Changes going from `self` to `newer`, by image. A package that only
     /// moves into or out of an image, at the same version, is a change too.
@@ -50,40 +127,59 @@ impl LockFile {
             changes: Vec::new(),
         };
 
-        // Each package's changes, merged across images.
-        let mut changes: BTreeMap<(&str, ChangeKind), Vec<&str>> = BTreeMap::new();
+        // Each package's changes, merged across images, with the package
+        // that has the repository.
+        type Changes<'a> = BTreeMap<(&'a str, ChangeKind<'a>), (&'a LockedPackage, Vec<&'a str>)>;
+        let mut changes: Changes = BTreeMap::new();
         for image in &newer.images {
             let Some(old_image) = self.image(&image.name) else {
                 continue;
             };
-            let versions =
-                |lock: &'a LockFile, image: &'a LockedImage| -> BTreeMap<&'a str, &'a str> {
-                    lock.image_packages(image)
-                        .into_iter()
-                        .map(|p| (p.name.as_str(), p.version.as_str()))
-                        .collect()
-                };
-            let old = versions(self, old_image);
-            let new = versions(newer, image);
-            let added_or_changed = new.iter().filter_map(|(&name, &version)| {
+            let packages = |lock: &'a LockFile,
+                            image: &'a LockedImage|
+             -> BTreeMap<&'a str, &'a LockedPackage> {
+                lock.image_packages(image)
+                    .into_iter()
+                    .map(|p| (p.name.as_str(), p))
+                    .collect()
+            };
+            let old = packages(self, old_image);
+            let new = packages(newer, image);
+            let added_or_changed = new.iter().filter_map(|(&name, &package)| {
+                let version = package.version.as_str();
                 let kind = match old.get(name) {
                     None => ChangeKind::Added { version },
-                    Some(&from) if from != version => ChangeKind::Changed { from, to: version },
+                    Some(from) if from.version != version => ChangeKind::Changed {
+                        from: &from.version,
+                        to: version,
+                    },
                     Some(_) => return None,
                 };
-                Some((name, kind))
+                Some((name, kind, package))
             });
-            let removed = old
-                .iter()
-                .filter(|(name, _)| !new.contains_key(*name))
-                .map(|(&name, &version)| (name, ChangeKind::Removed { version }));
-            for key in added_or_changed.chain(removed) {
-                changes.entry(key).or_default().push(&image.name);
+            let removed =
+                old.iter()
+                    .filter(|(name, _)| !new.contains_key(*name))
+                    .map(|(&name, &package)| {
+                        let version = &package.version;
+                        (name, ChangeKind::Removed { version }, package)
+                    });
+            for (name, kind, package) in added_or_changed.chain(removed) {
+                changes
+                    .entry((name, kind))
+                    .or_insert_with(|| (package, Vec::new()))
+                    .1
+                    .push(&image.name);
             }
         }
         diff.changes = changes
             .into_iter()
-            .map(|((name, kind), images)| Change { name, kind, images })
+            .map(|((name, kind), (package, images))| Change {
+                name,
+                kind,
+                repository: &package.repository,
+                images,
+            })
             .collect();
         diff
     }
@@ -141,6 +237,7 @@ mod tests {
         let change = |name, kind| Change {
             name,
             kind,
+            repository: "debian",
             images: vec!["default"],
         };
         assert_eq!(
@@ -182,6 +279,7 @@ mod tests {
                 Change {
                     name: "gcc",
                     kind: ChangeKind::Added { version: "12" },
+                    repository: "debian",
                     images: vec!["builder"],
                 },
                 Change {
@@ -190,11 +288,13 @@ mod tests {
                         from: "15",
                         to: "16"
                     },
+                    repository: "debian",
                     images: vec!["server"],
                 },
                 Change {
                     name: "libpq5",
                     kind: ChangeKind::Removed { version: "15" },
+                    repository: "debian",
                     images: vec!["builder"],
                 },
             ]
@@ -214,5 +314,65 @@ mod tests {
                 (&ChangeKind::Removed { version: "7" }, &vec!["a"]),
             ]
         );
+    }
+
+    #[test]
+    fn diff_names_the_repository_of_each_change() {
+        let old = set_lock(&[("default", &[("libssl3", "3.0.15"), ("zlib", "1")])]);
+        let mut new = set_lock(&[("default", &[("libssl3", "3.0.16")])]);
+        new.packages[0].repository = "debian-security".to_string();
+
+        let repositories: Vec<_> = old
+            .diff(&new)
+            .changes
+            .iter()
+            .map(|c| (c.name, c.repository))
+            .collect();
+        assert_eq!(
+            repositories,
+            [("libssl3", "debian-security"), ("zlib", "debian")]
+        );
+    }
+
+    #[test]
+    fn diff_serializes_to_the_documented_json() {
+        let old = set_lock(&[("server", &[("bash", "5.1"), ("zlib", "1")]), ("old", &[])]);
+        let new = set_lock(&[
+            ("server", &[("bash", "5.2"), ("curl", "7")]),
+            ("tools", &[]),
+        ]);
+
+        assert_eq!(
+            serde_json::to_value(old.diff(&new)).unwrap(),
+            serde_json::json!({
+                "changed": true,
+                "images": {"added": ["tools"], "removed": ["old"]},
+                "packages": [
+                    {"name": "bash", "from": "5.1", "to": "5.2",
+                     "repository": "debian", "images": ["server"]},
+                    {"name": "curl", "from": null, "to": "7",
+                     "repository": "debian", "images": ["server"]},
+                    {"name": "zlib", "from": "1", "to": null,
+                     "repository": "debian", "images": ["server"]},
+                ],
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(new.diff(&new)).unwrap(),
+            serde_json::json!({
+                "changed": false,
+                "images": {"added": [], "removed": []},
+                "packages": [],
+            })
+        );
+    }
+
+    #[test]
+    fn a_first_lock_adds_every_image() {
+        let lock = set_lock(&[("a", &[("curl", "7")]), ("b", &[])]);
+        let diff = LockDiff::from_nothing(&lock);
+        assert_eq!(diff.added_images, ["a", "b"]);
+        assert!(diff.changes.is_empty());
+        assert!(!diff.is_empty());
     }
 }

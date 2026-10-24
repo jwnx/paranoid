@@ -62,12 +62,13 @@ If you want a shell in the image, add one, like `bash`, to the package list.
 ## SYNOPSIS
 
 ```
-paranoid lock    [-f MANIFEST] [-o LOCK] [--force] [--allow-unmet]
+paranoid lock    [-f MANIFEST] [-o LOCK] [--force] [--allow-unmet] [--json]
 paranoid build   [-f MANIFEST] [--lock LOCK] [-o OUT] [--image ID]...
                  [--cache-dir DIR] [--jobs N] [--force-download]
                  [--allow-stale] [--allow-unmet]
 paranoid cache push    [URL|DIR] [-f MANIFEST] [--lock LOCK] [--cache-dir DIR]
                        [--jobs N]
+paranoid diff    OLD NEW [--json]
 paranoid inspect lock  [FILE] [--tree] [--image ID]
 paranoid inspect image [PATH]
 ```
@@ -356,6 +357,34 @@ what's missing and writes nothing. `--allow-unmet` writes the lock anyway
 and records each unmet dependency in it as an `[[unmet]]` table, so the
 gap shows up in review. Every later `lock` or `build` on that lock needs
 the same flag.
+
+`paranoid diff OLD NEW` shows what changed between two locks, as `lock`
+does when it re-resolves. With `--json`, both print the changes to stdout
+in a format paranoid keeps stable across releases, whatever happens to the
+lock's own layout. Read this rather than the lock:
+
+```json
+{
+  "changed": true,
+  "images": { "added": [], "removed": [] },
+  "packages": [
+    {
+      "name": "libssl3",
+      "from": "3.0.15-1~deb12u1",
+      "to": "3.0.16-1~deb12u1",
+      "repository": "debian-security",
+      "images": ["server", "builder"]
+    }
+  ]
+}
+```
+
+`from` is null for a package that's new and `to` for one that's gone.
+`repository` is where the package comes from, or came from if it's gone,
+and `images` are the images it changed in. A package that moves into or out
+of an image at the same version counts as a change. `changed` is false when
+no package or image moved, even if the snapshots did. Later releases may
+add fields, but won't remove any or change what they mean.
 
 ## BUILD
 

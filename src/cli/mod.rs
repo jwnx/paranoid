@@ -3,6 +3,7 @@
 
 pub mod build;
 pub mod cache;
+pub mod diff;
 pub mod error;
 pub mod inspect;
 pub mod lock;

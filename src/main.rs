@@ -4,6 +4,7 @@
 //!   lock     Resolve dependencies and write paranoid.lock
 //!   build    Download packages and build an OCI image from them
 //!   cache    Fill a store with the lock's packages
+//!   diff     Show how two lock files differ
 //!   inspect  Show the contents of a lock file or built image
 
 use std::process::ExitCode;
@@ -14,6 +15,7 @@ mod cli;
 
 use cli::build::BuildArgs;
 use cli::cache::CacheArgs;
+use cli::diff::DiffArgs;
 use cli::inspect::InspectArgs;
 use cli::lock::LockArgs;
 use cli::style as st;
@@ -45,6 +47,9 @@ enum Commands {
     /// Fill a store with the lock's packages.
     Cache(CacheArgs),
 
+    /// Show how two lock files differ.
+    Diff(DiffArgs),
+
     /// Show the contents of a lock file or image.
     Inspect(InspectArgs),
 }
@@ -58,6 +63,7 @@ async fn main() -> ExitCode {
         Commands::Lock(args) => cli::lock::run(args, quiet).await,
         Commands::Build(args) => cli::build::run(args, quiet).await,
         Commands::Cache(args) => cli::cache::run(args, quiet).await,
+        Commands::Diff(args) => cli::diff::run(args),
         Commands::Inspect(args) => cli::inspect::run(args),
     };
 
