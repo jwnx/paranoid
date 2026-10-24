@@ -1,10 +1,10 @@
 //! `paranoid lock`: resolve dependencies and write the lock file.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 
-use paranoid::config::Manifest;
+use paranoid::config::{ConfigFormat, Manifest, MovedSnapshot, SnapshotTime, set_snapshots};
 use paranoid::lock::{LockDiff, LockFile};
 use paranoid::resolve::ResolveService;
 
@@ -38,10 +38,92 @@ pub struct LockArgs {
     /// does: `"changed": false` when no package or image moved.
     #[arg(long)]
     json: bool,
+
+    /// Move every repository that has a `snapshot` to TIME and re-lock.
+    ///
+    /// TIME is `now` or a time like 20261020T000000Z. The manifest is
+    /// rewritten only once the new lock resolves.
+    #[arg(long, value_name = "TIME", value_parser = parse_snapshot)]
+    snapshot: Option<SnapshotTime>,
+}
+
+/// `--snapshot`: `now`, or a snapshot time that isn't in the future.
+fn parse_snapshot(s: &str) -> Result<SnapshotTime, String> {
+    let now = SnapshotTime::now();
+    if s == "now" {
+        return Ok(now);
+    }
+    let time: SnapshotTime = s.parse()?;
+    if time > now {
+        return Err(format!("{time} is in the future"));
+    }
+    Ok(time)
+}
+
+/// The manifest's text with its snapshots moved, to write once the lock
+/// resolves.
+struct Rewrite {
+    path: PathBuf,
+    time: SnapshotTime,
+    text: String,
+    moved: Vec<MovedSnapshot>,
+}
+
+impl Rewrite {
+    /// Move the snapshots of the manifest at `path` to `time`, in memory.
+    fn new(path: &Path, time: SnapshotTime) -> Result<Self, CliError> {
+        if !matches!(Manifest::detect_format(path), Ok(ConfigFormat::Toml)) {
+            return Err(CliError::config(format!(
+                "--snapshot can only rewrite a TOML manifest, and {} isn't one",
+                path.display()
+            )));
+        }
+        let content = std::fs::read_to_string(path).map_err(CliError::manifest)?;
+        let (text, moved) = set_snapshots(&content, time).map_err(CliError::manifest)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            time,
+            text,
+            moved,
+        })
+    }
+
+    fn save(&self) -> Result<(), CliError> {
+        if self.moved.is_empty() {
+            return Ok(());
+        }
+        std::fs::write(&self.path, &self.text)
+            .map_err(|e| CliError::config(format!("could not write {}: {e}", self.path.display())))
+    }
 }
 
 pub async fn run(args: LockArgs, quiet: bool) -> Result<(), CliError> {
-    let manifest = Manifest::load(&args.manifest).map_err(CliError::manifest)?;
+    let path = Manifest::locate(&args.manifest).map_err(CliError::manifest)?;
+    let rewrite = args
+        .snapshot
+        .map(|time| Rewrite::new(&path, time))
+        .transpose()?;
+    let manifest = match &rewrite {
+        Some(rewrite) => Manifest::from_file_content(&path, &rewrite.text),
+        None => Manifest::from_file(&path),
+    }
+    .map_err(CliError::manifest)?;
+    if let Some(rewrite) = &rewrite {
+        if !manifest.repositories.values().any(|r| r.snapshot.is_some()) {
+            return Err(CliError::config(format!(
+                "--snapshot moves the repositories that have a `snapshot`, and {} has none",
+                path.display()
+            )));
+        }
+        if !quiet && !rewrite.moved.is_empty() {
+            let names: Vec<_> = rewrite
+                .moved
+                .iter()
+                .map(|m| m.repository.as_str())
+                .collect();
+            eprintln!("Moving {} to snapshot {}.", names.join(", "), rewrite.time);
+        }
+    }
     let output = args
         .output
         .unwrap_or_else(|| Manifest::default_lock_path(&args.manifest));
@@ -64,6 +146,9 @@ pub async fn run(args: LockArgs, quiet: bool) -> Result<(), CliError> {
         && existing.is_current(&manifest).unwrap_or(false)
     {
         check_unmet(existing, args.allow_unmet)?;
+        if let Some(rewrite) = &rewrite {
+            rewrite.save()?;
+        }
         if args.json {
             diff::print_json(&LockDiff::default());
         }
@@ -93,6 +178,9 @@ pub async fn run(args: LockArgs, quiet: bool) -> Result<(), CliError> {
         eprintln!();
     }
     check_unmet(&lock, args.allow_unmet)?;
+    if let Some(rewrite) = &rewrite {
+        rewrite.save()?;
+    }
     lock.write(&output).map_err(CliError::lock)?;
 
     let diff = match &existing {

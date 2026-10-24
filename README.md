@@ -63,6 +63,7 @@ If you want a shell in the image, add one, like `bash`, to the package list.
 
 ```
 paranoid lock    [-f MANIFEST] [-o LOCK] [--force] [--allow-unmet] [--json]
+                 [--snapshot TIME]
 paranoid build   [-f MANIFEST] [--lock LOCK] [-o OUT] [--image ID]...
                  [--cache-dir DIR] [--jobs N] [--force-download]
                  [--allow-stale] [--allow-unmet]
@@ -222,6 +223,14 @@ signed_by    = "keys/debian-archive-trixie-automatic.asc"
 An old snapshot's Release is usually past its `Valid-Until`. With
 `snapshot` set, paranoid checks that the Release was valid at the
 snapshot's time instead of now, and that it isn't dated after it.
+
+`paranoid lock --snapshot now` moves every repository that has a
+`snapshot` to the current time and re-locks, and `--snapshot
+20261020T000000Z` moves them to that time instead. It changes only the
+`snapshot` values and leaves the rest of the manifest as written,
+comments included. It writes the manifest only once the new lock
+resolves, so a failed resolution leaves both files as they were. It
+needs a TOML manifest.
 
 `cmd` is the image's *entrypoint*: arguments to `podman run` are appended
 to it, they don't replace it.

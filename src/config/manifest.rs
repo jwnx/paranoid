@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, SubsecRound, Utc};
 use indexmap::IndexMap;
 use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
@@ -351,6 +351,11 @@ pub struct SnapshotTime(DateTime<Utc>);
 const SNAPSHOT_FORMAT: &str = "%Y%m%dT%H%M%SZ";
 
 impl SnapshotTime {
+    /// The current time, to the second.
+    pub fn now() -> Self {
+        Self(Utc::now().trunc_subsecs(0))
+    }
+
     pub fn time(&self) -> DateTime<Utc> {
         self.0
     }
@@ -520,6 +525,9 @@ pub enum ManifestError {
     #[error("{0}")]
     ParseToml(#[from] toml::de::Error),
 
+    #[error("{0}")]
+    EditToml(#[from] toml_edit::TomlError),
+
     #[error("YAML parse error: {0}")]
     ParseYaml(#[from] serde_yaml::Error),
 
@@ -570,10 +578,16 @@ const CONFIG_FILE_NAMES: &[&str] = &[
 impl Manifest {
     /// Load a manifest from a file, or find one in a directory.
     pub fn load(path: &Path) -> Result<Self, ManifestError> {
+        Self::from_file(&Self::locate(path)?)
+    }
+
+    /// The manifest file at `path`: `path` itself, or the one manifest in
+    /// it if it's a directory.
+    pub fn locate(path: &Path) -> Result<PathBuf, ManifestError> {
         if path.is_dir() {
-            Self::from_dir(path)
+            Self::find_in(path)
         } else {
-            Self::from_file(path)
+            Ok(path.to_path_buf())
         }
     }
 
@@ -593,7 +607,12 @@ impl Manifest {
     /// Looks for `paranoid.toml`, `paranoid.yaml`, `paranoid.yml`, or `paranoid.json`.
     /// Returns an error if no config file is found or if multiple are present.
     pub fn from_dir(dir: &Path) -> Result<Self, ManifestError> {
-        let found: Vec<PathBuf> = CONFIG_FILE_NAMES
+        Self::from_file(&Self::find_in(dir)?)
+    }
+
+    /// The one manifest file in `dir`.
+    fn find_in(dir: &Path) -> Result<PathBuf, ManifestError> {
+        let mut found: Vec<PathBuf> = CONFIG_FILE_NAMES
             .iter()
             .map(|name| dir.join(name))
             .filter(|path| path.exists())
@@ -603,16 +622,22 @@ impl Manifest {
             0 => Err(ManifestError::NotFound {
                 dir: dir.to_path_buf(),
             }),
-            1 => Self::from_file(&found[0]),
+            1 => Ok(found.remove(0)),
             _ => Err(ManifestError::MultipleFound { files: found }),
         }
     }
 
     /// Loads a manifest from a file, detecting format from extension.
     pub fn from_file(path: &Path) -> Result<Self, ManifestError> {
-        let format = Self::detect_format(path)?;
         let content = std::fs::read_to_string(path)?;
-        let mut manifest = Self::from_str_with_format(&content, format)?;
+        Self::from_file_content(path, &content)
+    }
+
+    /// Parses `content` as the manifest at `path`: in the format its
+    /// extension says, with paths relative to its directory.
+    pub fn from_file_content(path: &Path, content: &str) -> Result<Self, ManifestError> {
+        let format = Self::detect_format(path)?;
+        let mut manifest = Self::from_str_with_format(content, format)?;
         manifest.dir = path.parent().unwrap_or(Path::new("")).to_path_buf();
         Ok(manifest)
     }
