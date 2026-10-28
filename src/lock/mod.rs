@@ -6,7 +6,7 @@
 mod diff;
 mod lockfile;
 
-pub use diff::{Change, ChangeKind, LockDiff};
+pub use diff::{Change, ChangeKind, FileChange, LockDiff};
 pub use lockfile::{
     LockFile, LockFileError, LockedFile, LockedImage, LockedPackage, LockedUnmet, Trust,
 };

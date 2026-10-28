@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-use super::{LockFile, LockedImage, LockedPackage};
+use crate::hash::Sha256;
+
+use super::{LockFile, LockedFile, LockedImage, LockedPackage};
 
 /// How two lock files differ, image by image.
 ///
@@ -19,6 +21,8 @@ pub struct LockDiff<'a> {
     pub removed_images: Vec<&'a str>,
     /// Package changes in the images both locks have, sorted by name.
     pub changes: Vec<Change<'a>>,
+    /// File changes in the images both locks have, sorted by name.
+    pub files: Vec<FileChange<'a>>,
 }
 
 impl<'a> LockDiff<'a> {
@@ -30,10 +34,13 @@ impl<'a> LockDiff<'a> {
         }
     }
 
-    /// Whether nothing moved: no image or package changed. Two locks can
-    /// still differ in the snapshots they record.
+    /// Whether nothing moved: no image, package or file changed. Two locks
+    /// can still differ in the snapshots they record.
     pub fn is_empty(&self) -> bool {
-        self.added_images.is_empty() && self.removed_images.is_empty() && self.changes.is_empty()
+        self.added_images.is_empty()
+            && self.removed_images.is_empty()
+            && self.changes.is_empty()
+            && self.files.is_empty()
     }
 }
 
@@ -45,6 +52,19 @@ pub struct Change<'a> {
     /// The repository the package comes from: the newer lock's, or the
     /// older one's for a removal.
     pub repository: &'a str,
+    /// The images it changed in, in lock order.
+    pub images: Vec<&'a str>,
+}
+
+/// How one file changed in some images: it's new, gone, or now comes
+/// from another URL or has another hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileChange<'a> {
+    pub name: &'a str,
+    /// The file before; `None` if it's new.
+    pub from: Option<&'a LockedFile>,
+    /// The file after; `None` if it's gone.
+    pub to: Option<&'a LockedFile>,
     /// The images it changed in, in lock order.
     pub images: Vec<&'a str>,
 }
@@ -76,6 +96,7 @@ impl Serialize for LockDiff<'_> {
             changed: bool,
             images: Images<'a>,
             packages: Vec<Package<'a>>,
+            files: Vec<File<'a>>,
         }
         #[derive(Serialize)]
         struct Images<'a> {
@@ -89,6 +110,24 @@ impl Serialize for LockDiff<'_> {
             to: Option<&'a str>,
             repository: &'a str,
             images: &'a [&'a str],
+        }
+        #[derive(Serialize)]
+        struct File<'a> {
+            name: &'a str,
+            from: Option<Pin<'a>>,
+            to: Option<Pin<'a>>,
+            images: &'a [&'a str],
+        }
+        #[derive(Serialize)]
+        struct Pin<'a> {
+            url: &'a str,
+            sha256: &'a Sha256,
+        }
+        fn pin(file: &LockedFile) -> Pin<'_> {
+            Pin {
+                url: file.url.as_str(),
+                sha256: &file.sha256,
+            }
         }
 
         Json {
@@ -111,6 +150,16 @@ impl Serialize for LockDiff<'_> {
                     }
                 })
                 .collect(),
+            files: self
+                .files
+                .iter()
+                .map(|f| File {
+                    name: f.name,
+                    from: f.from.map(pin),
+                    to: f.to.map(pin),
+                    images: &f.images,
+                })
+                .collect(),
         }
         .serialize(serializer)
     }
@@ -125,6 +174,7 @@ impl LockFile {
             added_images: names(newer).filter(|&i| self.image(i).is_none()).collect(),
             removed_images: names(self).filter(|&i| newer.image(i).is_none()).collect(),
             changes: Vec::new(),
+            files: self.diff_files(newer),
         };
 
         // Each package's changes, merged across images, with the package
@@ -183,6 +233,51 @@ impl LockFile {
             .collect();
         diff
     }
+
+    /// File changes going from `self` to `newer`, in the images both have.
+    fn diff_files<'a>(&'a self, newer: &'a LockFile) -> Vec<FileChange<'a>> {
+        // A file is the same if it has the same URL and hash.
+        type Pin<'a> = Option<(&'a str, &'a Sha256)>;
+        let pin =
+            |file: Option<&'a LockedFile>| -> Pin<'a> { file.map(|f| (f.url.as_str(), &f.sha256)) };
+        type Key<'a> = (&'a str, Pin<'a>, Pin<'a>);
+        type Value<'a> = (Option<&'a LockedFile>, Option<&'a LockedFile>, Vec<&'a str>);
+        let mut changes: BTreeMap<Key<'a>, Value<'a>> = BTreeMap::new();
+        for image in &newer.images {
+            let Some(old_image) = self.image(&image.name) else {
+                continue;
+            };
+            let files = |lock: &'a LockFile, image: &'a LockedImage| {
+                lock.image_files(image)
+                    .into_iter()
+                    .map(|f| (f.name.as_str(), f))
+                    .collect::<BTreeMap<_, _>>()
+            };
+            let (old, new) = (files(self, old_image), files(newer, image));
+            let names: std::collections::BTreeSet<&str> =
+                old.keys().chain(new.keys()).copied().collect();
+            for name in names {
+                let (from, to) = (old.get(name).copied(), new.get(name).copied());
+                if pin(from) == pin(to) {
+                    continue;
+                }
+                changes
+                    .entry((name, pin(from), pin(to)))
+                    .or_insert_with(|| (from, to, Vec::new()))
+                    .2
+                    .push(&image.name);
+            }
+        }
+        changes
+            .into_iter()
+            .map(|((name, ..), (from, to, images))| FileChange {
+                name,
+                from,
+                to,
+                images,
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -190,7 +285,7 @@ mod tests {
     use super::*;
     use crate::arch::Architecture;
     use crate::hash::Sha256;
-    use crate::lock::LockedPackage;
+    use crate::lock::{LockedFile, LockedPackage};
 
     /// A lock with these images, each a list of (name, version).
     fn set_lock(images: &[(&str, &[(&str, &str)])]) -> LockFile {
@@ -357,6 +452,7 @@ mod tests {
                     {"name": "zlib", "from": "1", "to": null,
                      "repository": "debian", "images": ["server"]},
                 ],
+                "files": [],
             })
         );
         assert_eq!(
@@ -365,6 +461,7 @@ mod tests {
                 "changed": false,
                 "images": {"added": [], "removed": []},
                 "packages": [],
+                "files": [],
             })
         );
     }
@@ -376,5 +473,84 @@ mod tests {
         assert_eq!(diff.added_images, ["a", "b"]);
         assert!(diff.changes.is_empty());
         assert!(!diff.is_empty());
+    }
+
+    fn with_files(mut lock: LockFile, files: &[(&str, &str, &[u8])]) -> LockFile {
+        lock.files = files
+            .iter()
+            .map(|&(name, url, data)| LockedFile {
+                name: name.to_string(),
+                url: url.parse().unwrap(),
+                sha256: Sha256::of(data),
+                size: data.len() as u64,
+                trust: crate::lock::Trust::Pinned,
+            })
+            .collect();
+        for image in &mut lock.images {
+            image.files = files.iter().map(|(name, ..)| name.to_string()).collect();
+        }
+        lock
+    }
+
+    #[test]
+    fn diff_reports_files_by_url_and_hash() {
+        let base = || set_lock(&[("default", &[("bash", "5.2")])]);
+        let old = with_files(
+            base(),
+            &[
+                ("etcd", "https://example.com/etcd-3.6.15.tar.gz", b"3.6.15"),
+                ("tini", "https://example.com/tini", b"tini"),
+                ("gone", "https://example.com/gone", b"gone"),
+            ],
+        );
+        let new = with_files(
+            base(),
+            &[
+                ("etcd", "https://example.com/etcd-3.6.16.tar.gz", b"3.6.16"),
+                ("tini", "https://example.com/tini", b"tini"),
+                ("new", "https://example.com/new", b"new"),
+            ],
+        );
+
+        let diff = old.diff(&new);
+        let summary: Vec<_> = diff
+            .files
+            .iter()
+            .map(|f| (f.name, f.from.is_some(), f.to.is_some()))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("etcd", true, true),
+                ("gone", true, false),
+                ("new", false, true)
+            ]
+        );
+        assert!(!diff.is_empty());
+        assert!(diff.changes.is_empty());
+
+        let json = serde_json::to_value(&diff).unwrap();
+        assert_eq!(
+            json["files"][0],
+            serde_json::json!({
+                "name": "etcd",
+                "from": {
+                    "url": "https://example.com/etcd-3.6.15.tar.gz",
+                    "sha256": Sha256::of(b"3.6.15").to_string(),
+                },
+                "to": {
+                    "url": "https://example.com/etcd-3.6.16.tar.gz",
+                    "sha256": Sha256::of(b"3.6.16").to_string(),
+                },
+                "images": ["default"],
+            })
+        );
+        assert_eq!(json["files"][1]["to"], serde_json::Value::Null);
+        assert_eq!(json["changed"], true);
+
+        let repinned = with_files(base(), &[("tini", "https://example.com/tini", b"other")]);
+        let only_tini = with_files(base(), &[("tini", "https://example.com/tini", b"tini")]);
+        assert_eq!(only_tini.diff(&repinned).files.len(), 1);
+        assert!(new.diff(&new).is_empty());
     }
 }
