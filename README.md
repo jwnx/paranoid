@@ -517,6 +517,37 @@ resolved through the image's symlinks, as a package's paths are, so
 `/bin/x` lands in `/usr/bin` on a merged `/usr`. Like accounts, paths are
 left out of the config hash.
 
+## LOCALES
+
+glibc's locales are compiled by `localedef`, which a package's
+`postinst` would run in the image. Debian also ships every locale glibc
+supports already compiled, in `locales-all`, and an image takes the ones
+it asks for from there, without running anything:
+
+```toml
+[image]                                  # or [defaults], or [images.<id>]
+locales = ["en_US.UTF-8", "pt_BR.UTF-8"]
+```
+
+Asking for locales adds `locales-all` to the image's packages, so it's
+resolved and locked like any other, from the same glibc as `libc6`.
+`build` then keeps the locales asked for in `/usr/lib/locale` and drops
+the rest of `locales-all`'s, about 225 MB of them. Locales share files
+through symlinks; a kept one's links into a dropped one become copies of
+what they pointed at, so `en_US.UTF-8` alone takes about 3 MB. Names are
+spelled as for `LANG` and found the way glibc finds them, so
+`en_US.UTF-8` is `en_US.utf8` and `de_DE.ISO-8859-15@euro` is
+`de_DE.iso885915@euro`. A locale `locales-all` doesn't have is an error
+that lists the ones it has for that language. `C.UTF-8` comes with
+libc-bin and is always there. `locales = ["all"]` keeps every locale.
+
+dpkg's file list for `locales-all` still names the dropped files, so
+`dpkg --verify` reports them missing, as it does for a `path-exclude`.
+Set `LANG` in `entrypoint.env` for processes to pick a locale up. Which
+locales an image keeps isn't in the config hash, only `locales-all`
+coming in with the first one, so changing the list doesn't make the lock
+stale.
+
 ## LOCK
 
 `paranoid lock` fetches each repository's `InRelease` and checks its
