@@ -46,6 +46,9 @@ pub enum AccountsError {
 
     #[error("could not write the accounts")]
     Rootfs(#[from] RootfsError),
+
+    #[error("configuring the image changed {0}, which the manifest declares")]
+    Changed(String),
 }
 
 /// One line of `/etc/group`.
@@ -168,6 +171,66 @@ pub fn write(rootfs: &mut Rootfs, accounts: &Accounts) -> Result<(), AccountsErr
     let tar = tar.into_inner().map_err(RootfsError::from)?;
     // Not over anything a package shipped: no package ships these.
     rootfs.add_tar(tar.as_slice(), "etc")?;
+    Ok(())
+}
+
+/// After configuring: make sure every declared account is still what the
+/// manifest says. `adduser --system` keeps a user that exists, so this
+/// only fails when a script does something unusual, which is what this is
+/// for.
+pub fn verify(rootfs: &Rootfs, accounts: &Accounts) -> Result<(), AccountsError> {
+    let text = |path: &str| match rootfs.get(path) {
+        Some(Node::File(_, data)) => String::from_utf8_lossy(data).into_owned(),
+        _ => String::new(),
+    };
+    let passwd = text("etc/passwd");
+    let group = text("etc/group");
+    let users: Vec<Vec<&str>> = passwd.lines().map(|l| l.split(':').collect()).collect();
+    let groups: Vec<Vec<&str>> = group.lines().map(|l| l.split(':').collect()).collect();
+    let gid_of = |name: &str| {
+        groups
+            .iter()
+            .find(|g| g.first() == Some(&name))
+            .and_then(|g| g.get(2)?.parse::<u32>().ok())
+    };
+
+    for (name, &gid) in &accounts.groups {
+        if gid_of(name) != Some(gid) {
+            return Err(AccountsError::Changed(format!(
+                "group '{name}' (GID {gid})"
+            )));
+        }
+    }
+    for (name, user) in &accounts.users {
+        let entry = users.iter().find(|u| u.first() == Some(&name.as_str()));
+        let ids = entry.and_then(|u| {
+            Some((
+                u.get(2)?.parse::<u32>().ok()?,
+                u.get(3)?.parse::<u32>().ok()?,
+            ))
+        });
+        let primary = gid_of(user.group(name));
+        if ids.is_none()
+            || ids.map(|(uid, _)| uid) != Some(user.uid)
+            || ids.map(|(_, gid)| gid) != primary
+        {
+            return Err(AccountsError::Changed(format!(
+                "user '{name}' (UID {})",
+                user.uid
+            )));
+        }
+        for member_of in &user.groups {
+            let member = groups.iter().any(|g| {
+                g.first() == Some(&member_of.as_str())
+                    && g.get(3).is_some_and(|m| m.split(',').any(|m| m == name))
+            });
+            if !member {
+                return Err(AccountsError::Changed(format!(
+                    "user '{name}' being in group '{member_of}'"
+                )));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -326,5 +389,30 @@ group = "nogroup"
     fn needs_base_passwd() {
         let err = write(&mut Rootfs::new(), &accounts("users.app = { uid = 500 }")).unwrap_err();
         assert!(matches!(err, AccountsError::NoBasePasswd), "{err}");
+    }
+
+    #[test]
+    fn verifies_the_accounts_after_configuring() {
+        let declared = accounts(
+            "groups = { ssl-cert = 101 }\n\
+             [users.postgres]\nuid = 999\ngroups = [\"ssl-cert\"]\n",
+        );
+        let mut rootfs = with_base_passwd();
+        write(&mut rootfs, &declared).unwrap();
+        verify(&rootfs, &declared).unwrap();
+
+        // A script moves postgres to the next free ID.
+        let Some(Node::File(meta, data)) = rootfs.get("etc/passwd").cloned() else {
+            panic!();
+        };
+        let moved = String::from_utf8_lossy(&data).replace(":999:999:", ":100:999:");
+        rootfs
+            .replace_node("etc/passwd", Node::File(meta, moved.into_bytes().into()))
+            .unwrap();
+        let err = verify(&rootfs, &declared).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "configuring the image changed user 'postgres' (UID 999), which the manifest declares"
+        );
     }
 }

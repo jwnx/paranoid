@@ -208,6 +208,13 @@ pub async fn build(
         });
         let epoch = options.created.as_datetime().timestamp();
         rootfs = configure::configure(&rootfs, runtime, manifest.architecture, epoch).await?;
+        // What the manifest declares wins over what a script did.
+        if !manifest.accounts.is_empty() {
+            accounts::verify(&rootfs, &manifest.accounts)?;
+        }
+        if !manifest.paths.is_empty() {
+            paths::reapply(&mut rootfs, &manifest.paths)?;
+        }
         reporter.report(Event::Advance {
             phase: Phase::Configure,
             units: 1,

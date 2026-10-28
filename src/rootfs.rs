@@ -310,6 +310,47 @@ impl Rootfs {
         Ok(stats)
     }
 
+    /// Where `path` is, resolving its parents through symlinks as a
+    /// package's paths are, and what's there. `None` if a parent is
+    /// missing or isn't a directory.
+    pub fn lookup(&self, path: &str) -> Option<(String, &Node)> {
+        let components = components(path).ok()?;
+        let (name, parents) = components.split_last()?;
+        let mut pending: VecDeque<String> = parents.iter().map(|s| s.to_string()).collect();
+        let mut resolved: Vec<String> = Vec::new();
+        let mut hops = 0;
+        while let Some(component) = pending.pop_front() {
+            match component.as_str() {
+                "" | "." => continue,
+                ".." => {
+                    resolved.pop();
+                    continue;
+                }
+                _ => resolved.push(component),
+            }
+            match self.nodes.get(&resolved.join("/"))? {
+                Node::Dir(_) => {}
+                Node::Symlink(_, target) => {
+                    hops += 1;
+                    if hops > MAX_SYMLINK_HOPS {
+                        return None;
+                    }
+                    resolved.pop();
+                    if target.starts_with('/') {
+                        resolved.clear();
+                    }
+                    for part in target.split('/').rev() {
+                        pending.push_front(part.to_string());
+                    }
+                }
+                _ => return None,
+            }
+        }
+        let key = join(&resolved.join("/"), name);
+        let node = self.nodes.get(&key)?;
+        Some((key, node))
+    }
+
     /// Remove `path` and everything under it. Returns how many entries went.
     pub(crate) fn remove_tree(&mut self, path: &str) -> usize {
         let prefix = format!("{path}/");

@@ -28,6 +28,9 @@ pub enum PathsError {
     #[error("{path}: owner {owner} isn't a user in the image, so name its `group`")]
     NoGroup { path: ImagePath, owner: u32 },
 
+    #[error("{path}: configuring the image changed it, and the manifest says what it is")]
+    Changed { path: ImagePath },
+
     #[error("{path}: {source}")]
     Rootfs {
         path: ImagePath,
@@ -166,6 +169,46 @@ pub fn apply(rootfs: &mut Rootfs, paths: &IndexMap<ImagePath, PathSpec>) -> Resu
                     .map_err(|e| in_path(e.into()))?;
                 rootfs.add_tar(tar.as_slice(), relative).map_err(in_path)?;
             }
+        }
+    }
+    Ok(())
+}
+
+/// After configuring: give each directory its owner and mode again, since
+/// a package's script may have changed them, and make sure no script
+/// changed a file or a symlink.
+pub fn reapply(
+    rootfs: &mut Rootfs,
+    paths: &IndexMap<ImagePath, PathSpec>,
+) -> Result<(), PathsError> {
+    let ids = Ids::of(rootfs);
+    for (path, spec) in paths {
+        let (uid, gid) = ids.owner(path, spec)?;
+        let meta = Meta {
+            mode: spec.mode(),
+            uid: uid.into(),
+            gid: gid.into(),
+        };
+        let changed = || PathsError::Changed { path: path.clone() };
+        match spec.kind() {
+            PathKind::Directory => {
+                rootfs
+                    .set_dir(path.relative(), meta)
+                    .map_err(|source| PathsError::Rootfs {
+                        path: path.clone(),
+                        source,
+                    })?;
+            }
+            PathKind::File(content) => match rootfs.lookup(path.relative()) {
+                Some((_, Node::File(m, data))) if *m == meta && &data[..] == content.as_bytes() => {
+                }
+                _ => return Err(changed()),
+            },
+            PathKind::Symlink(target) => match rootfs.lookup(path.relative()) {
+                Some((_, Node::Symlink(m, t)))
+                    if (m.uid, m.gid) == (meta.uid, meta.gid) && t == target => {}
+                _ => return Err(changed()),
+            },
         }
     }
     Ok(())
@@ -319,5 +362,48 @@ mod tests {
         )
         .unwrap();
         assert_eq!(meta(&rootfs, "var/www"), (0o755, 33, 33));
+    }
+
+    #[test]
+    fn declarations_win_over_what_scripts_did() {
+        let mut rootfs = rootfs();
+        let declared = paths(
+            r#"
+"/var/lib/postgresql" = { owner = "postgres", mode = "0700" }
+"/bin/policy" = { content = "exit 101\n", mode = "0755" }
+"/usr/bin/sh" = { target = "bash" }
+"#,
+        );
+        apply(&mut rootfs, &declared).unwrap();
+
+        // A script makes the directory root's and 0755 again.
+        rootfs
+            .set_dir(
+                "var/lib/postgresql",
+                Meta {
+                    mode: 0o755,
+                    uid: 0,
+                    gid: 0,
+                },
+            )
+            .unwrap();
+        reapply(&mut rootfs, &declared).unwrap();
+        assert_eq!(meta(&rootfs, "var/lib/postgresql"), (0o700, 999, 998));
+
+        // A script rewrites the file, found through the merged /bin.
+        let (key, node) = rootfs.lookup("bin/policy").unwrap();
+        assert_eq!(key, "usr/bin/policy");
+        let Node::File(meta, _) = node.clone() else {
+            panic!("{node:?}");
+        };
+        rootfs
+            .replace_node(&key, Node::File(meta, b"exit 0\n".to_vec().into()))
+            .unwrap();
+        let err = reapply(&mut rootfs, &declared).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("/bin/policy: configuring the image changed it"),
+            "{err}"
+        );
     }
 }
