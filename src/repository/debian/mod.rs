@@ -20,7 +20,7 @@ pub use dependency::{
     DependencySpec, PackageDependency, ParseDependencySpecError, ParseRelationsError,
     parse_relations,
 };
-pub use keyring::{Fingerprint, Keyring, KeyringError, Verified, VerifyError};
+pub use keyring::{Fingerprint, KeyTime, Keyring, KeyringError, Verified, VerifyError};
 pub use package::{DebianPackage, ParseDebianPackageError};
 pub use package_index::{PackageIndex, ParsePackageIndexError, VirtualPackageProvider};
 pub use package_index_set::{

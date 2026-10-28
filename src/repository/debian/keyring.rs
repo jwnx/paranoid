@@ -1,4 +1,5 @@
-//! OpenPGP keyrings and the clearsigned `InRelease` files they verify.
+//! OpenPGP keyrings, and the clearsigned `InRelease` files and detached
+//! signatures they verify.
 //!
 //! rpgp does the cryptography. What it leaves to us is policy, and we
 //! follow what `gpgv` enforces for apt:
@@ -16,7 +17,9 @@ use std::fmt;
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
-use pgp::composed::{CleartextSignedMessage, PublicOrSecret, SignedPublicKey};
+use pgp::composed::{
+    CleartextSignedMessage, Deserializable, DetachedSignature, PublicOrSecret, SignedPublicKey,
+};
 use pgp::crypto::hash::HashAlgorithm;
 use pgp::packet::{PublicKey, PublicSubkey, Signature, SignatureType};
 use pgp::types::{KeyDetails, Tag, Timestamp};
@@ -66,6 +69,9 @@ pub enum VerifyError {
     #[error("not a valid clearsigned message: {0}")]
     Malformed(String),
 
+    #[error("not a valid OpenPGP signature: {0}")]
+    MalformedSignature(String),
+
     #[error("BAD signature from key {0}: the content was modified or corrupted")]
     BadSignature(Fingerprint),
 
@@ -81,6 +87,18 @@ pub struct Verified {
     pub text: String,
     /// Primary fingerprints of the keys with a good signature, sorted.
     pub signers: Vec<Fingerprint>,
+}
+
+/// When a key has to have been valid for its signature to count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyTime {
+    /// At the time we check: a repository's Release is only as good as the
+    /// keys that sign it are now.
+    Now,
+    /// When it made the signature, as gpg judges a release artifact: a key
+    /// that expired after signing still vouches for what it signed. A
+    /// revoked key still doesn't count.
+    Signing,
 }
 
 /// Keys trusted to sign a repository.
@@ -174,6 +192,16 @@ impl Keyring {
         input: &str,
         now: DateTime<Utc>,
     ) -> Result<Verified, VerifyError> {
+        self.verify_cleartext_with(input, now, KeyTime::Now)
+    }
+
+    /// Verify a clearsigned message, as of `now`, with keys judged at `keys`.
+    pub fn verify_cleartext_with(
+        &self,
+        input: &str,
+        now: DateTime<Utc>,
+        keys: KeyTime,
+    ) -> Result<Verified, VerifyError> {
         // rpgp refuses anything before the armor header or after the
         // signature block, so text outside the signature can't sneak in.
         let (msg, _) = CleartextSignedMessage::from_string(input)
@@ -181,10 +209,46 @@ impl Keyring {
         let signed = msg.signed_text();
         let now = now.timestamp().max(0) as u64;
 
+        let signers = self.judge(msg.signatures(), signed.as_bytes(), now, keys)?;
+        Ok(Verified {
+            text: signed.replace("\r\n", "\n"),
+            signers,
+        })
+    }
+
+    /// Verify a detached signature over `data`, ASCII-armored or binary, as
+    /// of `now`, with keys judged at `keys`. Returns the primary
+    /// fingerprints of the keys with a good signature, sorted.
+    pub fn verify_detached(
+        &self,
+        signature: &[u8],
+        data: &[u8],
+        now: DateTime<Utc>,
+        keys: KeyTime,
+    ) -> Result<Vec<Fingerprint>, VerifyError> {
+        let malformed = |e: pgp::errors::Error| VerifyError::MalformedSignature(e.to_string());
+        let (sigs, _) = DetachedSignature::from_reader_many(signature).map_err(malformed)?;
+        let sigs: Vec<Signature> = sigs
+            .map(|s| s.map(|s| s.signature))
+            .collect::<Result<_, _>>()
+            .map_err(malformed)?;
+        let now = now.timestamp().max(0) as u64;
+        self.judge(&sigs, data, now, keys)
+    }
+
+    /// The signers of every signature that counts, sorted, when at least
+    /// one does.
+    fn judge<'s>(
+        &self,
+        sigs: impl IntoIterator<Item = &'s Signature>,
+        data: &[u8],
+        now: u64,
+        keys: KeyTime,
+    ) -> Result<Vec<Fingerprint>, VerifyError> {
         let mut signers = Vec::new();
         let mut rejected = Vec::new();
-        for sig in msg.signatures() {
-            match self.check(sig, signed.as_bytes(), now)? {
+        for sig in sigs {
+            match self.check(sig, data, now, keys)? {
                 Ok(fp) => signers.push(fp),
                 Err(reason) => rejected.push(reason),
             }
@@ -192,16 +256,13 @@ impl Keyring {
 
         if signers.is_empty() {
             if rejected.is_empty() {
-                rejected.push("the message has no signatures".to_string());
+                rejected.push("there are no signatures".to_string());
             }
             return Err(VerifyError::NoValidSignature(rejected));
         }
         signers.sort();
         signers.dedup();
-        Ok(Verified {
-            text: signed.replace("\r\n", "\n"),
-            signers,
-        })
+        Ok(signers)
     }
 
     /// Check one signature. The outer error is fatal; the inner one says
@@ -211,6 +272,7 @@ impl Keyring {
         sig: &Signature,
         data: &[u8],
         now: u64,
+        keys: KeyTime,
     ) -> Result<Result<Fingerprint, String>, VerifyError> {
         // A signature naming its issuer only by key ID can match more than
         // one key; it's BAD only if none of them verify it.
@@ -239,13 +301,17 @@ impl Keyring {
         let fp = &signer.primary;
 
         let created = sig.created().map_or(0, |t| u64::from(t.as_secs()));
+        let key_time = match keys {
+            KeyTime::Now => now,
+            KeyTime::Signing => created,
+        };
         let reason = if !matches!(sig.typ(), Some(SignatureType::Text | SignatureType::Binary)) {
             Some("is not a document signature")
         } else if signer.revoked {
             Some("is from a revoked key")
         } else if !signer.can_sign {
             Some("is from a key not allowed to sign")
-        } else if signer.expires.is_some_and(|t| t <= now) {
+        } else if signer.expires.is_some_and(|t| t <= key_time) {
             Some("is from an expired key")
         } else if expiry(created, sig.signature_expiration_time()).is_some_and(|t| t <= now) {
             Some("has expired")
@@ -502,5 +568,88 @@ mod tests {
     fn rejects_garbage_keyrings() {
         assert!(Keyring::from_bytes(b"").is_err());
         assert!(Keyring::from_bytes(b"not a key").is_err());
+    }
+
+    mod detached {
+        use super::*;
+
+        const TOOL: &[u8] = include_bytes!("testdata/files/tool");
+        const TOOL_SIG: &[u8] = include_bytes!("testdata/files/tool.asc");
+        const SUMS: &[u8] = include_bytes!("testdata/files/SHA256SUMS");
+        const SUMS_SIG: &[u8] = include_bytes!("testdata/files/SHA256SUMS.sig");
+        const SUMS_CLEARSIGNED: &str = include_str!("testdata/files/SHA256SUMS.asc");
+        const REVOKED_SIG: &[u8] = include_bytes!("testdata/files/tool.revoked.asc");
+        const RELEASE: &[u8] = include_bytes!("testdata/files/release.asc");
+        const REVOKED: &[u8] = include_bytes!("testdata/files/revoked.asc");
+        const STRANGER: &[u8] = include_bytes!("testdata/files/stranger.asc");
+        const RELEASE_FP: &str = "7B6CFBF9384A130F6053229331B1E3B66D0E9BF6";
+
+        /// After the release key expired: it signed in 2020 and expired at
+        /// the start of 2021.
+        fn now() -> DateTime<Utc> {
+            "2026-10-28T00:00:00Z".parse().unwrap()
+        }
+
+        fn fps(fps: Vec<Fingerprint>) -> Vec<String> {
+            fps.iter().map(ToString::to_string).collect()
+        }
+
+        #[test]
+        fn verifies_armored_and_binary_signatures() {
+            let ring = keyring(&[RELEASE]);
+            let signed = ring.verify_detached(TOOL_SIG, TOOL, now(), KeyTime::Signing);
+            assert_eq!(fps(signed.unwrap()), [RELEASE_FP]);
+            let signed = ring.verify_detached(SUMS_SIG, SUMS, now(), KeyTime::Signing);
+            assert_eq!(fps(signed.unwrap()), [RELEASE_FP]);
+            let v = ring
+                .verify_cleartext_with(SUMS_CLEARSIGNED, now(), KeyTime::Signing)
+                .unwrap();
+            // The line break before the signature belongs to it.
+            assert_eq!(v.text.as_bytes(), SUMS.trim_ascii_end());
+        }
+
+        #[test]
+        fn a_key_that_expired_after_signing_counts_only_when_judged_at_signing() {
+            let ring = keyring(&[RELEASE]);
+            let err = ring
+                .verify_detached(TOOL_SIG, TOOL, now(), KeyTime::Now)
+                .unwrap_err();
+            assert!(err.to_string().contains("expired key"), "{err}");
+            let err = ring.verify_cleartext(SUMS_CLEARSIGNED, now()).unwrap_err();
+            assert!(err.to_string().contains("expired key"), "{err}");
+        }
+
+        #[test]
+        fn rejects_modified_data() {
+            let err = keyring(&[RELEASE])
+                .verify_detached(TOOL_SIG, b"a tool, changed\n", now(), KeyTime::Signing)
+                .unwrap_err();
+            assert!(matches!(err, VerifyError::BadSignature(_)), "{err}");
+        }
+
+        #[test]
+        fn rejects_revoked_keys_and_strangers() {
+            let err = keyring(&[REVOKED])
+                .verify_detached(REVOKED_SIG, TOOL, now(), KeyTime::Signing)
+                .unwrap_err();
+            assert!(err.to_string().contains("revoked key"), "{err}");
+
+            let err = keyring(&[STRANGER])
+                .verify_detached(TOOL_SIG, TOOL, now(), KeyTime::Signing)
+                .unwrap_err();
+            assert!(err.to_string().contains("not in the keyring"), "{err}");
+        }
+
+        #[test]
+        fn rejects_what_is_not_a_signature() {
+            let err = keyring(&[RELEASE])
+                .verify_detached(b"not a signature", TOOL, now(), KeyTime::Signing)
+                .unwrap_err();
+            assert!(matches!(err, VerifyError::MalformedSignature(_)), "{err}");
+            let err = keyring(&[RELEASE])
+                .verify_detached(RELEASE, TOOL, now(), KeyTime::Signing)
+                .unwrap_err();
+            assert!(matches!(err, VerifyError::MalformedSignature(_)), "{err}");
+        }
     }
 }
