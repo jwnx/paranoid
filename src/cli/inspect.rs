@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 
-use paranoid::lock::{LockFile, LockedImage, LockedPackage};
+use paranoid::lock::{LockFile, LockedImage, LockedPackage, Trust};
 use paranoid::oci::read_image;
 
 use super::error::CliError;
@@ -74,6 +74,7 @@ pub fn run(args: InspectArgs) -> Result<(), CliError> {
                 }
                 (false, focus) => print_lock_table(&lock, focus),
             }
+            print_lock_files(&lock, focus);
             println!();
             st::footer_stdout(&path, &lock.content_hash().map_err(CliError::lock)?);
             Ok(())
@@ -196,6 +197,42 @@ fn print_lock_table(lock: &LockFile, focus: Option<&LockedImage>) {
             st::dim()
         };
         println!("{}", style.apply_to(line));
+    }
+}
+
+/// Files as a table, if there are any: for one image, the ones it gets.
+fn print_lock_files(lock: &LockFile, focus: Option<&LockedImage>) {
+    let files = match focus {
+        Some(image) => lock.image_files(image),
+        None => lock.files.iter().collect(),
+    };
+    if files.is_empty() {
+        return;
+    }
+    const W_NAME: usize = 20;
+    const W_TRUST: usize = 8;
+    const W_SIZE: usize = 8;
+    let row = |name: &str, trust: &str, size: &str, url: &str| {
+        format!("{name:<W_NAME$} {trust:<W_TRUST$} {size:>W_SIZE$}  {url}")
+    };
+    println!();
+    println!(
+        "{}",
+        st::dim().apply_to(row("File", "Trust", "Size", "URL"))
+    );
+    for file in files {
+        let trust = match file.trust {
+            Trust::Pinned => "pinned",
+        };
+        println!(
+            "{}",
+            row(
+                &st::truncate(&file.name, W_NAME),
+                trust,
+                &st::fmt_size(file.size),
+                file.url.as_str(),
+            )
+        );
     }
 }
 
