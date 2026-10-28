@@ -13,7 +13,7 @@ use xz2::read::XzDecoder;
 
 use crate::config::{Extract, FileSpec, Manifest};
 use crate::download::{DownloadFailures, DownloadService, PackageCache, Sources};
-use crate::lock::{LockedFile, Trust};
+use crate::lock::{LockFile, LockedFile, Trust};
 use crate::report::Reporter;
 use crate::rootfs::{Rootfs, RootfsError};
 
@@ -21,11 +21,13 @@ use crate::rootfs::{Rootfs, RootfsError};
 pub const MAX_FILE_SIZE: u64 = 4 << 30;
 
 /// Lock the manifest's files, in manifest order: check each against the
-/// hash the manifest pins, and record its size. A file the cache has isn't
-/// downloaded again, and one that's downloaded goes into the cache for
-/// `build`.
+/// hash the manifest pins, and record its size. A file the existing lock
+/// already records at the same URL and hash keeps its entry, and one the
+/// cache has isn't downloaded again; one that is downloaded goes into the
+/// cache for `build`.
 pub async fn lock(
     manifest: &Manifest,
+    existing: Option<&LockFile>,
     downloads: &DownloadService,
     reporter: &dyn Reporter,
 ) -> Result<Vec<LockedFile>, DownloadFailures> {
@@ -46,9 +48,13 @@ pub async fn lock(
         let data = PackageCache::read(&cache.path_for(file), file).ok()?;
         Some(data.len() as u64)
     };
+    let locked = |file: &LockedFile| {
+        let old = existing?.files.iter().find(|f| f.name == file.name)?;
+        (old.url == file.url && old.sha256 == file.sha256).then_some(old.size)
+    };
     let mut missing = Vec::new();
     for (i, file) in files.iter_mut().enumerate() {
-        match cached(file) {
+        match locked(file).or_else(|| cached(file)) {
             Some(size) => file.size = size,
             None => missing.push(i),
         }

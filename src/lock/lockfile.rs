@@ -145,6 +145,9 @@ pub enum LockFileError {
     #[error("image '{image}' lists file '{file}', which the lock doesn't record")]
     UnknownFile { image: String, file: String },
 
+    #[error("the lock records file '{0}' twice")]
+    DuplicateFile(String),
+
     #[error(
         "package '{package}' comes from repository '{repository}', which the lock doesn't record"
     )]
@@ -284,6 +287,11 @@ impl LockFile {
         }
         if lock.images.is_empty() {
             return Err(LockFileError::NoImages);
+        }
+        for (i, file) in lock.files.iter().enumerate() {
+            if lock.files[..i].iter().any(|f| f.name == file.name) {
+                return Err(LockFileError::DuplicateFile(file.name.clone()));
+            }
         }
         for image in &lock.images {
             let missing = image
@@ -700,6 +708,14 @@ direct = ["bash"]
             .unwrap();
         assert!(!serialized.contains("[[file]]"), "{serialized}");
         assert!(!serialized.contains("files ="), "{serialized}");
+    }
+
+    #[test]
+    fn rejects_a_file_recorded_twice() {
+        let (_, mut lock) = with_tini();
+        lock.files.push(lock.files[0].clone());
+        let err = LockFile::from_str(&lock.serialize().unwrap()).unwrap_err();
+        assert_eq!(err.to_string(), "the lock records file 'tini' twice");
     }
 
     #[test]

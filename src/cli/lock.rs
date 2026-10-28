@@ -184,7 +184,7 @@ pub async fn run(args: LockArgs, quiet: bool) -> Result<(), CliError> {
         .map_err(CliError::files)?;
         let downloads = DownloadService::with_cache(cache, DownloadConfig::default())
             .map_err(CliError::files)?;
-        files::lock(&manifest, &downloads, &())
+        files::lock(&manifest, existing.as_ref(), &downloads, &())
             .await
             .map_err(CliError::files)?
     };
