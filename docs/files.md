@@ -1,6 +1,6 @@
 # Files
 
-Status: proposal. Phase 1 (pinned URLs) is being implemented.
+Status: phase 1 (pinned URLs) is implemented. The rest is a proposal.
 
 ## Why
 

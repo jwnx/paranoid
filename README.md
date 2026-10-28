@@ -63,7 +63,7 @@ If you want a shell in the image, add one, like `bash`, to the package list.
 
 ```
 paranoid lock    [-f MANIFEST] [-o LOCK] [--force] [--allow-unmet] [--json]
-                 [--snapshot TIME]
+                 [--snapshot TIME] [--cache-dir DIR]
 paranoid build   [-f MANIFEST] [--lock LOCK] [-o OUT] [--image ID]...
                  [--cache-dir DIR] [--jobs N] [--force-download]
                  [--allow-stale] [--allow-unmet]
@@ -298,6 +298,54 @@ with neither, images go to `{image}.tar`.
 When the lock changes, `paranoid lock` lists what changed in which images,
 including a package that only moved into or out of one.
 
+## FILES
+
+Not everything comes from apt: a static binary from a vendor's releases,
+or one tool out of a release tarball. A manifest can fetch those straight
+from a URL, pinned by their SHA-256:
+
+```toml
+[files.tini]
+url    = "https://github.com/krallin/tini/releases/download/v0.19.0/tini-static-arm64"
+sha256 = "eae1d3aa50c48fb23b8cbdf4e369d0910dfc538566bfd09df89a774aa84a48b9"
+path   = "/usr/bin/tini"
+mode   = "0755"
+
+[files.etcdctl]
+url     = "https://github.com/etcd-io/etcd/releases/download/v3.6.16/etcd-v3.6.16-linux-arm64.tar.gz"
+sha256  = "ad756ff27ba21e3488cfb84d00f3f4ad8d9b60a93e20f5be5b230a4aab1dc053"
+extract = "etcd-v3.6.16-linux-arm64/etcdctl"
+path    = "/usr/local/bin/etcdctl"
+```
+
+- `path` is where the file goes in the image.
+- Without `extract`, the download itself is the file. It gets `mode`,
+  `0644` by default.
+- `extract = "dir/member"` takes one member of a tar archive (plain,
+  gzip, xz or zstd). The member keeps its mode from the archive unless
+  `mode` is set.
+- `extract = "dir/"`, ending in `/`, takes everything under that
+  directory and puts it under `path`, keeping the archive's modes,
+  symlinks and hard links.
+
+Everything a file brings is owned by root. A single-image manifest gets
+every file. In a set, each image names the ones it wants with
+`files = ["tini"]`, and an image may have files and no packages.
+
+`paranoid lock` downloads each file, checks it against `sha256` and
+records it in the lock with its size. Nothing signs these files: the hash
+in the manifest is all that vouches for them, which the lock records as
+`trust = "pinned"`. Review a new hash the way you would a new dependency.
+`build` checks each file against the lock, like a package, and places the
+files after every package. A file can add to a directory that's there,
+like `/usr/local/bin`, but it can't replace anything a package installed,
+or another file.
+
+dpkg doesn't know about files, so scanners that read its database, like
+trivy and syft, won't see them. [`docs/files.md`](docs/files.md) has what
+comes next: signed URLs, and versions resolved from Go's and GitHub's
+release lists.
+
 ## LOCK
 
 `paranoid lock` fetches each repository's `InRelease` and checks its
@@ -384,6 +432,14 @@ lock's own layout. Read this rather than the lock:
       "repository": "debian-security",
       "images": ["server", "builder"]
     }
+  ],
+  "files": [
+    {
+      "name": "etcdctl",
+      "from": { "url": "https://.../etcd-v3.6.15-linux-arm64.tar.gz", "sha256": "567d9b8f..." },
+      "to": { "url": "https://.../etcd-v3.6.16-linux-arm64.tar.gz", "sha256": "ad756ff2..." },
+      "images": ["server"]
+    }
   ]
 }
 ```
@@ -391,9 +447,11 @@ lock's own layout. Read this rather than the lock:
 `from` is null for a package that's new and `to` for one that's gone.
 `repository` is where the package comes from, or came from if it's gone,
 and `images` are the images it changed in. A package that moves into or out
-of an image at the same version counts as a change. `changed` is false when
-no package or image moved, even if the snapshots did. Later releases may
-add fields, but won't remove any or change what they mean.
+of an image at the same version counts as a change. A file changes when
+its URL or hash does, and its `from` or `to` is null the same way.
+`changed` is false when no package, file or image moved, even if the
+snapshots did. Later releases may add fields, but won't remove any or
+change what they mean.
 
 ## BUILD
 
@@ -463,11 +521,12 @@ list them in the manifest.
 
 ## CACHE
 
-`build` keeps every package it fetches in the local cache, under its
-SHA-256:
+`build` keeps every package and file it fetches in the local cache, under
+its SHA-256:
 
 ```
-<user cache dir>/paranoid/sha256/<first 2 hex>/<sha256>.deb
+<user cache dir>/paranoid/sha256/<first 2 hex>/<sha256>.deb    a package
+<user cache dir>/paranoid/sha256/<first 2 hex>/<sha256>        a file
 ```
 
 A store is the same layout behind a URL: a bucket, or any HTTP server.
@@ -500,8 +559,8 @@ and stops every build. Store, repository and mirror URLs can't carry a
 query, a fragment or credentials, since package paths are appended to
 them and they show up in error messages.
 
-`paranoid cache push` fills a store with the lock's packages it doesn't
-have yet. It takes them from the local cache, or fetches them the way
+`paranoid cache push` fills a store with the lock's packages and files it
+doesn't have yet. It takes them from the local cache, or fetches them the way
 `build` would:
 
 ```
@@ -534,9 +593,10 @@ What holds today:
 ```
   same lock + same SOURCE_DATE_EPOCH      ─▶  same image digest
   package lists                           ─▶  signed by a key you chose
-  package contents                        ─▶  checked against the lock
+  package and file contents               ─▶  checked against the lock
   host filesystem                         ─▶  untouched by package contents
-  file ownership in the image             ─▶  taken from the package
+  file ownership in the image             ─▶  taken from the package, or
+                                              root for a fetched file
 ```
 
 What does **not** hold yet:
