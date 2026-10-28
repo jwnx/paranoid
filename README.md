@@ -473,6 +473,50 @@ Accounts shape the image rather than what's in it, so like `entrypoint`
 they're left out of the config hash, and changing them doesn't make the
 lock stale.
 
+## PATHS
+
+Files, directories and symlinks can be written straight from the
+manifest, with an owner and a mode:
+
+```toml
+[paths."/usr/sbin/policy-rc.d"]          # a file: start no services
+content = """
+#!/bin/sh
+exit 101
+"""
+mode = "0755"                             # default 0644
+
+[paths."/etc/postgresql-common/createcluster.d/mpg.conf"]
+content = "create_main_cluster = false\n"
+
+[paths."/var/lib/postgresql"]             # a directory
+owner = "postgres"                        # default root
+mode  = "0700"                            # default 0755
+
+[paths."/run/postgresql"]
+owner = "postgres"
+group = "postgres"                        # default: the owner's group
+mode  = "2775"
+
+[paths."/usr/local/bin/python"]           # a symlink
+target = "python3"
+```
+
+A path with `content` is a file, one with `target` is a symlink, and one
+with neither is a directory. `owner` and `group` take a name or a number.
+Names come from the image's `/etc/passwd` and `/etc/group`, which are
+base-passwd's and the [accounts](#accounts), so a path can be owned by a
+user the manifest declares.
+
+Paths are written last, after the packages, the accounts and the
+[files](#files), in manifest order, and every image of the manifest gets
+them. A directory takes the owner and mode the manifest gives it, whether
+a package made it or not, and its missing parents are made as root, 0755.
+A file or a symlink can't replace anything that's there. Parents are
+resolved through the image's symlinks, as a package's paths are, so
+`/bin/x` lands in `/usr/bin` on a merged `/usr`. Like accounts, paths are
+left out of the config hash.
+
 ## LOCK
 
 `paranoid lock` fetches each repository's `InRelease` and checks its
