@@ -78,8 +78,6 @@ pub struct OciConfig {
     image_name: Option<ImageName>,
     /// Image tag.
     image_tag: ImageTag,
-    /// Also name the image for containerd, and so Docker, in the index.
-    containerd_name: bool,
 }
 
 impl OciConfig {
@@ -97,15 +95,6 @@ impl OciConfig {
     /// Set the layer compression format.
     pub fn compression(mut self, compression: Compression) -> Self {
         self.compression = compression;
-        self
-    }
-
-    /// Also name the image the way containerd, and so Docker, looks it up
-    /// (`docker.io/library/<name>:<tag>` for a bare name), so `docker
-    /// load` makes an image `docker run <name>:<tag>` finds. Podman reads
-    /// that name too, and prefers it to `localhost/<name>`.
-    pub fn containerd_name(mut self, yes: bool) -> Self {
-        self.containerd_name = yes;
         self
     }
 
@@ -314,7 +303,6 @@ impl Default for OciConfig {
             user: None,
             image_name: None,
             image_tag: ImageTag::default(), // "latest"
-            containerd_name: false,
         }
     }
 }
@@ -524,8 +512,9 @@ impl OciConfig {
         // containerd, and so Docker, names a loaded image by this one, in
         // the normalized form it looks names up by. Without it, `docker
         // load` keeps `name:tag` as it is and `docker run name:tag` can't
-        // find it.
-        if let Some(name) = self.image_name.as_ref().filter(|_| self.containerd_name) {
+        // find it. Podman reads it too, so `node` loads as
+        // `docker.io/library/node` rather than `localhost/node`.
+        if let Some(name) = &self.image_name {
             let full = format!("{}:{}", normalized(name.as_str()), self.image_tag.as_str());
             manifest = manifest.with_annotation("io.containerd.image.name", full);
         }
@@ -1004,7 +993,6 @@ mod tests {
         assert_eq!(normalized("index.docker.io/fly/pg"), "docker.io/fly/pg");
 
         let named = OciConfig::new()
-            .containerd_name(true)
             .try_image_name("mpg-pg17-base")
             .unwrap()
             .try_image_tag("v1")
@@ -1016,11 +1004,7 @@ mod tests {
             json.contains(r#""io.containerd.image.name":"docker.io/library/mpg-pg17-base:v1""#)
         );
 
-        // Only when asked: podman would take the name over `localhost/`.
-        let plain = OciConfig::new().try_image_name("mpg-pg17-base").unwrap();
-        let json = serde_json::to_string(&plain.image_index(&digest, 1)).unwrap();
-        assert!(!json.contains("io.containerd.image.name"), "{json}");
-        let unnamed = OciConfig::new().containerd_name(true);
+        let unnamed = OciConfig::new();
         let json = serde_json::to_string(&unnamed.image_index(&digest, 1)).unwrap();
         assert!(!json.contains("io.containerd.image.name"), "{json}");
     }

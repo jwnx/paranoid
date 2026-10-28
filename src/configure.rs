@@ -397,7 +397,6 @@ impl Container {
         let config = OciConfig::new()
             .architecture(arch)
             .compression(Compression::Uncompressed)
-            .containerd_name(true)
             .try_image_name("paranoid-configure")?
             .try_image_tag(unique.as_str())?;
         let tarball = dir.join("unpacked.tar");

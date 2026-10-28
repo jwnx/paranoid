@@ -85,7 +85,7 @@ $ cd examples/node
 $ paranoid lock
 $ paranoid build
 $ podman load -i image.tar
-$ podman run --rm localhost/node:latest --version
+$ podman run --rm node:latest --version
 v18.20.4
 ```
 
@@ -710,7 +710,9 @@ change what they mean.
 - Output goes to `-o`, else to the manifest's `output` (relative to the
   manifest), else to `image.tar`. A path ending in `.tar` gets a tarball
   for `podman load` / `docker load`, anything else an OCI image layout
-  directory. Either is written next to its destination and renamed into
+  directory. A named image loads under the name Docker would give it
+  (`node` is `docker.io/library/node`), so `docker run node` and `podman
+  run node` both find it. Either is written next to its destination and renamed into
   place, so a failed build leaves the previous image as it was. A layout
   replaces the previous one whole, stale blobs included, and only ever
   replaces a layout or an empty directory.
