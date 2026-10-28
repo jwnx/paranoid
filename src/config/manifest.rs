@@ -45,14 +45,6 @@ pub struct Manifest {
     /// the local cache. Like `mirrors`, they're left out of the config
     /// hash.
     pub stores: Vec<Url>,
-    /// Users and groups with fixed IDs, which every image gets on top of
-    /// base-passwd's. They shape the image, not what's in it, so they're
-    /// left out of the config hash, as an entrypoint is.
-    pub accounts: Accounts,
-    /// Files, directories and symlinks written straight from the manifest,
-    /// which every image gets, in manifest order. Like `accounts`, they're
-    /// left out of the config hash.
-    pub paths: IndexMap<ImagePath, PathSpec>,
     /// Written as a set (`[images.*]`) rather than a single `[image]`.
     set: bool,
     /// The directory paths in the manifest are relative to: the manifest's
@@ -98,6 +90,15 @@ pub struct ImageSpec {
     /// Configure apt in the image for the manifest's repositories, at the
     /// snapshots they're locked to.
     pub apt_sources: bool,
+    /// Users and groups with fixed IDs, on top of base-passwd's: the
+    /// manifest's `[accounts]`, then the image's own, which win. They
+    /// shape the image, not what's in it, so they're left out of the
+    /// config hash, as an entrypoint is.
+    pub accounts: Accounts,
+    /// Files, directories and symlinks written straight from the manifest:
+    /// its `[paths]`, then the image's own, which win, in manifest order.
+    /// Like `accounts`, they're left out of the config hash.
+    pub paths: IndexMap<ImagePath, PathSpec>,
     pub entrypoint: Option<EntrypointConfig>,
     /// Where `build` writes the image, as written: relative to the
     /// manifest, with `{image}` standing for the image's id. See
@@ -203,8 +204,32 @@ struct RawImage {
     files: Vec<String>,
     locales: Option<Vec<String>>,
     apt_sources: Option<bool>,
+    #[serde(default)]
+    accounts: Accounts,
+    #[serde(default)]
+    paths: IndexMap<String, PathSpec>,
     entrypoint: Option<EntrypointConfig>,
     output: Option<String>,
+}
+
+/// `paths` as written, parsed and checked.
+fn parse_paths(
+    raw: IndexMap<String, PathSpec>,
+) -> Result<IndexMap<ImagePath, PathSpec>, ManifestError> {
+    let invalid = |message| ManifestError::Validation {
+        field: "paths",
+        message,
+    };
+    let mut paths = IndexMap::new();
+    for (path, spec) in raw {
+        let parsed: ImagePath = path.parse().map_err(invalid)?;
+        spec.check()
+            .map_err(|message| invalid(format!("'{path}': {message}")))?;
+        if paths.insert(parsed, spec).is_some() {
+            return Err(invalid(format!("'{path}' is declared twice")));
+        }
+    }
+    Ok(paths)
 }
 
 impl RawManifest {
@@ -223,15 +248,7 @@ impl RawManifest {
             .transpose()?;
         let stores = self.download.unwrap_or_default().stores;
         let accounts = self.accounts;
-        let mut paths = IndexMap::new();
-        for (path, spec) in self.paths {
-            let parsed: ImagePath = path.parse().map_err(|message| invalid("paths", message))?;
-            spec.check()
-                .map_err(|message| invalid("paths", format!("'{path}': {message}")))?;
-            if paths.insert(parsed, spec).is_some() {
-                return Err(invalid("paths", format!("'{path}' is declared twice")));
-            }
-        }
+        let paths = parse_paths(self.paths)?;
         let single = self.image.is_some() || !self.packages.is_empty() || self.entrypoint.is_some();
         let set = self.defaults.is_some() || !self.groups.is_empty() || !self.images.is_empty();
         if single && set {
@@ -259,6 +276,8 @@ impl RawManifest {
                         files: self.files.keys().cloned().collect(),
                         locales: i.locales,
                         apt_sources: i.apt_sources,
+                        accounts,
+                        paths,
                         entrypoint: self.entrypoint,
                         output: i.output,
                     },
@@ -268,6 +287,8 @@ impl RawManifest {
                     ImageSpec {
                         packages: self.packages,
                         files: self.files.keys().cloned().collect(),
+                        accounts,
+                        paths,
                         entrypoint: self.entrypoint,
                         ..ImageSpec::default()
                     },
@@ -281,8 +302,6 @@ impl RawManifest {
                 images: IndexMap::from([(DEFAULT_IMAGE.to_string(), image)]),
                 files: self.files,
                 stores,
-                accounts,
-                paths,
                 set: false,
                 dir: PathBuf::new(),
             });
@@ -328,6 +347,8 @@ impl RawManifest {
                     repository: None,
                 })
                 .collect();
+            let mut image_paths = paths.clone();
+            image_paths.extend(parse_paths(raw.paths)?);
             let image = ImageSpec {
                 name: raw.name,
                 tag: raw.tag.or_else(|| defaults.tag.clone()),
@@ -340,6 +361,8 @@ impl RawManifest {
                 files: raw.files,
                 locales,
                 apt_sources: raw.apt_sources.or(defaults.apt_sources).unwrap_or(false),
+                accounts: accounts.merged(raw.accounts),
+                paths: image_paths,
                 entrypoint: raw.entrypoint.or_else(|| defaults.entrypoint.clone()),
                 output: raw.output.or_else(|| defaults.output.clone()),
             };
@@ -360,8 +383,6 @@ impl RawManifest {
             images,
             files: self.files,
             stores,
-            accounts,
-            paths,
             set: true,
             dir: PathBuf::new(),
         })
@@ -912,12 +933,19 @@ impl Manifest {
             }
         }
 
-        self.accounts
-            .check()
-            .map_err(|message| ManifestError::Validation {
-                field: "accounts",
-                message,
-            })?;
+        for (id, image) in &self.images {
+            image
+                .accounts
+                .check()
+                .map_err(|message| ManifestError::Validation {
+                    field: "accounts",
+                    message: if self.set {
+                        format!("image '{id}': {message}")
+                    } else {
+                        message
+                    },
+                })?;
+        }
 
         for (id, file) in &self.files {
             if !is_id(id) {
@@ -1247,6 +1275,41 @@ name = \"bash\"
     }
 
     #[test]
+    fn images_add_their_own_accounts_and_paths() {
+        let manifest = set(
+            "[defaults]\narchitecture = \"amd64\"\n\n\
+             [accounts.users.postgres]\nuid = 999\n\n\
+             [paths.\"/run/postgresql\"]\nowner = \"postgres\"\n\n\
+             [paths.\"/var/lib/postgresql\"]\nmode = \"0755\"\n\n\
+             [images.plain]\npackages = [\"bash\"]\n\n\
+             [images.pg]\npackages = [\"bash\"]\n\
+             accounts = { groups = { ssl-cert = 101 }, users.postgres = { uid = 999, groups = [\"ssl-cert\"] } }\n\n\
+             [images.pg.paths.\"/var/lib/postgresql\"]\nowner = \"postgres\"\nmode = \"0700\"\n\n\
+             [images.pg.paths.\"/etc/x\"]\ncontent = \"x\"\n",
+        )
+        .unwrap();
+        let plain = &manifest.images["plain"];
+        assert!(plain.accounts.groups.is_empty());
+        assert!(plain.accounts.users["postgres"].groups.is_empty());
+        assert_eq!(plain.paths.len(), 2);
+
+        // The image's own come after the manifest's, and win.
+        let pg = &manifest.images["pg"];
+        assert_eq!(pg.accounts.groups["ssl-cert"], 101);
+        assert_eq!(pg.accounts.users["postgres"].groups, ["ssl-cert"]);
+        let paths: Vec<String> = pg.paths.keys().map(ToString::to_string).collect();
+        assert_eq!(paths, ["/run/postgresql", "/var/lib/postgresql", "/etc/x"]);
+        assert_eq!(pg.paths[1].mode.unwrap().to_string(), "0700");
+
+        let err = set("[defaults]\narchitecture = \"amd64\"\n\n\
+             [accounts.users.postgres]\nuid = 999\n\n\
+             [images.pg]\npackages = [\"bash\"]\naccounts.users.other = { uid = 999 }\n")
+        .unwrap_err();
+        assert!(err.to_string().contains("image 'pg'"), "{err}");
+        assert!(err.to_string().contains("both have UID 999"), "{err}");
+    }
+
+    #[test]
     fn parses_paths() {
         let single = |paths: &str| {
             Manifest::from_str(&format!(
@@ -1258,7 +1321,11 @@ name = \"bash\"
              \"/usr/sbin/policy-rc.d\" = { content = \"exit 101\", mode = \"0755\" }\n",
         )
         .unwrap();
-        let paths: Vec<String> = manifest.paths.keys().map(ToString::to_string).collect();
+        let paths: Vec<String> = manifest.images[DEFAULT_IMAGE]
+            .paths
+            .keys()
+            .map(ToString::to_string)
+            .collect();
         assert_eq!(paths, ["/run/postgresql", "/usr/sbin/policy-rc.d"]);
 
         for (paths, wanted) in [

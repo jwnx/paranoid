@@ -192,8 +192,8 @@ pub async fn build(
     if !spec.locales.is_empty() {
         locales::keep(&mut rootfs, &spec.locales)?;
     }
-    if !manifest.accounts.is_empty() {
-        accounts::write(&mut rootfs, &manifest.accounts)?;
+    if !spec.accounts.is_empty() {
+        accounts::write(&mut rootfs, &spec.accounts)?;
     }
     for (fetched, (_, spec)) in fetched_files.iter().zip(&files) {
         place(&mut rootfs, fetched, spec, manifest.architecture)?;
@@ -201,8 +201,8 @@ pub async fn build(
     if spec.apt_sources {
         apt::write(&mut rootfs, manifest)?;
     }
-    if !manifest.paths.is_empty() {
-        paths::apply(&mut rootfs, &manifest.paths)?;
+    if !spec.paths.is_empty() {
+        paths::apply(&mut rootfs, &spec.paths)?;
     }
     if spec.configure {
         let runtime = options
@@ -222,11 +222,11 @@ pub async fn build(
             let mut rootfs =
                 configure::configure(&unpacked, runtime, manifest.architecture, epoch).await?;
             // What the manifest declares wins over what a script did.
-            if !manifest.accounts.is_empty() {
-                accounts::verify(&rootfs, &manifest.accounts)?;
+            if !spec.accounts.is_empty() {
+                accounts::verify(&rootfs, &spec.accounts)?;
             }
-            if !manifest.paths.is_empty() {
-                paths::reapply(&mut rootfs, &manifest.paths)?;
+            if !spec.paths.is_empty() {
+                paths::reapply(&mut rootfs, &spec.paths)?;
             }
             reporter.report(Event::Advance {
                 phase: Phase::Configure,

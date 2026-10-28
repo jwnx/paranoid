@@ -3,7 +3,7 @@
 use indexmap::IndexMap;
 use serde::Deserialize;
 
-/// The users and groups every image gets, on top of base-passwd's.
+/// Users and groups an image gets, on top of base-passwd's.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Accounts {
@@ -57,6 +57,15 @@ const MAX_ID: u32 = 65533;
 impl Accounts {
     pub fn is_empty(&self) -> bool {
         self.groups.is_empty() && self.users.is_empty()
+    }
+
+    /// These accounts, with `other`'s added: a group or user `other` also
+    /// declares takes `other`'s declaration.
+    pub(super) fn merged(&self, other: Accounts) -> Accounts {
+        let mut merged = self.clone();
+        merged.groups.extend(other.groups);
+        merged.users.extend(other.users);
+        merged
     }
 
     /// Whether the accounts make sense on their own. Whether they get

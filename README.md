@@ -276,8 +276,11 @@ packages = ["build-essential", "postgresql-server-dev-17"]
 ```
 
 An image may set `name`, `tag`, `description`, `authors`, `source`,
-`unconfigured`, `entrypoint` and `output`, which override `[defaults]`.
-`examples/postgres` is a small working set.
+`unconfigured`, `configure`, `locales`, `apt_sources`, `entrypoint` and
+`output`, which override `[defaults]`. `files` names the
+[files](#files) it gets, and `accounts` and `paths` add to the
+manifest's [accounts](#accounts) and [paths](#paths). `examples/postgres`
+is a small working set.
 
 `paranoid lock` fetches and verifies every repository once and resolves
 each image against that same state, in manifest order. A package has one
@@ -457,11 +460,20 @@ gecos  = "PostgreSQL administrator"
 
 A user's primary group is `group`, by default a group named after it. A
 group named after the user is made with the user's UID as its GID, unless
-`[accounts.groups]` or base-passwd has it already. Every image of the
-manifest gets the accounts.
+`[accounts.groups]` or base-passwd has it already.
+
+Every image of the manifest gets `[accounts]`. In a set, an image can
+declare more of its own, and they take precedence over the manifest's
+when both name the same user or group:
+
+```toml
+[images.pg17.accounts.users.postgres]
+uid    = 999
+groups = ["ssl-cert"]
+```
 
 `build` writes `/etc/passwd` and `/etc/group` with base-passwd's entries
-and then these, so the image needs base-passwd. Nothing can take a name
+and then these, so an image with accounts needs base-passwd. Nothing can take a name
 or an ID base-passwd has: its `users` group is GID 100, for one. In a
 configured image the accounts are simply there. In an unconfigured one,
 base-passwd's `postinst` keeps the files it finds, and so does the
@@ -510,8 +522,10 @@ base-passwd's and the [accounts](#accounts), so a path can be owned by a
 user the manifest declares.
 
 Paths are written last, after the packages, the accounts and the
-[files](#files), in manifest order, and every image of the manifest gets
-them. A directory takes the owner and mode the manifest gives it, whether
+[files](#files), in manifest order. Every image of the manifest gets
+`[paths]`, and in a set an image can add its own with
+`[images.<id>.paths."/..."]`. They come after the manifest's, and take
+precedence when both declare the same path. A directory takes the owner and mode the manifest gives it, whether
 a package made it or not, and its missing parents are made as root, 0755.
 A file or a symlink can't replace anything that's there. Parents are
 resolved through the image's symlinks, as a package's paths are, so
