@@ -548,6 +548,28 @@ locales an image keeps isn't in the config hash, only `locales-all`
 coming in with the first one, so changing the list doesn't make the lock
 stale.
 
+## APT
+
+An image that installs more packages later, in a Dockerfile say, should
+get them from where its own came from. With `apt_sources = true` under
+`[image]`, `[defaults]` or `[images.<id>]`, `build` configures apt for the
+manifest's repositories:
+
+- `/etc/apt/sources.list.d/paranoid.sources` has a deb822 stanza per
+  repository, at its `snapshot` if it has one, with `Check-Valid-Until:
+  no` there, since an old snapshot's Release has expired.
+- Each repository's `signed_by` keys go to `/etc/apt/keyrings/`, and its
+  stanza names them with `Signed-By`, so apt trusts each repository's
+  keys for it alone, as paranoid does.
+- `/etc/apt/preferences.d/paranoid` pins each repository that sets
+  `priority`, such as an archive at 100, by its host. apt can't tell
+  repositories on one host apart, so those have to share a priority.
+
+`mirrors` stay out: they're paranoid's fallbacks for `.deb` downloads.
+The image needs `apt` itself, and `ca-certificates`, configured, for
+HTTPS repositories. Like `locales`, this shapes the image rather than
+what's in the lock.
+
 ## LOCK
 
 `paranoid lock` fetches each repository's `InRelease` and checks its
