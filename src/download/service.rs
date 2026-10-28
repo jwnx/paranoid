@@ -12,9 +12,10 @@ use url::Url;
 use crate::config::{Manifest, RepositoryConfig};
 use crate::hash::Sha256;
 use crate::http::{Client, ClientError, Retry};
-use crate::lock::LockedPackage;
 use crate::report::{Event, Phase, Reporter};
 
+use super::Blob;
+use super::blob::base;
 use super::cache::{PackageCache, content_path};
 use super::error::{
     DownloadError, DownloadFailures, Fetched, Mismatch, Origin, SourceFailure, WrongBytes,
@@ -101,13 +102,13 @@ impl DownloadService {
     ///
     /// Results come back in lock order. All packages are attempted; if any
     /// fail, every failure is returned together.
-    pub async fn download_all<'a>(
+    pub async fn download_all<'a, B: Blob + Sync>(
         &self,
-        packages: &[&'a LockedPackage],
+        packages: &[&'a B],
         sources: Sources<'_>,
         reporter: &dyn Reporter,
-    ) -> Result<Vec<Fetched<'a>>, DownloadFailures> {
-        let total_bytes = packages.iter().map(|p| p.size).sum();
+    ) -> Result<Vec<Fetched<'a, B>>, DownloadFailures> {
+        let total_bytes = packages.iter().map(|p| p.size()).sum();
         reporter.report(Event::Begin {
             phase: Phase::Download,
             total: total_bytes,
@@ -118,16 +119,16 @@ impl DownloadService {
             match &result {
                 Ok(_) => reporter.report(Event::Advance {
                     phase: Phase::Download,
-                    units: package.size,
-                    item: &package.name,
+                    units: package.size(),
+                    item: package.name(),
                 }),
                 Err(error) => reporter.report(Event::Failed {
                     phase: Phase::Download,
-                    item: &package.name,
+                    item: package.name(),
                     error,
                 }),
             }
-            result.map_err(|error| (package.name.clone(), error))
+            result.map_err(|error| (package.name().to_string(), error))
         });
 
         let results: Vec<_> = stream::iter(downloads)
@@ -144,16 +145,16 @@ impl DownloadService {
     }
 
     /// Make one package available in the cache.
-    async fn download<'a>(
+    async fn download<'a, B: Blob>(
         &self,
-        package: &'a LockedPackage,
+        package: &'a B,
         sources: Sources<'_>,
-    ) -> Result<Fetched<'a>, DownloadError> {
+    ) -> Result<Fetched<'a, B>, DownloadError> {
         if !self.config.force
             && let Some(path) = self.cache.get(package)
         {
             return Ok(Fetched {
-                package,
+                item: package,
                 path,
                 origin: Origin::Cache,
             });
@@ -163,7 +164,7 @@ impl DownloadService {
         let path = self.cache.store(package, &data)?;
 
         Ok(Fetched {
-            package,
+            item: package,
             path,
             origin,
         })
@@ -179,7 +180,7 @@ impl DownloadService {
     /// download at once rather than being skipped.
     async fn fetch(
         &self,
-        package: &LockedPackage,
+        package: &impl Blob,
         sources: Sources<'_>,
     ) -> Result<(Vec<u8>, Origin), DownloadError> {
         // Sources that were down for an earlier package go last, with one
@@ -209,25 +210,25 @@ impl DownloadService {
             let wrong = |url, mismatch| {
                 DownloadError::WrongBytes(Box::new(WrongBytes {
                     url,
-                    package: package.name.clone(),
+                    package: package.name().to_string(),
                     mismatch,
                 }))
             };
             match retry
-                .run(|| self.client.fetch_bytes_limited(&url, package.size))
+                .run(|| self.client.fetch_bytes_limited(&url, package.size()))
                 .await
             {
                 (Ok(data), _) => {
                     let actual = Sha256::of(&data);
-                    if actual != package.sha256 {
-                        let expected = package.sha256;
+                    if actual != *package.sha256() {
+                        let expected = *package.sha256();
                         return Err(wrong(url, Mismatch::Hash { expected, actual }));
                     }
                     self.down.lock().unwrap().remove(&base);
                     return Ok((data, origin));
                 }
                 (Err(ClientError::TooLarge { .. }), _) => {
-                    let size = package.size;
+                    let size = package.size();
                     return Err(wrong(url, Mismatch::TooLarge { size }));
                 }
                 (Err(error), attempts) => {
@@ -252,30 +253,26 @@ impl DownloadService {
     /// first costs nothing in safety, and keeps an outage upstream away
     /// from every package a store has.
     fn download_urls(
-        package: &LockedPackage,
+        package: &impl Blob,
         sources: Sources<'_>,
     ) -> Result<Vec<Source>, DownloadError> {
-        let repo_config = sources
-            .repositories
-            .get(&package.repository)
-            .ok_or_else(|| DownloadError::UnknownRepository(package.repository.clone()))?;
-        let base = |url: &Url| url.as_str().trim_end_matches('/').to_string();
         let stores = sources.stores.iter().map(|store| {
             let base = base(store);
             Source {
-                url: format!("{base}/{}", content_path(&package.sha256)),
+                url: format!("{base}/{}", content_path(package)),
                 base,
                 origin: Origin::Store,
             }
         });
-        let repository = std::iter::once(repo_config.base_url())
-            .chain(repo_config.mirrors.iter().map(base))
-            .map(|base| Source {
-                url: format!("{base}/{}", package.filename),
+        let upstream = package
+            .upstream(sources)?
+            .into_iter()
+            .map(|(base, url)| Source {
                 base,
+                url,
                 origin: Origin::Repository,
             });
-        Ok(stores.chain(repository).collect())
+        Ok(stores.chain(upstream).collect())
     }
 
     /// Get a reference to the cache.
@@ -289,6 +286,7 @@ mod tests {
     use super::*;
     use crate::download::test_utils::make_test_package;
     use crate::http::test_server::{Reply, TestServer};
+    use crate::lock::LockedPackage;
 
     #[test]
     fn test_download_config_default() {
@@ -453,7 +451,7 @@ mod tests {
 
     /// The store path of `bash()`.
     fn stored() -> String {
-        format!("/{}", content_path(&Sha256::of(DEB)))
+        format!("/{}", content_path(&bash()))
     }
 
     /// Fetch `bash()` from these stores, then a repository and its mirrors.

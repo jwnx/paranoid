@@ -1,22 +1,21 @@
-//! Content-addressable package cache.
+//! Content-addressable cache for packages and other blobs.
 
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::hash::Sha256;
-use crate::lock::LockedPackage;
 
-use super::DownloadError;
+use super::{Blob, DownloadError};
 
-/// Where a package with this hash lives in a content-addressed store, the
-/// local cache or a remote one: `sha256/<first 2 hex>/<hash>.deb`.
-pub fn content_path(sha256: &Sha256) -> String {
-    let hash = sha256.to_string();
-    format!("sha256/{}/{hash}.deb", &hash[..2])
+/// Where a blob lives in a content-addressed store, the local cache or a
+/// remote one: `sha256/<first 2 hex>/<hash>`, plus `.deb` for a package.
+pub fn content_path<B: Blob + ?Sized>(blob: &B) -> String {
+    let hash = blob.sha256().to_string();
+    format!("sha256/{}/{hash}{}", &hash[..2], B::EXTENSION)
 }
 
-/// Content-addressable cache for downloaded packages.
+/// Content-addressable cache for downloaded packages and other blobs.
 ///
 /// Packages are stored by their SHA256 hash:
 /// `{base_dir}/sha256/{first-2-chars}/{hash}.deb`
@@ -50,8 +49,8 @@ impl PackageCache {
     /// Get the cache path for a package.
     ///
     /// Returns the path where the package would be stored based on its SHA256 hash.
-    pub fn path_for(&self, package: &LockedPackage) -> PathBuf {
-        self.base_dir.join(content_path(&package.sha256))
+    pub fn path_for(&self, blob: &impl Blob) -> PathBuf {
+        self.base_dir.join(content_path(blob))
     }
 
     /// Check if a package is already cached.
@@ -59,25 +58,25 @@ impl PackageCache {
     /// Returns the cache path if an entry of the expected size exists. A
     /// truncated or partial entry counts as a miss. Contents are verified
     /// against the lock when the package is read with [`Self::read`].
-    pub fn get(&self, package: &LockedPackage) -> Option<PathBuf> {
-        let path = self.path_for(package);
+    pub fn get(&self, blob: &impl Blob) -> Option<PathBuf> {
+        let path = self.path_for(blob);
         let len = fs::metadata(&path).ok()?.len();
-        (len == package.size).then_some(path)
+        (len == blob.size()).then_some(path)
     }
 
     /// Read a cached package, verifying its checksum against the lock.
-    pub fn read(path: &Path, package: &LockedPackage) -> Result<Vec<u8>, DownloadError> {
+    pub fn read(path: &Path, blob: &impl Blob) -> Result<Vec<u8>, DownloadError> {
         let data = fs::read(path)?;
-        Self::verify(package, &data)?;
+        Self::verify(blob, &data)?;
         Ok(data)
     }
 
-    fn verify(package: &LockedPackage, data: &[u8]) -> Result<(), DownloadError> {
+    fn verify(blob: &impl Blob, data: &[u8]) -> Result<(), DownloadError> {
         let actual = Sha256::of(data);
-        if actual != package.sha256 {
+        if actual != *blob.sha256() {
             return Err(DownloadError::ChecksumMismatch {
-                package: package.name.clone(),
-                expected: package.sha256,
+                package: blob.name().to_string(),
+                expected: *blob.sha256(),
                 actual,
             });
         }
@@ -87,11 +86,11 @@ impl PackageCache {
     /// Store downloaded data in the cache after verifying its checksum.
     ///
     /// Returns the path to the cached file on success.
-    pub fn store(&self, package: &LockedPackage, data: &[u8]) -> Result<PathBuf, DownloadError> {
-        Self::verify(package, data)?;
+    pub fn store(&self, blob: &impl Blob, data: &[u8]) -> Result<PathBuf, DownloadError> {
+        Self::verify(blob, data)?;
 
         // Determine target path and ensure parent directory exists
-        let target_path = self.path_for(package);
+        let target_path = self.path_for(blob);
         if let Some(parent) = target_path.parent() {
             fs::create_dir_all(parent).map_err(|e| {
                 DownloadError::CacheDir(format!(

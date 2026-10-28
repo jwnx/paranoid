@@ -15,13 +15,9 @@ use thiserror::Error;
 use url::Url;
 
 use crate::config::check_base_url;
-use crate::download::{DownloadError, Fetched, PackageCache, all_or_errors, content_path};
+use crate::download::{Blob, DownloadError, Fetched, PackageCache, all_or_errors, content_path};
 use crate::http::{Client, ClientError, Credentials, EMPTY_PAYLOAD, Head, Retry};
-use crate::lock::LockedPackage;
 use crate::report::{Event, Phase, Reporter};
-
-/// The media type of a `.deb`.
-const DEB_TYPE: &str = "application/vnd.debian.binary-package";
 
 /// Where packages are pushed to.
 pub enum Store {
@@ -134,16 +130,16 @@ impl Store {
     /// of the wrong size counts as missing, so pushing repairs it, and so
     /// does a 403: S3 answers that for a missing key unless we may list
     /// the bucket. If we really may not write, the upload says so.
-    pub async fn missing<'a>(
+    pub async fn missing<'a, B: Blob + Sync>(
         &self,
-        packages: &[&'a LockedPackage],
+        packages: &[&'a B],
         jobs: NonZeroUsize,
-    ) -> Result<Vec<&'a LockedPackage>, PushFailures> {
+    ) -> Result<Vec<&'a B>, PushFailures> {
         let checks = packages.iter().map(|&package| async move {
             match self.has(package).await {
                 Ok(true) => Ok(None),
                 Ok(false) => Ok(Some(package)),
-                Err(error) => Err((package.name.clone(), error)),
+                Err(error) => Err((package.name().to_string(), error)),
             }
         });
         let results: Vec<_> = stream::iter(checks).buffered(jobs.get()).collect().await;
@@ -154,19 +150,19 @@ impl Store {
 
     /// Upload packages from the local cache, checking each against the
     /// lock first, so a store only ever gets what the lock says.
-    pub async fn push(
+    pub async fn push<B: Blob + Sync>(
         &self,
-        packages: &[Fetched<'_>],
+        packages: &[Fetched<'_, B>],
         jobs: NonZeroUsize,
         reporter: &dyn Reporter,
     ) -> Result<PushReport, PushFailures> {
-        let bytes = packages.iter().map(|f| f.package.size).sum();
+        let bytes = packages.iter().map(|f| f.item.size()).sum();
         reporter.report(Event::Begin {
             phase: Phase::Push,
             total: bytes,
         });
         let uploads = packages.iter().map(|fetched| async move {
-            let package = fetched.package;
+            let package = fetched.item;
             let result = match PackageCache::read(&fetched.path, package) {
                 Ok(data) => self.put(package, &data).await,
                 Err(e) => Err(e.into()),
@@ -174,16 +170,16 @@ impl Store {
             match &result {
                 Ok(()) => reporter.report(Event::Advance {
                     phase: Phase::Push,
-                    units: package.size,
-                    item: &package.name,
+                    units: package.size(),
+                    item: package.name(),
                 }),
                 Err(error) => reporter.report(Event::Failed {
                     phase: Phase::Push,
-                    item: &package.name,
+                    item: package.name(),
                     error,
                 }),
             }
-            result.map_err(|error| (package.name.clone(), error))
+            result.map_err(|error| (package.name().to_string(), error))
         });
         let results: Vec<_> = stream::iter(uploads).buffered(jobs.get()).collect().await;
         reporter.report(Event::End {
@@ -197,7 +193,7 @@ impl Store {
         })
     }
 
-    async fn has(&self, package: &LockedPackage) -> Result<bool, StoreError> {
+    async fn has<B: Blob>(&self, package: &B) -> Result<bool, StoreError> {
         let (client, credentials, retry, url) = match self {
             Self::Dir(cache) => return Ok(cache.get(package).is_some()),
             Self::Http {
@@ -221,7 +217,7 @@ impl Store {
             .await;
         match head {
             // Without a length we take the store's word for it.
-            Ok(Head::Present { length }) => Ok(length.is_none_or(|l| l == package.size)),
+            Ok(Head::Present { length }) => Ok(length.is_none_or(|l| l == package.size())),
             Ok(Head::Missing) => Ok(false),
             Err(ClientError::Status { status, .. }) if status == reqwest::StatusCode::FORBIDDEN => {
                 Ok(false)
@@ -230,7 +226,7 @@ impl Store {
         }
     }
 
-    async fn put(&self, package: &LockedPackage, data: &[u8]) -> Result<(), StoreError> {
+    async fn put<B: Blob>(&self, package: &B, data: &[u8]) -> Result<(), StoreError> {
         let (client, credentials, retry, url) = match self {
             Self::Dir(cache) => {
                 cache.store(package, data)?;
@@ -250,13 +246,13 @@ impl Store {
         };
         // S3 checks the body against the hash we sign, so a bucket never
         // keeps a corrupted upload.
-        let hash = package.sha256.to_string();
+        let hash = package.sha256().to_string();
         let url = &url;
         let (result, _) = retry
             .run(|| {
-                let content_type = [("content-type", DEB_TYPE)];
+                let content_type = [("content-type", B::MEDIA_TYPE)];
                 let mut headers = sign(credentials, "PUT", url, &content_type, &hash);
-                headers.push(("content-type".to_string(), DEB_TYPE.to_string()));
+                headers.push(("content-type".to_string(), B::MEDIA_TYPE.to_string()));
                 async move { client.put(url.as_str(), &headers, data).await }
             })
             .await;
@@ -273,9 +269,9 @@ impl fmt::Display for Store {
     }
 }
 
-/// Where a package lives under a store's base URL.
-fn object_url(base: &str, package: &LockedPackage) -> Url {
-    Url::parse(&format!("{base}/{}", content_path(&package.sha256)))
+/// Where a blob lives under a store's base URL.
+fn object_url(base: &str, blob: &impl Blob) -> Url {
+    Url::parse(&format!("{base}/{}", content_path(blob)))
         .expect("a valid base URL with a path appended is valid")
 }
 
@@ -306,6 +302,7 @@ mod tests {
     use crate::download::test_utils::make_test_package;
     use crate::hash::Sha256;
     use crate::http::test_server::{Reply, TestServer};
+    use crate::lock::LockedPackage;
 
     const JOBS: NonZeroUsize = NonZeroUsize::new(4).unwrap();
 
@@ -322,7 +319,7 @@ mod tests {
         packages
             .iter()
             .map(|package| Fetched {
-                package,
+                item: package,
                 path: cache.path_for(package),
                 origin: Origin::Cache,
             })
@@ -368,7 +365,7 @@ mod tests {
             package("dash", b"dash", dir.path()),
             package("zsh", b"zsh", dir.path()),
         ];
-        let path = |p: &LockedPackage| format!("/debs/{}", content_path(&p.sha256));
+        let path = |p: &LockedPackage| format!("/debs/{}", content_path(p));
         let objects = Arc::new(Mutex::new(vec![
             (path(&packages[0]), b"bash".to_vec()),
             // Truncated, so pushed again.
@@ -398,7 +395,10 @@ mod tests {
             .filter(|r| r.method == "PUT")
             .collect();
         assert_eq!(put.len(), 2);
-        assert_eq!(put[0].header("content-type"), Some(DEB_TYPE));
+        assert_eq!(
+            put[0].header("content-type"),
+            Some(LockedPackage::MEDIA_TYPE)
+        );
         assert!(store.missing(&all, JOBS).await.unwrap().is_empty());
         assert!(
             objects
@@ -516,7 +516,7 @@ mod tests {
             .await
             .unwrap();
         assert!(store.missing(&all, JOBS).await.unwrap().is_empty());
-        let stored = target.path().join(content_path(&packages[0].sha256));
+        let stored = target.path().join(content_path(&packages[0]));
         assert_eq!(std::fs::read(stored).unwrap(), b"bash");
     }
 
@@ -560,7 +560,7 @@ mod tests {
             package("bash", b"bash", dir.path()),
             package("dash", b"dash", dir.path()),
         ];
-        let forbidden = format!("/{}", content_path(&packages[0].sha256));
+        let forbidden = format!("/{}", content_path(&packages[0]));
         let server = TestServer::start(move |request| match request.path == forbidden {
             true => Reply::Status(403),
             false => Reply::Status(200),

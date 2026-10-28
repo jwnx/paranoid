@@ -133,12 +133,12 @@ pub enum Origin {
     Repository,
 }
 
-/// A package available in the local cache.
+/// A package, or another blob, available in the local cache.
 #[derive(Debug, Clone)]
-pub struct Fetched<'a> {
+pub struct Fetched<'a, B = LockedPackage> {
     /// The lock entry this file satisfies.
-    pub package: &'a LockedPackage,
-    /// Path to the cached `.deb`.
+    pub item: &'a B,
+    /// Path to the cached file.
     pub path: PathBuf,
     pub origin: Origin,
 }

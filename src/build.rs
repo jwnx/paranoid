@@ -154,8 +154,8 @@ pub fn assemble(
     let mut rootfs = Rootfs::new();
     let mut dpkg = DpkgDatabase::new(state);
     for fetched in packages {
-        let name = &fetched.package.name;
-        let result = PackageCache::read(&fetched.path, fetched.package)
+        let name = &fetched.item.name;
+        let result = PackageCache::read(&fetched.path, fetched.item)
             .map_err(|source| BuildError::Verify {
                 package: name.clone(),
                 source,

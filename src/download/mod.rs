@@ -6,10 +6,12 @@
 //! repository and its mirrors. A source that doesn't have a package is
 //! skipped for the next one, and one that's down is retried first.
 
+mod blob;
 mod cache;
 mod error;
 mod service;
 
+pub use blob::Blob;
 pub use cache::{PackageCache, content_path};
 pub use error::{
     DownloadError, DownloadFailures, Fetched, Mismatch, Origin, SourceFailure, WrongBytes,

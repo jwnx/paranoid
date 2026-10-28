@@ -596,8 +596,8 @@ name = "ca-certificates"
         );
         println!(
             "  {} {} -> {} ({:?})",
-            pkg.package.name,
-            pkg.package.version,
+            pkg.item.name,
+            pkg.item.version,
             pkg.path.display(),
             pkg.origin
         );
@@ -652,7 +652,7 @@ name = "base-files"
         .await
         .expect("First download should succeed");
 
-    let first_download = result1.iter().find(|p| p.package.name == "base-files");
+    let first_download = result1.iter().find(|p| p.item.name == "base-files");
     assert!(
         first_download.is_some(),
         "Should have downloaded base-files"
@@ -672,7 +672,7 @@ name = "base-files"
         .await
         .expect("Second download should succeed");
 
-    let cached_download = result2.iter().find(|p| p.package.name == "base-files");
+    let cached_download = result2.iter().find(|p| p.item.name == "base-files");
     assert!(cached_download.is_some(), "Should have base-files");
     assert!(
         cached_download.unwrap().origin == Origin::Cache,
