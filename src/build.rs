@@ -2,13 +2,14 @@
 //!
 //! The pipeline is: download every locked package and file into the cache,
 //! apply the packages to an in-memory [`Rootfs`] in lock order, record them
-//! in the dpkg database (`/var/lib/dpkg`), place the files, and write a
-//! single-layer OCI image from it.
+//! in the dpkg database (`/var/lib/dpkg`), write the manifest's accounts,
+//! place the files, and write a single-layer OCI image from it.
 
 use std::path::PathBuf;
 
 use thiserror::Error;
 
+use crate::accounts::{self, AccountsError};
 use crate::arch::Architecture;
 use crate::config::{FileSpec, Manifest};
 use crate::deb::{DebArchive, DebError};
@@ -65,6 +66,9 @@ pub enum BuildError {
 
     #[error(transparent)]
     Download(#[from] DownloadFailures),
+
+    #[error("failed to write the accounts")]
+    Accounts(#[from] AccountsError),
 
     #[error("failed to place file {file}")]
     Place {
@@ -156,6 +160,9 @@ pub async fn build(
         PackageState::Installed
     };
     let mut rootfs = assemble(&fetched, state, reporter)?;
+    if !manifest.accounts.is_empty() {
+        accounts::write(&mut rootfs, &manifest.accounts)?;
+    }
     for (fetched, (_, spec)) in fetched_files.iter().zip(&files) {
         place(&mut rootfs, fetched, spec, manifest.architecture)?;
     }

@@ -13,7 +13,7 @@ use crate::arch::Architecture;
 use crate::repository::DebianVersion;
 use crate::version::VersionConstraint;
 
-use super::FileSpec;
+use super::{Accounts, FileSpec};
 
 /// A manifest: repositories, holds, and the images built from them.
 ///
@@ -45,6 +45,10 @@ pub struct Manifest {
     /// the local cache. Like `mirrors`, they're left out of the config
     /// hash.
     pub stores: Vec<Url>,
+    /// Users and groups with fixed IDs, which every image gets on top of
+    /// base-passwd's. They shape the image, not what's in it, so they're
+    /// left out of the config hash, as an entrypoint is.
+    pub accounts: Accounts,
     /// Written as a set (`[images.*]`) rather than a single `[image]`.
     set: bool,
     /// The directory paths in the manifest are relative to: the manifest's
@@ -96,6 +100,8 @@ struct RawManifest {
     #[serde(default)]
     holds: IndexMap<String, HoldSpec>,
     download: Option<RawDownload>,
+    #[serde(default)]
+    accounts: Accounts,
     #[serde(default)]
     files: IndexMap<String, FileSpec>,
 
@@ -187,6 +193,7 @@ impl RawManifest {
             })
             .transpose()?;
         let stores = self.download.unwrap_or_default().stores;
+        let accounts = self.accounts;
         let single = self.image.is_some() || !self.packages.is_empty() || self.entrypoint.is_some();
         let set = self.defaults.is_some() || !self.groups.is_empty() || !self.images.is_empty();
         if single && set {
@@ -233,6 +240,7 @@ impl RawManifest {
                 images: IndexMap::from([(DEFAULT_IMAGE.to_string(), image)]),
                 files: self.files,
                 stores,
+                accounts,
                 set: false,
                 dir: PathBuf::new(),
             });
@@ -302,6 +310,7 @@ impl RawManifest {
             images,
             files: self.files,
             stores,
+            accounts,
             set: true,
             dir: PathBuf::new(),
         })
@@ -810,6 +819,13 @@ impl Manifest {
                 }
             }
         }
+
+        self.accounts
+            .check()
+            .map_err(|message| ManifestError::Validation {
+                field: "accounts",
+                message,
+            })?;
 
         for (id, file) in &self.files {
             if !is_id(id) {

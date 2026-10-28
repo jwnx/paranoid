@@ -1,3 +1,4 @@
+pub mod accounts;
 pub mod arch;
 pub mod build;
 pub mod config;

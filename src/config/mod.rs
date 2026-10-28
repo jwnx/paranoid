@@ -1,7 +1,9 @@
+mod accounts;
 mod files;
 mod manifest;
 mod snapshot;
 
+pub use accounts::{Accounts, UserSpec};
 pub use files::{Extract, FileMode, FileSpec, ImagePath, Source, VersionPrefix, release_version};
 pub use manifest::{
     ConfigFormat, DEFAULT_IMAGE, EntrypointConfig, HoldSpec, ImageSpec, Manifest, ManifestError,
