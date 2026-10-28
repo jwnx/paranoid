@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 
 use paranoid::config::{ConfigFormat, Manifest, MovedSnapshot, SnapshotTime, set_snapshots};
+use paranoid::download::{DownloadConfig, DownloadService, PackageCache};
+use paranoid::files;
 use paranoid::lock::{LockDiff, LockFile};
 use paranoid::resolve::ResolveService;
 
@@ -45,6 +47,10 @@ pub struct LockArgs {
     /// rewritten only once the new lock resolves.
     #[arg(long, value_name = "TIME", value_parser = parse_snapshot)]
     snapshot: Option<SnapshotTime>,
+
+    /// Directory to hold downloaded files (defaults to system cache).
+    #[arg(long, value_name = "DIR")]
+    cache_dir: Option<PathBuf>,
 }
 
 /// `--snapshot`: `now`, or a snapshot time that isn't in the future.
@@ -168,11 +174,25 @@ pub async fn run(args: LockArgs, quiet: bool) -> Result<(), CliError> {
         .resolve(&manifest)
         .await
         .map_err(CliError::resolve)?;
+    let files = if manifest.files.is_empty() {
+        Vec::new()
+    } else {
+        let cache = match &args.cache_dir {
+            Some(dir) => PackageCache::with_base_dir(dir.clone()),
+            None => PackageCache::new(),
+        }
+        .map_err(CliError::files)?;
+        let downloads = DownloadService::with_cache(cache, DownloadConfig::default())
+            .map_err(CliError::files)?;
+        files::lock(&manifest, &downloads, &())
+            .await
+            .map_err(CliError::files)?
+    };
     if !quiet {
         eprint!(" Done ");
     }
 
-    let lock = LockFile::from_resolved(&manifest, resolved);
+    let lock = LockFile::from_resolved(&manifest, resolved).with_files(files);
     if lock.unmet().next().is_some() && !quiet {
         // Finish the progress line before the warning or error.
         eprintln!();

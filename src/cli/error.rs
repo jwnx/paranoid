@@ -37,6 +37,11 @@ impl CliError {
         Self::wrap("dependency resolution failed", e)
     }
 
+    /// A file that couldn't be fetched, or doesn't match its pinned hash.
+    pub fn files(e: impl Error) -> Self {
+        Self::wrap("could not lock files", e)
+    }
+
     pub fn lock(e: impl Error) -> Self {
         Self::wrap("lock file error", e)
     }

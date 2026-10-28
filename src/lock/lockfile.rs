@@ -5,6 +5,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use url::Url;
 
 use crate::arch::Architecture;
 use crate::config::{FileSpec, HoldSpec, Manifest, PackageSpec, RepositoryConfig};
@@ -23,6 +24,26 @@ pub struct LockedPackage {
     pub filename: String,
     pub size: u64,
     pub repository: String,
+}
+
+/// A locked file, fetched from a URL rather than a repository.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LockedFile {
+    /// Its id in the manifest.
+    pub name: String,
+    pub url: Url,
+    pub sha256: Sha256,
+    pub size: u64,
+    /// What vouches for its hash.
+    pub trust: Trust,
+}
+
+/// What vouches for a file's hash.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Trust {
+    /// The manifest pins it, so whoever wrote the manifest does.
+    Pinned,
 }
 
 /// A dependency nothing in the repositories satisfied, which the lock was
@@ -58,6 +79,9 @@ pub struct LockedImage {
     pub packages: Vec<String>,
     /// The packages the manifest asks for, sorted.
     pub direct: Vec<String>,
+    /// The files it gets, in manifest order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
     /// Dependencies left unmet, sorted. Empty unless the lock was written
     /// with `--allow-unmet`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -83,8 +107,12 @@ pub struct LockFile {
     pub repositories: Vec<ResolvedRepository>,
 
     /// Every locked package of every image, sorted by name.
-    #[serde(rename = "package")]
+    #[serde(rename = "package", default)]
     pub packages: Vec<LockedPackage>,
+
+    /// Every locked file of every image, in manifest order.
+    #[serde(rename = "file", default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<LockedFile>,
 
     /// The images, in manifest order.
     #[serde(rename = "image", default)]
@@ -113,6 +141,9 @@ pub enum LockFileError {
 
     #[error("image '{image}' lists package '{package}', which the lock doesn't record")]
     UnknownPackage { image: String, package: String },
+
+    #[error("image '{image}' lists file '{file}', which the lock doesn't record")]
+    UnknownFile { image: String, file: String },
 
     #[error(
         "package '{package}' comes from repository '{repository}', which the lock doesn't record"
@@ -176,10 +207,16 @@ impl LockFile {
                     names.sort();
                     names
                 };
+                let files = manifest
+                    .images
+                    .get(&image.id)
+                    .map(|spec| spec.files.clone())
+                    .unwrap_or_default();
                 LockedImage {
                     name: image.id,
                     packages: sorted(image.packages),
                     direct: sorted(image.direct),
+                    files,
                     unmet,
                     deps,
                 }
@@ -190,8 +227,25 @@ impl LockFile {
             config_hash,
             repositories: resolved.repositories,
             packages,
+            files: Vec::new(),
             images,
         }
+    }
+
+    /// The lock with these files, which [`Self::from_resolved`] leaves to
+    /// the caller since resolution doesn't fetch them.
+    #[must_use]
+    pub fn with_files(self, files: Vec<LockedFile>) -> Self {
+        Self { files, ..self }
+    }
+
+    /// An image's files, in manifest order.
+    pub fn image_files<'a>(&'a self, image: &'a LockedImage) -> Vec<&'a LockedFile> {
+        image
+            .files
+            .iter()
+            .filter_map(|name| self.files.iter().find(|f| &f.name == name))
+            .collect()
     }
 
     /// The image with this id.
@@ -241,6 +295,16 @@ impl LockFile {
                 return Err(LockFileError::UnknownPackage {
                     image: image.name.clone(),
                     package: name.clone(),
+                });
+            }
+            if let Some(name) = image
+                .files
+                .iter()
+                .find(|name| !lock.files.iter().any(|f| &f.name == *name))
+            {
+                return Err(LockFileError::UnknownFile {
+                    image: image.name.clone(),
+                    file: name.clone(),
                 });
             }
         }
@@ -591,6 +655,62 @@ direct = ["bash"]
         let parsed = LockFile::from_str(&serialized).unwrap();
         assert_eq!(parsed.packages.len(), 2);
         assert_eq!(parsed.config_hash, lock.config_hash);
+    }
+
+    fn with_tini() -> (Manifest, LockFile) {
+        let manifest = Manifest::from_str(&format!(
+            "{}\n[files.tini]\nurl = \"https://example.com/tini\"\n\
+             sha256 = \"{TEST_HASH_1}\"\npath = \"/usr/bin/tini\"\n",
+            make_manifest_toml()
+        ))
+        .unwrap();
+        let lock =
+            LockFile::from_resolved(&manifest, make_resolved()).with_files(vec![LockedFile {
+                name: "tini".to_string(),
+                url: "https://example.com/tini".parse().unwrap(),
+                sha256: TEST_HASH_1.parse().unwrap(),
+                size: 42,
+                trust: Trust::Pinned,
+            }]);
+        (manifest, lock)
+    }
+
+    #[test]
+    fn records_files_and_the_images_that_get_them() {
+        let (manifest, lock) = with_tini();
+        let serialized = lock.serialize().unwrap();
+        assert!(
+            serialized.contains("[[file]]\nname = \"tini\""),
+            "{serialized}"
+        );
+        assert!(serialized.contains("trust = \"pinned\""), "{serialized}");
+
+        let parsed = LockFile::from_str(&serialized).unwrap();
+        assert_eq!(parsed.files, lock.files);
+        let image = &parsed.images[0];
+        assert_eq!(image.files, ["tini"]);
+        assert_eq!(parsed.image_files(image), [&lock.files[0]]);
+        assert!(parsed.matches_config(&manifest));
+    }
+
+    #[test]
+    fn leaves_files_out_when_there_are_none() {
+        let serialized = LockFile::from_resolved(&make_manifest(), make_resolved())
+            .serialize()
+            .unwrap();
+        assert!(!serialized.contains("[[file]]"), "{serialized}");
+        assert!(!serialized.contains("files ="), "{serialized}");
+    }
+
+    #[test]
+    fn rejects_an_image_with_a_file_the_lock_does_not_record() {
+        let (_, mut lock) = with_tini();
+        lock.files.clear();
+        let err = LockFile::from_str(&lock.serialize().unwrap()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "image 'default' lists file 'tini', which the lock doesn't record"
+        );
     }
 
     #[test]

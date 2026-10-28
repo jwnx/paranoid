@@ -3,7 +3,7 @@
 use url::Url;
 
 use crate::hash::Sha256;
-use crate::lock::LockedPackage;
+use crate::lock::{LockedFile, LockedPackage};
 
 use super::{DownloadError, Sources};
 
@@ -24,6 +24,32 @@ pub trait Blob {
     /// (base URL, URL) pairs. A source whose base is down for one blob is
     /// asked last for the next.
     fn upstream(&self, sources: Sources<'_>) -> Result<Vec<(String, String)>, DownloadError>;
+}
+
+impl Blob for LockedFile {
+    const EXTENSION: &'static str = "";
+    const MEDIA_TYPE: &'static str = "application/octet-stream";
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn sha256(&self) -> &Sha256 {
+        &self.sha256
+    }
+
+    fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// The file's own URL. Its server is its base, so a server that's down
+    /// for one file is asked last for the next.
+    fn upstream(&self, _: Sources<'_>) -> Result<Vec<(String, String)>, DownloadError> {
+        Ok(vec![(
+            self.url.origin().ascii_serialization(),
+            self.url.to_string(),
+        )])
+    }
 }
 
 /// A URL without a trailing slash, to join paths to.

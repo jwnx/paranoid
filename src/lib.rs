@@ -4,6 +4,7 @@ pub mod config;
 pub mod deb;
 pub mod download;
 pub mod dpkg;
+pub mod files;
 pub mod hash;
 pub mod http;
 pub mod lock;

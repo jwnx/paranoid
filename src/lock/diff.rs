@@ -213,12 +213,14 @@ mod tests {
             config_hash: String::new(),
             repositories: vec![],
             packages,
+            files: Vec::new(),
             images: images
                 .iter()
                 .map(|(name, pkgs)| LockedImage {
                     name: name.to_string(),
                     packages: pkgs.iter().map(|(n, _)| n.to_string()).collect(),
                     direct: Vec::new(),
+                    files: Vec::new(),
                     unmet: Vec::new(),
                     deps: Vec::new(),
                 })
