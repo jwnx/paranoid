@@ -434,6 +434,45 @@ dpkg doesn't know about files, so scanners that read its database, like
 trivy and syft, won't see them. [`docs/files.md`](docs/files.md) has what
 comes next: GitHub's releases.
 
+## ACCOUNTS
+
+A package that needs a user makes it in its `postinst`, with `adduser
+--system`, which takes the next free ID. Which one that is depends on
+what was configured before it, so adding a package to an image can move
+`postgres` from 100 to 101, and files it owns on a volume stop being its.
+Declare the users and groups instead, with fixed IDs:
+
+```toml
+[accounts]
+groups = { ssl-cert = 101 }
+
+[accounts.users.postgres]
+uid    = 999                        # its own group, postgres, gets 999 too
+groups = ["ssl-cert"]               # more groups it's a member of
+home   = "/var/lib/postgresql"      # default /nonexistent
+shell  = "/bin/bash"                # default /usr/sbin/nologin
+gecos  = "PostgreSQL administrator"
+```
+
+A user's primary group is `group`, by default a group named after it. A
+group named after the user is made with the user's UID as its GID, unless
+`[accounts.groups]` or base-passwd has it already. Every image of the
+manifest gets the accounts.
+
+`build` writes `/etc/passwd` and `/etc/group` with base-passwd's entries
+and then these, so the image needs base-passwd. Nothing can take a name
+or an ID base-passwd has: its `users` group is GID 100, for one. In a
+configured image the accounts are simply there. In an unconfigured one,
+base-passwd's `postinst` keeps the files it finds, and so does the
+`adduser --system` in a package's `postinst` when the user it asks for
+exists: `postgresql-common` keeps `postgres` at 999, and `ssl-cert` keeps
+its group at 101. Passwords are `*`, as base-passwd writes its own, until
+configuring the passwd package moves them to `/etc/shadow`.
+
+Accounts shape the image rather than what's in it, so like `entrypoint`
+they're left out of the config hash, and changing them doesn't make the
+lock stale.
+
 ## LOCK
 
 `paranoid lock` fetches each repository's `InRelease` and checks its
