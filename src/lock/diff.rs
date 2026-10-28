@@ -484,6 +484,9 @@ mod tests {
                 sha256: Sha256::of(data),
                 size: data.len() as u64,
                 trust: crate::lock::Trust::Pinned,
+                signed_by: Vec::new(),
+                signature: None,
+                checksums: None,
             })
             .collect();
         for image in &mut lock.images {

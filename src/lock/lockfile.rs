@@ -11,7 +11,7 @@ use crate::arch::Architecture;
 use crate::config::{FileSpec, HoldSpec, Manifest, PackageSpec, RepositoryConfig};
 use crate::hash::Sha256;
 use crate::oci::Digest;
-use crate::repository::debian::{Keyring, KeyringError};
+use crate::repository::debian::{Fingerprint, Keyring, KeyringError};
 use crate::resolve::{ResolvedManifest, ResolvedRepository};
 
 /// A locked package entry.
@@ -36,6 +36,16 @@ pub struct LockedFile {
     pub size: u64,
     /// What vouches for its hash.
     pub trust: Trust,
+    /// For a signed file, primary fingerprints of the keys whose signatures
+    /// checked out.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signed_by: Vec<Fingerprint>,
+    /// The detached signature that was checked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<Url>,
+    /// The checksums file the hash came from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checksums: Option<Url>,
 }
 
 /// What vouches for a file's hash.
@@ -44,6 +54,8 @@ pub struct LockedFile {
 pub enum Trust {
     /// The manifest pins it, so whoever wrote the manifest does.
     Pinned,
+    /// A key the manifest trusts signed it, or a checksums file listing it.
+    Signed,
 }
 
 /// A dependency nothing in the repositories satisfied, which the lock was
@@ -152,6 +164,13 @@ pub enum LockFileError {
         "package '{package}' comes from repository '{repository}', which the lock doesn't record"
     )]
     UnknownRepository { package: String, repository: String },
+
+    #[error("file '{file}': {source}")]
+    FileKeyring {
+        file: String,
+        #[source]
+        source: Box<KeyringError>,
+    },
 
     #[error("repository '{repository}': {source}")]
     Keyring {
@@ -359,10 +378,10 @@ impl LockFile {
     }
 
     /// Whether the lock still stands for the manifest: it was resolved from
-    /// this manifest, and each snapshot it records was signed by a key the
-    /// manifest still trusts for that repository. The config hash covers
-    /// the `signed_by` path but not what's in the file, hence the second
-    /// check.
+    /// this manifest, and each snapshot and signed file it records was
+    /// signed by a key the manifest still trusts for it. The config hash
+    /// covers the `signed_by` paths but not what's in the files, hence the
+    /// second check.
     pub fn is_current(&self, manifest: &Manifest) -> Result<bool, LockFileError> {
         if !self.matches_config(manifest) {
             return Ok(false);
@@ -380,6 +399,25 @@ impl LockFile {
                 })?;
             let trusted = keyring.fingerprints();
             if !repo.signed_by.iter().any(|fp| trusted.contains(fp)) {
+                return Ok(false);
+            }
+        }
+        for file in self.files.iter().filter(|f| f.trust == Trust::Signed) {
+            let Some(signed_by) = manifest
+                .files
+                .get(&file.name)
+                .and_then(|spec| spec.signed_by.as_ref())
+            else {
+                return Ok(false);
+            };
+            let keyring = Keyring::load(&manifest.resolve_path(signed_by)).map_err(|source| {
+                LockFileError::FileKeyring {
+                    file: file.name.clone(),
+                    source: Box::new(source),
+                }
+            })?;
+            let trusted = keyring.fingerprints();
+            if !file.signed_by.iter().any(|fp| trusted.contains(fp)) {
                 return Ok(false);
             }
         }
@@ -679,6 +717,9 @@ direct = ["bash"]
                 sha256: TEST_HASH_1.parse().unwrap(),
                 size: 42,
                 trust: Trust::Pinned,
+                signed_by: Vec::new(),
+                signature: None,
+                checksums: None,
             }]);
         (manifest, lock)
     }
@@ -708,6 +749,41 @@ direct = ["bash"]
             .unwrap();
         assert!(!serialized.contains("[[file]]"), "{serialized}");
         assert!(!serialized.contains("files ="), "{serialized}");
+    }
+
+    #[test]
+    fn a_signed_file_needs_a_signer_the_manifest_still_trusts() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/repository/debian/testdata/files");
+        let manifest = |keys: &str| {
+            let toml = format!(
+                "{}\n[files.tool]\nurl = \"https://example.com/tool\"\npath = \"/tool\"\n\
+                 signed_by = \"{keys}\"\nsignature = \"https://example.com/tool.asc\"\n",
+                make_manifest_toml().replace("keys/debian.asc", "release.asc")
+            );
+            Manifest::from_file_content(&dir.join("paranoid.toml"), &toml).unwrap()
+        };
+        let trusted = manifest("release.asc");
+        let mut lock = LockFile::from_resolved(&trusted, make_resolved());
+        lock.repositories.clear();
+        lock.files = vec![LockedFile {
+            name: "tool".to_string(),
+            url: "https://example.com/tool".parse().unwrap(),
+            sha256: TEST_HASH_1.parse().unwrap(),
+            size: 7,
+            trust: Trust::Signed,
+            signed_by: vec![
+                serde_json::from_str("\"7B6CFBF9384A130F6053229331B1E3B66D0E9BF6\"").unwrap(),
+            ],
+            signature: Some("https://example.com/tool.asc".parse().unwrap()),
+            checksums: None,
+        }];
+        assert!(lock.is_current(&trusted).unwrap());
+
+        // The same keyring path with other keys in it.
+        let stranger = manifest("stranger.asc");
+        lock.config_hash = LockFile::compute_config_hash(&stranger);
+        assert!(!lock.is_current(&stranger).unwrap());
     }
 
     #[test]

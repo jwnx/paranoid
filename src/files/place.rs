@@ -1,9 +1,4 @@
-//! Files fetched from a URL rather than a repository (`[files.<id>]`).
-//!
-//! `lock` checks each file against the hash the manifest pins and records
-//! its size; from then on a file is a blob like a package: `build` fetches
-//! it from the stores or its URL, checks it against the lock, and places it
-//! in the image after the packages.
+//! Placing a file in an image.
 
 use std::io::{self, Read};
 
@@ -11,69 +6,8 @@ use flate2::read::GzDecoder;
 use thiserror::Error;
 use xz2::read::XzDecoder;
 
-use crate::config::{Extract, FileSpec, Manifest};
-use crate::download::{DownloadFailures, DownloadService, PackageCache, Sources};
-use crate::lock::{LockFile, LockedFile, Trust};
-use crate::report::Reporter;
+use crate::config::{Extract, FileSpec};
 use crate::rootfs::{Rootfs, RootfsError};
-
-/// The most `lock` reads of a file before it knows the file's size.
-pub const MAX_FILE_SIZE: u64 = 4 << 30;
-
-/// Lock the manifest's files, in manifest order: check each against the
-/// hash the manifest pins, and record its size. A file the existing lock
-/// already records at the same URL and hash keeps its entry, and one the
-/// cache has isn't downloaded again; one that is downloaded goes into the
-/// cache for `build`.
-pub async fn lock(
-    manifest: &Manifest,
-    existing: Option<&LockFile>,
-    downloads: &DownloadService,
-    reporter: &dyn Reporter,
-) -> Result<Vec<LockedFile>, DownloadFailures> {
-    let mut files: Vec<LockedFile> = manifest
-        .files
-        .iter()
-        .map(|(id, spec)| LockedFile {
-            name: id.clone(),
-            url: spec.url.clone(),
-            sha256: spec.sha256,
-            size: MAX_FILE_SIZE,
-            trust: Trust::Pinned,
-        })
-        .collect();
-
-    let cache = downloads.cache();
-    let cached = |file: &LockedFile| {
-        let data = PackageCache::read(&cache.path_for(file), file).ok()?;
-        Some(data.len() as u64)
-    };
-    let locked = |file: &LockedFile| {
-        let old = existing?.files.iter().find(|f| f.name == file.name)?;
-        (old.url == file.url && old.sha256 == file.sha256).then_some(old.size)
-    };
-    let mut missing = Vec::new();
-    for (i, file) in files.iter_mut().enumerate() {
-        match locked(file).or_else(|| cached(file)) {
-            Some(size) => file.size = size,
-            None => missing.push(i),
-        }
-    }
-
-    let wanted: Vec<LockedFile> = missing.iter().map(|&i| files[i].clone()).collect();
-    let wanted: Vec<&LockedFile> = wanted.iter().collect();
-    let fetched = downloads
-        .download_all(&wanted, Sources::of(manifest), reporter)
-        .await?;
-    for (&i, fetched) in missing.iter().zip(fetched) {
-        // The download was checked against the hash on its way into the
-        // cache, so its length is the file's size.
-        files[i].size = std::fs::metadata(&fetched.path)
-            .map(|m| m.len())
-            .map_err(|e| DownloadFailures(vec![(files[i].name.clone(), e.into())]))?;
-    }
-    Ok(files)
-}
 
 /// Errors placing a file in an image.
 #[derive(Debug, Error)]
@@ -320,10 +254,13 @@ mod tests {
     fn spec(path: &str, mode: Option<&str>, extract: Option<&str>) -> FileSpec {
         FileSpec {
             url: "https://example.com/x".parse().unwrap(),
-            sha256: Sha256::of(b""),
+            sha256: Some(Sha256::of(b"")),
             path: path.parse().unwrap(),
             mode: mode.map(|m| m.parse().unwrap()),
             extract: extract.map(|e| e.parse().unwrap()),
+            signed_by: None,
+            signature: None,
+            checksums: None,
         }
     }
 

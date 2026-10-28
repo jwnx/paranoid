@@ -1,6 +1,7 @@
 //! Files fetched from a URL rather than a repository: `[files.<id>]`.
 
 use std::fmt;
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
@@ -8,13 +9,15 @@ use url::Url;
 
 use crate::hash::Sha256;
 
-/// A file pinned by its URL and SHA-256, and where it goes in the image.
+/// A file fetched from a URL, pinned by its SHA-256 or signed by keys the
+/// manifest names, or both, and where it goes in the image.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileSpec {
     #[serde(deserialize_with = "deserialize_file_url")]
     pub url: Url,
-    pub sha256: Sha256,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<Sha256>,
     /// Where the file goes in the image, or where an extracted directory's
     /// contents go.
     pub path: ImagePath,
@@ -26,11 +29,61 @@ pub struct FileSpec {
     /// everything under a directory when it ends in `/`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extract: Option<Extract>,
+    /// OpenPGP keys allowed to sign the file, relative to the manifest, as
+    /// a repository's `signed_by`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_by: Option<PathBuf>,
+    /// A detached signature: over the file, or over `checksums` if there
+    /// is one.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_file_url"
+    )]
+    pub signature: Option<Url>,
+    /// A checksums file listing the file's SHA-256 by the last part of its
+    /// URL, as `sha256sum` writes it. Signed by `signature`, or clearsigned
+    /// itself.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_file_url"
+    )]
+    pub checksums: Option<Url>,
 }
 
 impl FileSpec {
     /// Whether the spec makes sense as a whole.
     pub(super) fn check(&self) -> Result<(), String> {
+        let signs = self.signature.is_some() || self.checksums.is_some();
+        match (self.sha256.is_some(), &self.signed_by, signs) {
+            (_, None, true) => {
+                return Err("a `signature` or `checksums` needs `signed_by`".to_string());
+            }
+            (false, None, false) => {
+                return Err(
+                    "pin it with `sha256`, or name the keys that sign it with `signed_by`"
+                        .to_string(),
+                );
+            }
+            (_, Some(_), false) => {
+                return Err("`signed_by` needs a `signature` or `checksums` to check".to_string());
+            }
+            _ => {}
+        }
+        if self
+            .signed_by
+            .as_ref()
+            .is_some_and(|p| p.as_os_str().is_empty())
+        {
+            return Err("`signed_by` is empty".to_string());
+        }
+        if self.checksums.is_some() && self.name().is_none() {
+            return Err(format!(
+                "a checksums file lists files by name, and '{}' doesn't end in one",
+                self.url
+            ));
+        }
         if self.mode.is_some() && matches!(self.extract, Some(Extract::Dir(_))) {
             return Err(
                 "`mode` applies to one file, not to a directory extracted from an archive"
@@ -38,6 +91,17 @@ impl FileSpec {
             );
         }
         Ok(())
+    }
+}
+
+impl FileSpec {
+    /// The last part of the URL's path: the name a checksums file lists
+    /// the file by.
+    pub fn name(&self) -> Option<&str> {
+        self.url
+            .path_segments()?
+            .next_back()
+            .filter(|s| !s.is_empty())
     }
 }
 
@@ -195,6 +259,12 @@ fn deserialize_file_url<'de, D: serde::Deserializer<'de>>(
     Ok(url)
 }
 
+fn deserialize_optional_file_url<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Url>, D::Error> {
+    deserialize_file_url(deserializer).map(Some)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,5 +339,28 @@ mod tests {
         ))
         .unwrap_err();
         assert!(err.to_string().contains("has credentials"), "{err}");
+    }
+
+    #[test]
+    fn a_file_is_pinned_or_signed() {
+        let parse = |toml: &str| -> Result<FileSpec, String> {
+            let spec: FileSpec = toml::from_str(&format!(
+                "url = \"https://example.com/tool.tar.gz\"\npath = \"/x\"\n{toml}"
+            ))
+            .map_err(|e| e.to_string())?;
+            spec.check().map(|()| spec)
+        };
+        let err = parse("").unwrap_err();
+        assert!(err.contains("pin it with `sha256`"), "{err}");
+        let err = parse("signed_by = \"keys.asc\"").unwrap_err();
+        assert!(err.contains("needs a `signature` or `checksums`"), "{err}");
+        let err = parse("signature = \"https://example.com/tool.tar.gz.asc\"").unwrap_err();
+        assert!(err.contains("needs `signed_by`"), "{err}");
+
+        let signed =
+            parse("signed_by = \"keys.asc\"\nchecksums = \"https://example.com/SHA256SUMS.asc\"")
+                .unwrap();
+        assert_eq!(signed.name(), Some("tool.tar.gz"));
+        assert!(signed.sha256.is_none());
     }
 }
