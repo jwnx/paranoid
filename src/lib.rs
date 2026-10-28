@@ -10,6 +10,7 @@ pub mod hash;
 pub mod http;
 pub mod lock;
 pub mod oci;
+pub mod paths;
 pub mod report;
 pub mod repository;
 pub mod resolve;

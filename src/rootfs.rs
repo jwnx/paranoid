@@ -310,6 +310,27 @@ impl Rootfs {
         Ok(stats)
     }
 
+    /// Make `path` a directory with `meta`: create it, and any parents it
+    /// lacks, or give the directory that's there `meta`. Its parents are
+    /// resolved through symlinks, as a package's paths are, but `path`
+    /// itself has to be a directory or nothing. Returns where it is.
+    pub fn set_dir(&mut self, path: &str, meta: Meta) -> Result<String, RootfsError> {
+        let components = components(path)?;
+        let (name, parents) = components
+            .split_last()
+            .ok_or_else(|| RootfsError::EscapingPath(path.to_string()))?;
+        let parent = self.resolve_dir(parents.iter().copied(), path)?;
+        let key = join(&parent, name);
+        match self.nodes.get_mut(&key) {
+            None => {
+                self.nodes.insert(key.clone(), Node::Dir(meta));
+            }
+            Some(Node::Dir(existing)) => *existing = meta,
+            Some(_) => return Err(RootfsError::NotADirectory(key)),
+        }
+        Ok(key)
+    }
+
     /// Add a directory entry. An existing directory takes the new
     /// permissions; an existing symlink to a directory is kept, as dpkg does
     /// for merged-`/usr` style links.

@@ -3,7 +3,8 @@
 //! The pipeline is: download every locked package and file into the cache,
 //! apply the packages to an in-memory [`Rootfs`] in lock order, record them
 //! in the dpkg database (`/var/lib/dpkg`), write the manifest's accounts,
-//! place the files, and write a single-layer OCI image from it.
+//! place the files, write the paths, and write a single-layer OCI image
+//! from it.
 
 use std::path::PathBuf;
 
@@ -21,6 +22,7 @@ use crate::dpkg::{DpkgDatabase, DpkgError, PackageState};
 use crate::files::{PlaceError, render_extract};
 use crate::lock::{LockFile, LockedFile};
 use crate::oci::{ImageOutput, OciConfig, OciConfigError, OciError, OciImageResult, Timestamp};
+use crate::paths::{self, PathsError};
 use crate::report::{Event, Phase, Reporter};
 use crate::rootfs::{Rootfs, RootfsError};
 
@@ -69,6 +71,9 @@ pub enum BuildError {
 
     #[error("failed to write the accounts")]
     Accounts(#[from] AccountsError),
+
+    #[error("failed to write a path")]
+    Paths(#[from] PathsError),
 
     #[error("failed to place file {file}")]
     Place {
@@ -165,6 +170,9 @@ pub async fn build(
     }
     for (fetched, (_, spec)) in fetched_files.iter().zip(&files) {
         place(&mut rootfs, fetched, spec, manifest.architecture)?;
+    }
+    if !manifest.paths.is_empty() {
+        paths::apply(&mut rootfs, &manifest.paths)?;
     }
     let image = crate::oci::write_image(&config, &rootfs, &options.output, reporter)?;
 

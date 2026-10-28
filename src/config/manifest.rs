@@ -13,7 +13,7 @@ use crate::arch::Architecture;
 use crate::repository::DebianVersion;
 use crate::version::VersionConstraint;
 
-use super::{Accounts, FileSpec};
+use super::{Accounts, FileSpec, ImagePath, PathSpec};
 
 /// A manifest: repositories, holds, and the images built from them.
 ///
@@ -49,6 +49,10 @@ pub struct Manifest {
     /// base-passwd's. They shape the image, not what's in it, so they're
     /// left out of the config hash, as an entrypoint is.
     pub accounts: Accounts,
+    /// Files, directories and symlinks written straight from the manifest,
+    /// which every image gets, in manifest order. Like `accounts`, they're
+    /// left out of the config hash.
+    pub paths: IndexMap<ImagePath, PathSpec>,
     /// Written as a set (`[images.*]`) rather than a single `[image]`.
     set: bool,
     /// The directory paths in the manifest are relative to: the manifest's
@@ -102,6 +106,8 @@ struct RawManifest {
     download: Option<RawDownload>,
     #[serde(default)]
     accounts: Accounts,
+    #[serde(default)]
+    paths: IndexMap<String, PathSpec>,
     #[serde(default)]
     files: IndexMap<String, FileSpec>,
 
@@ -194,6 +200,15 @@ impl RawManifest {
             .transpose()?;
         let stores = self.download.unwrap_or_default().stores;
         let accounts = self.accounts;
+        let mut paths = IndexMap::new();
+        for (path, spec) in self.paths {
+            let parsed: ImagePath = path.parse().map_err(|message| invalid("paths", message))?;
+            spec.check()
+                .map_err(|message| invalid("paths", format!("'{path}': {message}")))?;
+            if paths.insert(parsed, spec).is_some() {
+                return Err(invalid("paths", format!("'{path}' is declared twice")));
+            }
+        }
         let single = self.image.is_some() || !self.packages.is_empty() || self.entrypoint.is_some();
         let set = self.defaults.is_some() || !self.groups.is_empty() || !self.images.is_empty();
         if single && set {
@@ -241,6 +256,7 @@ impl RawManifest {
                 files: self.files,
                 stores,
                 accounts,
+                paths,
                 set: false,
                 dir: PathBuf::new(),
             });
@@ -311,6 +327,7 @@ impl RawManifest {
             files: self.files,
             stores,
             accounts,
+            paths,
             set: true,
             dir: PathBuf::new(),
         })
@@ -1152,6 +1169,31 @@ name = \"bash\"
 
         let err = set("[defaults]\narchitecture = \"amd64\"\n\n[images.a]\n").unwrap_err();
         assert!(err.to_string().contains("no packages or files"), "{err}");
+    }
+
+    #[test]
+    fn parses_paths() {
+        let single = |paths: &str| {
+            Manifest::from_str(&format!(
+                "{SET_REPOS}\n[[packages]]\nname = \"bash\"\n\n[paths]\n{paths}"
+            ))
+        };
+        let manifest = single(
+            "\"/run/postgresql/\" = { owner = \"postgres\", mode = \"2775\" }\n\
+             \"/usr/sbin/policy-rc.d\" = { content = \"exit 101\", mode = \"0755\" }\n",
+        )
+        .unwrap();
+        let paths: Vec<String> = manifest.paths.keys().map(ToString::to_string).collect();
+        assert_eq!(paths, ["/run/postgresql", "/usr/sbin/policy-rc.d"]);
+
+        for (paths, wanted) in [
+            ("\"/a\" = {}\n\"/a/\" = {}\n", "'/a/' is declared twice"),
+            ("\"a\" = {}\n", "must be absolute"),
+            ("\"/a\" = { content = \"x\", target = \"y\" }\n", "not both"),
+        ] {
+            let err = single(paths).unwrap_err();
+            assert!(err.to_string().contains(wanted), "{paths}: {err}");
+        }
     }
 
     #[test]

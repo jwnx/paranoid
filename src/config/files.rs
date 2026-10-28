@@ -245,7 +245,7 @@ impl FileSpec {
 
 /// An absolute path in the image, other than the root, without `.` or
 /// `..`: `/usr/local/bin/etcdctl`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ImagePath(String);
 
 impl ImagePath {
