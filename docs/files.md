@@ -1,7 +1,7 @@
 # Files
 
-Status: phases 1 and 2 (pinned and signed URLs) are implemented. The rest
-is a proposal.
+Status: phases 1 to 3 (pinned and signed URLs, Go releases and GCS
+buckets) are implemented. GitHub releases are a proposal.
 
 ## Why
 
@@ -86,7 +86,8 @@ adds a kind of source. They differ in the keys that pick them:
 |---|---|---|---|
 | Pinned URL | `url`, `sha256` | whoever wrote the manifest | edit the URL and hash |
 | Signed URL | `url`, `signature` or `checksums`, `signed_by` | the signing key | edit the URL |
-| Go | `go = "1.23"` | Google's signing key, via `.asc` | `lock --upgrade` |
+| Go | `go = "1.23"`, optionally `signed_by` | go.dev's list, and Google's signing key via `.asc` | `lock --upgrade` |
+| GCS bucket | `gcs = "etcd"`, `version`, `asset` | the bucket's `SHA256SUMS` | `lock --upgrade` |
 | GitHub release | `github = "etcd-io/etcd"`, `version`, `asset` | GitHub's digest | `lock --upgrade` |
 
 The lock records which kind each file came from (`trust`), so review and
@@ -162,17 +163,21 @@ contract:
    (`checksums`), or a checksums file with a detached signature over it
    (both), checked with `signed_by` at lock time. A key only has to have
    been valid when it signed, since releases outlive their keys.
-3. **Go:** resolve `go = "1.23"` against `go.dev/dl/?mode=json`, check the
-   tarball's `.asc`, and `extract = "go/"` by default.
+3. **Go and GCS buckets:** resolve `go = "1.23"` against
+   `go.dev/dl/?mode=json`, and check the tarball's `.asc` when there's a
+   `signed_by`. Resolve `gcs = "etcd"` with `version` against the bucket's
+   directories through the GCS JSON API, and take the hash from the
+   release's `SHA256SUMS`, as for etcd's mirror of its GitHub releases.
+   Unsigned hashes from an index are recorded as `trust = "index"`.
 4. **GitHub releases:** resolve `version` against the Releases API and
    template `asset` with `{version}` and `{arch}` (Debian names mapped to
    the usual `amd64`, `arm64`, ...). The asset's `digest` is the only
    anchor, so the lock records `trust = "github"`. Uses `GITHUB_TOKEN` when
    set, since the API allows 60 unauthenticated requests per hour.
 
-Phases 3 and 4 make files bumpable. `lock --upgrade` (or a name like it)
-would move them to the newest version their constraint allows, the way
-`--snapshot` moves repositories.
+Phases 3 and 4 make files bumpable. A re-lock keeps a file at its release
+while the manifest allows it, and `lock --upgrade` moves it to the newest
+release its line allows, the way `--snapshot` moves repositories.
 
 ## Later
 

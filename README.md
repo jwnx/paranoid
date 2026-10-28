@@ -63,7 +63,7 @@ If you want a shell in the image, add one, like `bash`, to the package list.
 
 ```
 paranoid lock    [-f MANIFEST] [-o LOCK] [--force] [--allow-unmet] [--json]
-                 [--snapshot TIME] [--cache-dir DIR]
+                 [--snapshot TIME] [--upgrade] [--cache-dir DIR]
 paranoid build   [-f MANIFEST] [--lock LOCK] [-o OUT] [--image ID]...
                  [--cache-dir DIR] [--jobs N] [--force-download]
                  [--allow-stale] [--allow-unmet]
@@ -388,9 +388,47 @@ or another file. Nothing checks that a binary's libraries are in the
 image, so list them as packages: Node needs `libstdc++6` and
 `libatomic1`.
 
+### Releases from an index
+
+Instead of a URL, a file can name a release line, and `lock` finds the
+newest release in it from the publisher's index:
+
+```toml
+[files.go]                          # go.dev's list of Go releases
+go        = "1.27"                  # the newest 1.27.x; "1.27.3" for just that
+signed_by = "keys/google-linux.asc" # optional: check the tarball's .asc too
+extract   = "go/"
+path      = "/usr/local/go"
+
+[files.etcdctl]                     # a public Google Cloud Storage bucket
+gcs     = "etcd"                    # storage.googleapis.com/etcd
+version = "3.6"
+asset   = "etcd-v{version}-linux-{arch}.tar.gz"
+extract = "etcd-v{version}-linux-{arch}/etcdctl"
+path    = "/usr/local/bin/etcdctl"
+```
+
+`go` takes the Linux tarball for the image's architecture. `gcs` reads a
+bucket with a directory per release named for its version (`v3.6.16/`),
+optionally under a `prefix`, and takes `asset` from it. In `asset` and
+`extract`, `{version}` is the release's version without its `v`, and
+`{arch}` is the architecture as Go and OCI name it (`amd64`, `arm64`,
+...). Prereleases never match.
+
+The lock records the release as `version`. Nothing signs a bucket's
+`SHA256SUMS` or go.dev's list, so a hash read from either is recorded as
+`trust = "index"`: whoever controls the index vouches for it. A `go`
+file with `signed_by` is checked against its `.asc` as well, and recorded
+as `signed`.
+
+A later `lock` keeps the release a file has while the manifest still
+allows it, so an unrelated change doesn't move it. `lock --upgrade` moves
+every file from an index to the newest release its line allows, and
+`--json` shows what moved.
+
 dpkg doesn't know about files, so scanners that read its database, like
 trivy and syft, won't see them. [`docs/files.md`](docs/files.md) has what
-comes next: versions resolved from Go's and GitHub's release lists.
+comes next: GitHub's releases.
 
 ## LOCK
 
@@ -482,8 +520,8 @@ lock's own layout. Read this rather than the lock:
   "files": [
     {
       "name": "etcdctl",
-      "from": { "url": "https://.../etcd-v3.6.15-linux-arm64.tar.gz", "sha256": "567d9b8f..." },
-      "to": { "url": "https://.../etcd-v3.6.16-linux-arm64.tar.gz", "sha256": "ad756ff2..." },
+      "from": { "url": "https://.../etcd-v3.6.15-linux-arm64.tar.gz", "sha256": "567d9b8f...", "version": "v3.6.15" },
+      "to": { "url": "https://.../etcd-v3.6.16-linux-arm64.tar.gz", "sha256": "ad756ff2...", "version": "v3.6.16" },
       "images": ["server"]
     }
   ]
@@ -494,7 +532,8 @@ lock's own layout. Read this rather than the lock:
 `repository` is where the package comes from, or came from if it's gone,
 and `images` are the images it changed in. A package that moves into or out
 of an image at the same version counts as a change. A file changes when
-its URL or hash does, and its `from` or `to` is null the same way.
+its URL or hash does, and its `from` or `to` is null the same way; each
+has the release's `version` when the file comes from an index.
 `changed` is false when no package, file or image moved, even if the
 snapshots did. Later releases may add fields, but won't remove any or
 change what they mean.
