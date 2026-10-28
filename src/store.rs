@@ -17,7 +17,7 @@ use url::Url;
 use crate::config::check_base_url;
 use crate::download::{Blob, DownloadError, Fetched, PackageCache, all_or_errors, content_path};
 use crate::http::{Client, ClientError, Credentials, EMPTY_PAYLOAD, Head, Retry};
-use crate::report::{Event, Phase, Reporter};
+use crate::report::{Event, Reporter};
 
 /// Where packages are pushed to.
 pub enum Store {
@@ -158,7 +158,7 @@ impl Store {
     ) -> Result<PushReport, PushFailures> {
         let bytes = packages.iter().map(|f| f.item.size()).sum();
         reporter.report(Event::Begin {
-            phase: Phase::Push,
+            phase: B::PUSH,
             total: bytes,
         });
         let uploads = packages.iter().map(|fetched| async move {
@@ -169,12 +169,12 @@ impl Store {
             };
             match &result {
                 Ok(()) => reporter.report(Event::Advance {
-                    phase: Phase::Push,
+                    phase: B::PUSH,
                     units: package.size(),
                     item: package.name(),
                 }),
                 Err(error) => reporter.report(Event::Failed {
-                    phase: Phase::Push,
+                    phase: B::PUSH,
                     item: package.name(),
                     error,
                 }),
@@ -183,7 +183,7 @@ impl Store {
         });
         let results: Vec<_> = stream::iter(uploads).buffered(jobs.get()).collect().await;
         reporter.report(Event::End {
-            phase: Phase::Push,
+            phase: B::PUSH,
             summary: bytes,
         });
         all_or_errors(results).map_err(PushFailures)?;

@@ -4,6 +4,7 @@ use url::Url;
 
 use crate::hash::Sha256;
 use crate::lock::{LockedFile, LockedPackage};
+use crate::report::Phase;
 
 use super::{DownloadError, Sources};
 
@@ -14,6 +15,9 @@ pub trait Blob {
     const EXTENSION: &'static str;
     /// Its media type, for uploads to a store.
     const MEDIA_TYPE: &'static str;
+    /// The phases its downloads and uploads report under.
+    const DOWNLOAD: Phase;
+    const PUSH: Phase;
 
     /// Its name in the lock.
     fn name(&self) -> &str;
@@ -29,6 +33,8 @@ pub trait Blob {
 impl Blob for LockedFile {
     const EXTENSION: &'static str = "";
     const MEDIA_TYPE: &'static str = "application/octet-stream";
+    const DOWNLOAD: Phase = Phase::DownloadFiles;
+    const PUSH: Phase = Phase::PushFiles;
 
     fn name(&self) -> &str {
         &self.name
@@ -60,6 +66,8 @@ pub(crate) fn base(url: &Url) -> String {
 impl Blob for LockedPackage {
     const EXTENSION: &'static str = ".deb";
     const MEDIA_TYPE: &'static str = "application/vnd.debian.binary-package";
+    const DOWNLOAD: Phase = Phase::Download;
+    const PUSH: Phase = Phase::Push;
 
     fn name(&self) -> &str {
         &self.name

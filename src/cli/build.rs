@@ -153,7 +153,15 @@ pub async fn run(args: BuildArgs, quiet: bool) -> Result<(), CliError> {
                 Some(_) => report.image.reference.clone(),
                 None => output.display().to_string(),
             };
-            let packages = lock.image(id).map_or(0, |i| i.packages.len());
+            let contents = match lock.image(id) {
+                Some(image) if !image.files.is_empty() => format!(
+                    "{} packages and {} file{}",
+                    image.packages.len(),
+                    image.files.len(),
+                    if image.files.len() == 1 { "" } else { "s" },
+                ),
+                image => format!("{} packages", image.map_or(0, |i| i.packages.len())),
+            };
             // With stores, say how many they served, so a store that
             // never has anything doesn't go unnoticed.
             let from_stores = if manifest.stores.is_empty() {
@@ -162,9 +170,9 @@ pub async fn run(args: BuildArgs, quiet: bool) -> Result<(), CliError> {
                 format!(", {} of them from a store", report.from_stores)
             };
             eprintln!(
-                "Built {} with {} packages ({} fresh{}, {} cached) sized {}.",
+                "Built {} with {} ({} fresh{}, {} cached) sized {}.",
                 name,
-                packages,
+                contents,
                 report.fresh,
                 from_stores,
                 report.cached,

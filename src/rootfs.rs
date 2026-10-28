@@ -58,6 +58,9 @@ pub enum RootfsError {
 
     #[error("hard link '{link}' points to '{target}', which is not a regular file")]
     BadHardlink { link: String, target: String },
+
+    #[error("'/{0}' is already in the image")]
+    Exists(String),
 }
 
 /// Ownership and permission bits of a node.
@@ -187,8 +190,20 @@ impl Rootfs {
         self.apply_tar(deb.data_tar()?)
     }
 
-    /// Apply the entries of an uncompressed tar stream.
+    /// Apply the entries of an uncompressed tar stream. Later entries
+    /// replace earlier ones, as a later package's files replace an earlier
+    /// one's.
     pub fn apply_tar(&mut self, tar: impl Read) -> Result<ApplyStats, RootfsError> {
+        self.apply(tar, true)
+    }
+
+    /// Add the entries of an uncompressed tar stream without replacing
+    /// anything already there. A directory that's there already is kept.
+    pub fn add_tar(&mut self, tar: impl Read) -> Result<ApplyStats, RootfsError> {
+        self.apply(tar, false)
+    }
+
+    fn apply(&mut self, tar: impl Read, replace: bool) -> Result<ApplyStats, RootfsError> {
         let mut stats = ApplyStats::default();
         let mut archive = tar::Archive::new(tar);
 
@@ -214,7 +229,11 @@ impl Rootfs {
                 key: Some(path.clone()),
             });
 
-            match entry.header().entry_type() {
+            let entry_type = entry.header().entry_type();
+            if !replace && !entry_type.is_dir() && self.nodes.contains_key(&path) {
+                return Err(RootfsError::Exists(path));
+            }
+            match entry_type {
                 tar::EntryType::Directory => self.add_dir(path, meta)?,
                 tar::EntryType::Regular | tar::EntryType::Continuous => {
                     let mut data = Vec::with_capacity(entry.size() as usize);

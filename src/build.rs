@@ -1,21 +1,23 @@
 //! Building an image from a manifest and its lock file.
 //!
-//! The pipeline is: download every locked package into the cache, apply them
-//! to an in-memory [`Rootfs`] in lock order, record them in the dpkg database
-//! (`/var/lib/dpkg`), and write a single-layer OCI image from it.
+//! The pipeline is: download every locked package and file into the cache,
+//! apply the packages to an in-memory [`Rootfs`] in lock order, record them
+//! in the dpkg database (`/var/lib/dpkg`), place the files, and write a
+//! single-layer OCI image from it.
 
 use std::path::PathBuf;
 
 use thiserror::Error;
 
-use crate::config::Manifest;
+use crate::config::{FileSpec, Manifest};
 use crate::deb::{DebArchive, DebError};
 use crate::download::{
     DownloadConfig, DownloadError, DownloadFailures, DownloadService, Fetched, Origin,
     PackageCache, Sources,
 };
 use crate::dpkg::{DpkgDatabase, DpkgError, PackageState};
-use crate::lock::LockFile;
+use crate::files::PlaceError;
+use crate::lock::{LockFile, LockedFile};
 use crate::oci::{ImageOutput, OciConfig, OciConfigError, OciError, OciImageResult, Timestamp};
 use crate::report::{Event, Phase, Reporter};
 use crate::rootfs::{Rootfs, RootfsError};
@@ -36,11 +38,11 @@ pub struct BuildOptions {
 #[derive(Debug, Clone)]
 pub struct BuildReport {
     pub image: OciImageResult,
-    /// Packages downloaded during this build.
+    /// Packages and files downloaded during this build.
     pub fresh: usize,
-    /// How many of the fresh packages came from a store.
+    /// How many of the fresh ones came from a store.
     pub from_stores: usize,
-    /// Packages served from the cache.
+    /// Packages and files served from the cache.
     pub cached: usize,
     /// Entries in the assembled rootfs.
     pub entries: usize,
@@ -51,6 +53,9 @@ pub enum BuildError {
     #[error("no image '{0}' in the manifest and the lock")]
     UnknownImage(String),
 
+    #[error("the lock has file '{0}', which the manifest doesn't")]
+    UnknownFile(String),
+
     #[error("invalid image configuration")]
     Config(#[from] OciConfigError),
 
@@ -60,7 +65,14 @@ pub enum BuildError {
     #[error(transparent)]
     Download(#[from] DownloadFailures),
 
-    #[error("cached package {package} failed verification")]
+    #[error("failed to place file {file}")]
+    Place {
+        file: String,
+        #[source]
+        source: PlaceError,
+    },
+
+    #[error("the cached copy of {package} failed verification")]
     Verify {
         package: String,
         #[source]
@@ -107,6 +119,15 @@ pub async fn build(
     let spec = manifest.images.get(image).ok_or_else(unknown)?;
     let locked = lock.image(image).ok_or_else(unknown)?;
     let packages = lock.image_packages(locked);
+    let files: Vec<(&LockedFile, &FileSpec)> = lock
+        .image_files(locked)
+        .into_iter()
+        .map(|file| {
+            let spec = manifest.files.get(&file.name);
+            spec.map(|spec| (file, spec))
+                .ok_or_else(|| BuildError::UnknownFile(file.name.clone()))
+        })
+        .collect::<Result<_, _>>()?;
 
     // Validate the image configuration before doing any work.
     let config = OciConfig::from_image(spec, manifest.architecture, options.created.clone())?;
@@ -119,23 +140,56 @@ pub async fn build(
     let fetched = downloader
         .download_all(&packages, Sources::of(manifest), reporter)
         .await?;
+    let locked_files: Vec<&LockedFile> = files.iter().map(|(file, _)| *file).collect();
+    let fetched_files = if locked_files.is_empty() {
+        Vec::new()
+    } else {
+        downloader
+            .download_all(&locked_files, Sources::of(manifest), reporter)
+            .await?
+    };
 
     let state = if spec.unconfigured {
         PackageState::Unpacked
     } else {
         PackageState::Installed
     };
-    let rootfs = assemble(&fetched, state, reporter)?;
+    let mut rootfs = assemble(&fetched, state, reporter)?;
+    for (fetched, (_, spec)) in fetched_files.iter().zip(&files) {
+        place(&mut rootfs, fetched, spec)?;
+    }
     let image = crate::oci::write_image(&config, &rootfs, &options.output, reporter)?;
 
-    let count = |origin| fetched.iter().filter(|f| f.origin == origin).count();
+    let origins = fetched
+        .iter()
+        .map(|f| f.origin)
+        .chain(fetched_files.iter().map(|f| f.origin));
+    let count = |origin| origins.clone().filter(|&o| o == origin).count();
     let cached = count(Origin::Cache);
     Ok(BuildReport {
         image,
-        fresh: fetched.len() - cached,
+        fresh: fetched.len() + fetched_files.len() - cached,
         from_stores: count(Origin::Store),
         cached,
         entries: rootfs.len(),
+    })
+}
+
+/// Place a file in the rootfs, checking it against the lock as it's read.
+fn place(
+    rootfs: &mut Rootfs,
+    fetched: &Fetched<'_, LockedFile>,
+    spec: &FileSpec,
+) -> Result<(), BuildError> {
+    let name = &fetched.item.name;
+    let data =
+        PackageCache::read(&fetched.path, fetched.item).map_err(|source| BuildError::Verify {
+            package: name.clone(),
+            source,
+        })?;
+    crate::files::place(rootfs, spec, &data).map_err(|source| BuildError::Place {
+        file: name.clone(),
+        source,
     })
 }
 

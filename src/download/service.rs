@@ -12,7 +12,7 @@ use url::Url;
 use crate::config::{Manifest, RepositoryConfig};
 use crate::hash::Sha256;
 use crate::http::{Client, ClientError, Retry};
-use crate::report::{Event, Phase, Reporter};
+use crate::report::{Event, Reporter};
 
 use super::Blob;
 use super::blob::base;
@@ -110,7 +110,7 @@ impl DownloadService {
     ) -> Result<Vec<Fetched<'a, B>>, DownloadFailures> {
         let total_bytes = packages.iter().map(|p| p.size()).sum();
         reporter.report(Event::Begin {
-            phase: Phase::Download,
+            phase: B::DOWNLOAD,
             total: total_bytes,
         });
 
@@ -118,12 +118,12 @@ impl DownloadService {
             let result = self.download(package, sources).await;
             match &result {
                 Ok(_) => reporter.report(Event::Advance {
-                    phase: Phase::Download,
+                    phase: B::DOWNLOAD,
                     units: package.size(),
                     item: package.name(),
                 }),
                 Err(error) => reporter.report(Event::Failed {
-                    phase: Phase::Download,
+                    phase: B::DOWNLOAD,
                     item: package.name(),
                     error,
                 }),
@@ -137,7 +137,7 @@ impl DownloadService {
             .await;
 
         reporter.report(Event::End {
-            phase: Phase::Download,
+            phase: B::DOWNLOAD,
             summary: total_bytes,
         });
 

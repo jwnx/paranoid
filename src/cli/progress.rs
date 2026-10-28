@@ -26,9 +26,11 @@ const DOTS_WIDTH: usize = 20;
 fn presentation(phase: Phase) -> (&'static str, fn(u64) -> String) {
     match phase {
         Phase::Download => ("Downloading packages", style::fmt_size),
+        Phase::DownloadFiles => ("Downloading files", style::fmt_size),
         Phase::Assemble => ("Installing packages", |n| format!("{n} files")),
         Phase::Image => ("Building image", style::fmt_size),
         Phase::Push => ("Pushing packages", style::fmt_size),
+        Phase::PushFiles => ("Pushing files", style::fmt_size),
     }
 }
 

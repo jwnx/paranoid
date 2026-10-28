@@ -12,12 +12,16 @@ use std::fmt;
 pub enum Phase {
     /// Fetching packages into the cache. Work is measured in bytes.
     Download,
+    /// Fetching files into the cache. Work is measured in bytes.
+    DownloadFiles,
     /// Applying packages to the rootfs. Work is measured in packages.
     Assemble,
     /// Writing the layer and image. Work is measured in steps.
     Image,
     /// Uploading packages to a store. Work is measured in bytes.
     Push,
+    /// Uploading files to a store. Work is measured in bytes.
+    PushFiles,
 }
 
 /// Something that happened during a phase.
