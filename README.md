@@ -422,9 +422,13 @@ file with `signed_by` is checked against its `.asc` as well, and recorded
 as `signed`.
 
 A later `lock` keeps the release a file has while the manifest still
-allows it, so an unrelated change doesn't move it. `lock --upgrade` moves
-every file from an index to the newest release its line allows, and
-`--json` shows what moved.
+allows it and the index still has it, so an unrelated change doesn't
+move it; a release the index no longer has moves to the newest. `lock
+--upgrade` moves every file from an index to the newest release its line
+allows, and `--json` shows what moved. A bucket's newest release has to
+have `asset` for the image's architecture, or `lock` fails rather than
+fall back to an older one. Go publishes no tarball for `armel`, whose
+CPUs can be older than its ARM builds need.
 
 dpkg doesn't know about files, so scanners that read its database, like
 trivy and syft, won't see them. [`docs/files.md`](docs/files.md) has what

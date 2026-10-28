@@ -135,7 +135,13 @@ impl FileSpec {
         };
         if let Some(bucket) = &self.gcs {
             only("gcs", &["version", "asset", "prefix"])?;
-            if bucket.is_empty()
+            // GCS's rules: 3 to 63 of these, starting and ending with a
+            // letter or digit.
+            let edge =
+                |c: Option<char>| c.is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
+            if !(3..=63).contains(&bucket.len())
+                || !edge(bucket.chars().next())
+                || !edge(bucket.chars().last())
                 || !bucket
                     .chars()
                     .all(|c| matches!(c, 'a'..='z' | '0'..='9' | '.' | '-' | '_'))
@@ -145,17 +151,23 @@ impl FileSpec {
             if self.version.is_none() || self.asset.is_none() {
                 return Err("a file from `gcs` needs a `version` and an `asset`".to_string());
             }
+            // Both end up in URLs, so nothing a URL would read as more
+            // than a path.
+            let urlish = |s: &str| s.contains([':', '\\', '%', '?', '#']);
             if self
                 .asset
                 .as_ref()
-                .is_some_and(|a| a.is_empty() || a.contains('/'))
+                .is_some_and(|a| a.is_empty() || a.contains('/') || urlish(a))
             {
-                return Err("`asset` is a file name, without '/'".to_string());
+                return Err(
+                    "`asset` is a file name, without '/', ':', '\\', '%', '?' or '#'".to_string(),
+                );
             }
             if let Some(prefix) = &self.prefix
                 && (prefix.starts_with('/')
                     || !prefix.ends_with('/')
-                    || prefix.split('/').any(|c| c == ".."))
+                    || urlish(prefix)
+                    || prefix.split('/').any(|c| c == ".." || c == "."))
             {
                 return Err(format!(
                     "`prefix` '{prefix}' must be a relative directory ending in '/'"
@@ -332,10 +344,12 @@ impl VersionPrefix {
 /// `[1, 20, 0]`. `None` for a prerelease like `go1.27rc1` or `v3.6.0-rc.1`,
 /// or anything else that isn't a plain version.
 pub fn release_version(release: &str) -> Option<Vec<u64>> {
-    let digits = release.trim_start_matches(|c: char| !c.is_ascii_digit());
-    if digits.is_empty() || release.len() - digits.len() > 2 {
-        return None;
-    }
+    // Release names end up in URLs, so nothing but a known prefix and the
+    // version itself.
+    let digits = ["go", "v", ""]
+        .iter()
+        .find_map(|prefix| release.strip_prefix(prefix))
+        .filter(|d| d.starts_with(|c: char| c.is_ascii_digit()))?;
     let mut parts: Vec<u64> = digits
         .split('.')
         .map(|p| {
@@ -586,6 +600,18 @@ mod tests {
             (
                 "gcs = \"Etcd!\"\nversion = \"3\"\nasset = \"x\"",
                 "not a bucket name",
+            ),
+            (
+                "gcs = \"..\"\nversion = \"3\"\nasset = \"x\"",
+                "not a bucket name",
+            ),
+            (
+                "gcs = \"etcd\"\nversion = \"3\"\nasset = \"http:evil.example\"",
+                "without '/', ':'",
+            ),
+            (
+                "gcs = \"etcd\"\nversion = \"3\"\nasset = \"x\"\nprefix = \"%2e%2e/b/\"",
+                "ending in '/'",
             ),
             (
                 "gcs = \"etcd\"\nversion = \"3\"\nasset = \"a/b\"",

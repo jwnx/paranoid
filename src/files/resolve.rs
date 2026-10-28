@@ -14,6 +14,9 @@ use crate::lock::Trust;
 /// The most we read of an index. Go's, with every release, is about 2 MB.
 const MAX_INDEX_SIZE: u64 = 64 << 20;
 
+/// The most pages of a bucket's listing we read.
+const MAX_PAGES: usize = 1000;
+
 /// The name of the checksums file in each release directory of a bucket.
 const GCS_CHECKSUMS: &str = "SHA256SUMS";
 
@@ -110,11 +113,14 @@ impl Indexes {
                 trust: signed_or(Trust::Pinned),
                 version: None,
             }),
-            (Source::Go { version: wanted }, Some(version)) if wanted.matches(version) => {
+            (Source::Go { version: wanted }, Some(version))
+                if version.starts_with("go") && wanted.matches(version) =>
+            {
                 let url = self
                     .go_downloads
                     .join(&format!("{version}.linux-{}.tar.gz", go_arch(arch)?))
-                    .ok()?;
+                    .ok()
+                    .and_then(|url| under(url, &self.go_downloads))?;
                 let signature = spec
                     .signed_by
                     .as_ref()
@@ -136,12 +142,11 @@ impl Indexes {
                 },
                 Some(version),
             ) if wanted.matches(version) => {
-                let dir = self
-                    .gcs
-                    .join(&format!("{bucket}/{prefix}{version}/"))
-                    .ok()?;
+                let releases = self.gcs.join(&format!("{bucket}/{prefix}")).ok()?;
+                let dir = under(releases.join(&format!("{version}/")).ok()?, &releases)?;
+                let url = under(dir.join(&render(asset, version, arch)?).ok()?, &dir)?;
                 Some(Expected {
-                    url: dir.join(&render(asset, version, arch)?).ok()?,
+                    url,
                     signature: None,
                     checksums: dir.join(GCS_CHECKSUMS).ok(),
                     trust: Trust::Index,
@@ -206,11 +211,8 @@ impl Indexes {
                     .ok_or(ResolveError::Arch(arch))?;
                 // The index names the file; it has to be the one we'd ask
                 // for, since a later lock rebuilds its URL from the version.
-                if !expected
-                    .url
-                    .path()
-                    .ends_with(&format!("/{}", file.filename))
-                {
+                let name = expected.url.path_segments().and_then(|mut s| s.next_back());
+                if name != Some(file.filename.as_str()) {
                     return Err(ResolveError::Parse {
                         url: self.go_index.to_string(),
                         message: format!(
@@ -236,7 +238,15 @@ impl Indexes {
             } => {
                 let mut versions = Vec::new();
                 let mut page: Option<String> = None;
-                loop {
+                for pages in 1.. {
+                    // A bucket with a thousand pages of releases, or one
+                    // that hands back the same page, isn't one we can use.
+                    if pages > MAX_PAGES {
+                        return Err(ResolveError::Parse {
+                            url: format!("gs://{bucket}/{prefix}"),
+                            message: format!("it lists more than {MAX_PAGES} pages"),
+                        });
+                    }
                     let mut url = self
                         .gcs
                         .join(&format!("storage/v1/b/{bucket}/o"))
@@ -256,7 +266,13 @@ impl Indexes {
                         wanted.matches(dir).then(|| dir.to_string())
                     }));
                     match listing.next_page_token {
-                        Some(token) => page = Some(token),
+                        Some(token) if page.as_ref() != Some(&token) => page = Some(token),
+                        Some(_) => {
+                            return Err(ResolveError::Parse {
+                                url: url.to_string(),
+                                message: "it hands back the same page again".to_string(),
+                            });
+                        }
                         None => break,
                     }
                 }
@@ -325,10 +341,18 @@ fn render(template: &str, version: &str, arch: Architecture) -> Option<String> {
 /// What Go calls `arch` in its release file names: the GOARCH, except
 /// that 32-bit ARM tarballs are for ARMv6.
 fn go_arch(arch: Architecture) -> Option<&'static str> {
-    match arch.oci_platform()?.architecture {
-        "arm" => Some("armv6l"),
-        goarch => Some(goarch),
+    match (arch, arch.oci_platform()?.architecture) {
+        // ARMv6 with VFP is more than armel promises.
+        (Architecture::Armel, _) => None,
+        (_, "arm") => Some("armv6l"),
+        (_, goarch) => Some(goarch),
     }
+}
+
+/// `url` if it's under `base`, which it can only fail to be when a name
+/// from an index or the manifest reads as more than a path.
+fn under(url: Url, base: &Url) -> Option<Url> {
+    (url.origin() == base.origin() && url.path().starts_with(base.path())).then_some(url)
 }
 
 /// One release in Go's index.
@@ -570,6 +594,66 @@ mod tests {
             indexes
                 .expected(&go, Some("go1.27.2"), Architecture::Amd64)
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn names_from_an_index_stay_names() {
+        // A Go index naming a release `//1.27.99`, which would make it a
+        // host, and a file with no name.
+        let mut odd = go_release("go1.27.3", true, &["arm64"]);
+        odd["files"][0]["filename"] = "".into();
+        let index = serde_json::json!([go_release("//1.27.99", true, &["arm64"]), odd]);
+        let body = serde_json::to_vec(&index).unwrap();
+        let server = TestServer::start(move |_| Reply::Body(body.clone())).await;
+        let err = resolve(&indexes(&server), &spec("go = \"1.27\""), ARM64, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("it names  for go1.27.3"), "{err}");
+
+        // Bucket directories that would read as a query, a fragment or a
+        // path aren't releases.
+        let server = TestServer::start(|_| {
+            let body = serde_json::json!({
+                "prefixes": ["?3.6.99/", "#3.6.98/", "\\3.6.97/", "\t3.6.96/", "v3.6.1/"],
+            });
+            Reply::Body(serde_json::to_vec(&body).unwrap())
+        })
+        .await;
+        let etcd = spec("gcs = \"etcd\"\nversion = \"3.6\"\nasset = \"etcd.tar.gz\"");
+        let release = resolve(&indexes(&server), &etcd, ARM64, None)
+            .await
+            .unwrap();
+        assert_eq!(release.expected.version.as_deref(), Some("v3.6.1"));
+    }
+
+    #[tokio::test]
+    async fn a_bucket_that_pages_forever_is_refused() {
+        let server = TestServer::start(|_| {
+            let body = serde_json::json!({"prefixes": ["v3.6.1/"], "nextPageToken": "again"});
+            Reply::Body(serde_json::to_vec(&body).unwrap())
+        })
+        .await;
+        let etcd = spec("gcs = \"etcd\"\nversion = \"3.6\"\nasset = \"etcd.tar.gz\"");
+        let err = resolve(&indexes(&server), &etcd, ARM64, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("same page again"), "{err}");
+    }
+
+    #[test]
+    fn go_has_no_tarball_for_armel() {
+        let go = spec("go = \"1.27\"");
+        let indexes = Indexes::default();
+        assert!(
+            indexes
+                .expected(&go, Some("go1.27.3"), Architecture::Armel)
+                .is_none()
+        );
+        assert!(
+            indexes
+                .expected(&go, Some("go1.27.3"), Architecture::Armhf)
+                .is_some()
         );
     }
 }
