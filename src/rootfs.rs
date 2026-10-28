@@ -61,6 +61,23 @@ pub enum RootfsError {
 
     #[error("'/{0}' is already in the image")]
     Exists(String),
+
+    #[error("'{entry}' would land at '/{path}', outside '/{within}'")]
+    Outside {
+        entry: String,
+        path: String,
+        within: String,
+    },
+}
+
+/// How a tar stream meets what's in the rootfs already.
+#[derive(Clone, Copy)]
+enum Mode<'a> {
+    /// Later entries replace earlier ones, as packages do.
+    Replace,
+    /// Entries add to the rootfs without changing anything there, and must
+    /// all land in `within`, a canonical path.
+    Add { within: &'a str },
 }
 
 /// Ownership and permission bits of a node.
@@ -194,16 +211,43 @@ impl Rootfs {
     /// replace earlier ones, as a later package's files replace an earlier
     /// one's.
     pub fn apply_tar(&mut self, tar: impl Read) -> Result<ApplyStats, RootfsError> {
-        self.apply(tar, true)
+        self.apply(tar, Mode::Replace)
     }
 
-    /// Add the entries of an uncompressed tar stream without replacing
-    /// anything already there. A directory that's there already is kept.
-    pub fn add_tar(&mut self, tar: impl Read) -> Result<ApplyStats, RootfsError> {
-        self.apply(tar, false)
+    /// Add the entries of an uncompressed tar stream, all of which must
+    /// land at or under `within`, a path relative to the root.
+    ///
+    /// Nothing already there changes: an existing file is an error, and an
+    /// existing directory keeps its permissions and owner. `within` is
+    /// resolved first, through whatever symlinks the rootfs has, so a path
+    /// under a merged `/usr` link works; after that, a symlink an entry
+    /// adds can't take a later entry, or a hard link's target, outside it.
+    pub fn add_tar(&mut self, tar: impl Read, within: &str) -> Result<ApplyStats, RootfsError> {
+        let components = components(within)?;
+        let (name, parents) = components
+            .split_last()
+            .ok_or_else(|| RootfsError::EscapingPath(within.to_string()))?;
+        let parent = self.resolve_dir(parents.iter().copied(), within)?;
+        let within = join(&parent, name);
+        self.apply(tar, Mode::Add { within: &within })
     }
 
-    fn apply(&mut self, tar: impl Read, replace: bool) -> Result<ApplyStats, RootfsError> {
+    fn apply(&mut self, tar: impl Read, mode: Mode<'_>) -> Result<ApplyStats, RootfsError> {
+        let inside = |path: &str, entry: &str| match mode {
+            Mode::Replace => Ok(()),
+            Mode::Add { within } => {
+                let rest = path.strip_prefix(within);
+                if rest.is_some_and(|rest| rest.is_empty() || rest.starts_with('/')) {
+                    Ok(())
+                } else {
+                    Err(RootfsError::Outside {
+                        entry: entry.to_string(),
+                        path: path.to_string(),
+                        within: within.to_string(),
+                    })
+                }
+            }
+        };
         let mut stats = ApplyStats::default();
         let mut archive = tar::Archive::new(tar);
 
@@ -230,8 +274,15 @@ impl Rootfs {
             });
 
             let entry_type = entry.header().entry_type();
-            if !replace && !entry_type.is_dir() && self.nodes.contains_key(&path) {
-                return Err(RootfsError::Exists(path));
+            let adding = matches!(mode, Mode::Add { .. });
+            if adding {
+                inside(&path, &raw_path)?;
+                match self.nodes.get(&path) {
+                    // Keep it as it is.
+                    Some(Node::Dir(_)) if entry_type.is_dir() => continue,
+                    Some(_) => return Err(RootfsError::Exists(path)),
+                    None => {}
+                }
             }
             match entry_type {
                 tar::EntryType::Directory => self.add_dir(path, meta)?,
@@ -247,6 +298,9 @@ impl Rootfs {
                 tar::EntryType::Link => {
                     let target = link_name(&entry, &raw_path)?;
                     let node = self.hardlink(&path, &target)?;
+                    if let Node::Hardlink { target, .. } = &node {
+                        inside(target, &raw_path)?;
+                    }
                     self.replace(path, node)?;
                 }
                 _ => stats.skipped += 1,

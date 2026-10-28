@@ -81,6 +81,9 @@ pub enum PlaceError {
     #[error("'{0}' in the archive is not a regular file")]
     NotAFile(String),
 
+    #[error("'{0}' in the archive is not a directory")]
+    NotADirectory(String),
+
     #[error("hard link '{link}' in the archive points to '{target}', outside '{dir}'")]
     LinkOutside {
         link: String,
@@ -91,6 +94,10 @@ pub enum PlaceError {
     #[error(transparent)]
     Rootfs(#[from] RootfsError),
 }
+
+/// The most we allocate up front for an archive member, whatever its
+/// header says.
+const PREALLOCATE: u64 = 64 << 20;
 
 /// Default permissions of a download placed as it is.
 const DEFAULT_MODE: u32 = 0o644;
@@ -117,7 +124,7 @@ pub fn place(rootfs: &mut Rootfs, spec: &FileSpec, data: &[u8]) -> Result<(), Pl
         }
         Some(Extract::Dir(dir)) => extract_dir(data, dir, path, &mut out)?,
     }
-    rootfs.add_tar(out.into_inner()?.as_slice())?;
+    rootfs.add_tar(out.into_inner()?.as_slice(), path)?;
     Ok(())
 }
 
@@ -136,7 +143,7 @@ fn find_member(data: &[u8], member: &str) -> Result<(u32, Vec<u8>), PlaceError> 
             return Err(PlaceError::NotAFile(member.to_string()));
         }
         let mode = entry.header().mode()? & 0o7777;
-        let mut contents = Vec::with_capacity(entry.size() as usize);
+        let mut contents = Vec::with_capacity(entry.size().min(PREALLOCATE) as usize);
         entry.read_to_end(&mut contents)?;
         return Ok((mode, contents));
     }
@@ -170,10 +177,13 @@ fn extract_dir(
         found = true;
         let mode = entry.header().mode()? & 0o7777;
         let kind = entry.header().entry_type();
+        if name == dir && !kind.is_dir() {
+            return Err(PlaceError::NotADirectory(name));
+        }
         match kind {
             tar::EntryType::Directory => append(out, kind, &target, mode, &[])?,
             tar::EntryType::Regular | tar::EntryType::Continuous => {
-                let mut contents = Vec::with_capacity(entry.size() as usize);
+                let mut contents = Vec::with_capacity(entry.size().min(PREALLOCATE) as usize);
                 entry.read_to_end(&mut contents)?;
                 append(out, tar::EntryType::Regular, &target, mode, &contents)?;
             }
@@ -456,5 +466,106 @@ mod tests {
             place(&mut rootfs, &spec("/tool", None, Some("dir/tool")), archive).unwrap();
             assert_eq!(file(&rootfs, "tool").2, "tool");
         }
+    }
+
+    /// A rootfs with what packages would have put there: a directory with
+    /// its own mode and group, a merged `/bin`, and a secret.
+    fn packaged() -> Rootfs {
+        let mut tar = tar::Builder::new(Vec::new());
+        for (path, kind, mode, gid, target) in [
+            ("usr/", DIR, 0o755, 0, ""),
+            ("usr/bin/", DIR, 0o755, 0, ""),
+            ("usr/local/", DIR, 0o755, 0, ""),
+            ("usr/local/bin/", DIR, 0o2775, 50, ""),
+            ("bin", SYMLINK, 0o777, 0, "usr/bin"),
+            ("etc/", DIR, 0o755, 0, ""),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(kind);
+            header.set_mode(mode);
+            header.set_uid(0);
+            header.set_gid(gid);
+            header.set_size(0);
+            if kind.is_symlink() {
+                tar.append_link(&mut header, path, target).unwrap();
+            } else {
+                tar.append_data(&mut header, path, &[][..]).unwrap();
+            }
+        }
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o600);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_size(6);
+        tar.append_data(&mut header, "etc/shadow", &b"secret"[..])
+            .unwrap();
+        let mut rootfs = Rootfs::new();
+        rootfs
+            .apply_tar(tar.into_inner().unwrap().as_slice())
+            .unwrap();
+        rootfs
+    }
+
+    #[test]
+    fn leaves_a_directory_that_is_there_as_it_is() {
+        let archive = tarball(&[
+            ("etcd/", DIR, 0o700, ""),
+            ("etcd/etcd", FILE, 0o755, "etcd"),
+        ]);
+        let mut rootfs = packaged();
+        place(
+            &mut rootfs,
+            &spec("/usr/local/bin", None, Some("etcd/")),
+            &archive,
+        )
+        .unwrap();
+        assert!(matches!(
+            rootfs.get("usr/local/bin"),
+            Some(Node::Dir(meta)) if meta.mode == 0o2775 && meta.gid == 50
+        ));
+        assert_eq!(file(&rootfs, "usr/local/bin/etcd").2, "etcd");
+    }
+
+    #[test]
+    fn follows_the_images_own_links_to_the_path() {
+        let mut rootfs = packaged();
+        place(&mut rootfs, &spec("/bin/tini", Some("0755"), None), b"tini").unwrap();
+        assert_eq!(file(&rootfs, "usr/bin/tini").2, "tini");
+    }
+
+    #[test]
+    fn a_symlink_in_the_archive_cannot_lead_out_of_the_path() {
+        let archive = tarball(&[
+            ("go/", DIR, 0o755, ""),
+            ("go/s", SYMLINK, 0o777, "/"),
+            ("go/s/usr/bin/planted", FILE, 0o4755, "planted"),
+        ]);
+        let mut rootfs = packaged();
+        let err = place(&mut rootfs, &spec("/opt/go", None, Some("go/")), &archive).unwrap_err();
+        assert!(err.to_string().contains("outside '/opt/go'"), "{err}");
+
+        let archive = tarball(&[
+            ("go/s", SYMLINK, 0o777, "../.."),
+            ("go/shadow", LINK, 0o644, "go/s/etc/shadow"),
+        ]);
+        let err = place(
+            &mut packaged(),
+            &spec("/opt/go", None, Some("go/")),
+            &archive,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("outside '/opt/go'"), "{err}");
+    }
+
+    #[test]
+    fn extracting_a_directory_needs_one() {
+        let archive = tarball(&[("go", FILE, 0o755, "not a dir")]);
+        let err = place(
+            &mut Rootfs::new(),
+            &spec("/go", None, Some("go/")),
+            &archive,
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), "'go' in the archive is not a directory");
     }
 }
