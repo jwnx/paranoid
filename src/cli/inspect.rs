@@ -224,6 +224,7 @@ fn print_lock_files(lock: &LockFile, focus: Option<&LockedImage>) {
         let trust = match file.trust {
             Trust::Pinned => "pinned",
             Trust::Signed => "signed",
+            Trust::Index => "index",
         };
         println!(
             "{}",

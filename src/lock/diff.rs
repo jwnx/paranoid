@@ -122,11 +122,14 @@ impl Serialize for LockDiff<'_> {
         struct Pin<'a> {
             url: &'a str,
             sha256: &'a Sha256,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            version: Option<&'a str>,
         }
         fn pin(file: &LockedFile) -> Pin<'_> {
             Pin {
                 url: file.url.as_str(),
                 sha256: &file.sha256,
+                version: file.version.as_deref(),
             }
         }
 
@@ -487,6 +490,7 @@ mod tests {
                 signed_by: Vec::new(),
                 signature: None,
                 checksums: None,
+                version: None,
             })
             .collect();
         for image in &mut lock.images {

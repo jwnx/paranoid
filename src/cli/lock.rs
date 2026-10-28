@@ -49,6 +49,14 @@ pub struct LockArgs {
     #[arg(long, value_name = "TIME", value_parser = parse_snapshot)]
     snapshot: Option<SnapshotTime>,
 
+    /// Move files from an index (`go`, `gcs`) to the newest release their
+    /// `version` allows.
+    ///
+    /// Otherwise each keeps the release the lock has while the manifest
+    /// still allows it.
+    #[arg(long)]
+    upgrade: bool,
+
     /// Directory to hold downloaded files (defaults to system cache).
     #[arg(long, value_name = "DIR")]
     cache_dir: Option<PathBuf>,
@@ -148,6 +156,7 @@ pub async fn run(args: LockArgs, quiet: bool) -> Result<(), CliError> {
     };
 
     if !args.force
+        && !args.upgrade
         && let Some(existing) = &existing
         // A keyring we can't read is reported by the resolution below.
         && existing.is_current(&manifest).unwrap_or(false)
@@ -185,9 +194,11 @@ pub async fn run(args: LockArgs, quiet: bool) -> Result<(), CliError> {
         .map_err(CliError::files)?;
         let downloads = DownloadService::with_cache(cache, DownloadConfig::default())
             .map_err(CliError::files)?;
-        // `--force` checks every file again too.
-        let existing = existing.as_ref().filter(|_| !args.force);
-        files::lock(&manifest, existing, &downloads, &())
+        let options = files::Options {
+            recheck: args.force,
+            upgrade: args.upgrade,
+        };
+        files::lock(&manifest, existing.as_ref(), options, &downloads, &())
             .await
             .map_err(CliError::files)?
     };

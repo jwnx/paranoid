@@ -9,6 +9,7 @@ use url::Url;
 
 use crate::arch::Architecture;
 use crate::config::{FileSpec, HoldSpec, Manifest, PackageSpec, RepositoryConfig};
+use crate::files::Indexes;
 use crate::hash::Sha256;
 use crate::oci::Digest;
 use crate::repository::debian::{Fingerprint, Keyring, KeyringError};
@@ -46,6 +47,9 @@ pub struct LockedFile {
     /// The checksums file the hash came from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checksums: Option<Url>,
+    /// The release an index resolved it to, by its publisher's name for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 /// What vouches for a file's hash.
@@ -56,6 +60,9 @@ pub enum Trust {
     Pinned,
     /// A key the manifest trusts signed it, or a checksums file listing it.
     Signed,
+    /// Its publisher's index lists its hash, fetched over HTTPS. Nothing
+    /// signs it, so whoever controls the index does.
+    Index,
 }
 
 /// A dependency nothing in the repositories satisfied, which the lock was
@@ -382,8 +389,9 @@ impl LockFile {
     /// by a key the manifest still trusts for it and that isn't revoked,
     /// and each file is recorded the way the manifest asks for it: from
     /// the same URLs, with the same pin, signed if and only if the
-    /// manifest names keys. The config hash covers the `signed_by` paths
-    /// but not what's in the files, nor what the lock says, hence the rest.
+    /// manifest names keys, and at a release the manifest allows for a file
+    /// from an index. The config hash covers the `signed_by` paths but not
+    /// what's in the files, nor what the lock says, hence the rest.
     pub fn is_current(&self, manifest: &Manifest) -> Result<bool, LockFileError> {
         if !self.matches_config(manifest) {
             return Ok(false);
@@ -408,11 +416,15 @@ impl LockFile {
             let Some(spec) = manifest.files.get(&file.name) else {
                 return Ok(false);
             };
-            let as_asked = file.url == spec.url
-                && file.signature == spec.signature
-                && file.checksums == spec.checksums
-                && spec.sha256.is_none_or(|sha256| sha256 == file.sha256)
-                && (file.trust == Trust::Signed) == spec.signed_by.is_some();
+            // What the file should be at the release the lock records.
+            let expected =
+                Indexes::default().expected(spec, file.version.as_deref(), manifest.architecture);
+            let as_asked = expected.is_some_and(|e| {
+                e.url == file.url
+                    && e.signature == file.signature
+                    && e.checksums == file.checksums
+                    && e.trust == file.trust
+            }) && spec.sha256.is_none_or(|sha256| sha256 == file.sha256);
             if !as_asked {
                 return Ok(false);
             }
@@ -729,6 +741,7 @@ direct = ["bash"]
                 signed_by: Vec::new(),
                 signature: None,
                 checksums: None,
+                version: None,
             }]);
         (manifest, lock)
     }
@@ -786,6 +799,7 @@ direct = ["bash"]
             ],
             signature: Some("https://example.com/tool.asc".parse().unwrap()),
             checksums: None,
+            version: None,
         }];
         assert!(lock.is_current(&trusted).unwrap());
 
@@ -805,6 +819,44 @@ direct = ["bash"]
         lock.files[0].signed_by =
             vec![serde_json::from_str("\"42D7C88C41C585732BDAEFACB8BA386B1127FC7C\"").unwrap()];
         assert!(!lock.is_current(&revoked).unwrap());
+    }
+
+    #[test]
+    fn a_resolved_file_has_to_be_at_a_release_the_manifest_allows() {
+        let manifest = |version: &str| {
+            Manifest::from_str(&format!(
+                "{}\n[files.etcdctl]\ngcs = \"etcd\"\nversion = \"{version}\"\n\
+                 asset = \"etcd-v{{version}}-linux-{{arch}}.tar.gz\"\npath = \"/etcdctl\"\n",
+                make_manifest_toml()
+            ))
+            .unwrap()
+        };
+        let three_six = manifest("3.6");
+        let base = "https://storage.googleapis.com/etcd/v3.6.15/";
+        let mut lock =
+            LockFile::from_resolved(&three_six, make_resolved()).with_files(vec![LockedFile {
+                name: "etcdctl".to_string(),
+                url: format!("{base}etcd-v3.6.15-linux-amd64.tar.gz")
+                    .parse()
+                    .unwrap(),
+                sha256: TEST_HASH_1.parse().unwrap(),
+                size: 7,
+                trust: Trust::Index,
+                signed_by: Vec::new(),
+                signature: None,
+                checksums: Some(format!("{base}SHA256SUMS").parse().unwrap()),
+                version: Some("v3.6.15".to_string()),
+            }]);
+        lock.repositories.clear();
+        assert!(lock.is_current(&three_six).unwrap());
+
+        // Another release line, or a lock edited to another release.
+        let three_seven = manifest("3.7");
+        lock.config_hash = LockFile::compute_config_hash(&three_seven);
+        assert!(!lock.is_current(&three_seven).unwrap());
+        lock.config_hash = LockFile::compute_config_hash(&three_six);
+        lock.files[0].version = Some("v3.6.16".to_string());
+        assert!(!lock.is_current(&three_six).unwrap());
     }
 
     #[test]

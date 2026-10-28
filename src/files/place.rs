@@ -18,6 +18,9 @@ pub enum PlaceError {
     #[error("the archive has no '{0}'")]
     Missing(String),
 
+    #[error("{0}")]
+    Extract(String),
+
     #[error("'{0}' in the archive is not a regular file")]
     NotAFile(String),
 
@@ -253,7 +256,7 @@ mod tests {
 
     fn spec(path: &str, mode: Option<&str>, extract: Option<&str>) -> FileSpec {
         FileSpec {
-            url: "https://example.com/x".parse().unwrap(),
+            url: Some("https://example.com/x".parse().unwrap()),
             sha256: Some(Sha256::of(b"")),
             path: path.parse().unwrap(),
             mode: mode.map(|m| m.parse().unwrap()),
@@ -261,6 +264,11 @@ mod tests {
             signed_by: None,
             signature: None,
             checksums: None,
+            go: None,
+            gcs: None,
+            version: None,
+            asset: None,
+            prefix: None,
         }
     }
 

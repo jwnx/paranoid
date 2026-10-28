@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+use crate::arch::Architecture;
 use crate::config::{FileSpec, Manifest};
 use crate::deb::{DebArchive, DebError};
 use crate::download::{
@@ -16,7 +17,7 @@ use crate::download::{
     PackageCache, Sources,
 };
 use crate::dpkg::{DpkgDatabase, DpkgError, PackageState};
-use crate::files::PlaceError;
+use crate::files::{PlaceError, render_extract};
 use crate::lock::{LockFile, LockedFile};
 use crate::oci::{ImageOutput, OciConfig, OciConfigError, OciError, OciImageResult, Timestamp};
 use crate::report::{Event, Phase, Reporter};
@@ -156,7 +157,7 @@ pub async fn build(
     };
     let mut rootfs = assemble(&fetched, state, reporter)?;
     for (fetched, (_, spec)) in fetched_files.iter().zip(&files) {
-        place(&mut rootfs, fetched, spec)?;
+        place(&mut rootfs, fetched, spec, manifest.architecture)?;
     }
     let image = crate::oci::write_image(&config, &rootfs, &options.output, reporter)?;
 
@@ -180,6 +181,7 @@ fn place(
     rootfs: &mut Rootfs,
     fetched: &Fetched<'_, LockedFile>,
     spec: &FileSpec,
+    arch: Architecture,
 ) -> Result<(), BuildError> {
     let name = &fetched.item.name;
     let data =
@@ -187,7 +189,18 @@ fn place(
             package: name.clone(),
             source,
         })?;
-    crate::files::place(rootfs, spec, &data).map_err(|source| BuildError::Place {
+    // An extracted path can name the release, as `etcd-v{version}/etcdctl`.
+    let extract = render_extract(spec, fetched.item.version.as_deref(), arch).map_err(|e| {
+        BuildError::Place {
+            file: name.clone(),
+            source: PlaceError::Extract(e),
+        }
+    })?;
+    let spec = FileSpec {
+        extract,
+        ..spec.clone()
+    };
+    crate::files::place(rootfs, &spec, &data).map_err(|source| BuildError::Place {
         file: name.clone(),
         source,
     })
