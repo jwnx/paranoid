@@ -234,7 +234,13 @@ resolves, so a failed resolution leaves both files as they were. It
 needs a TOML manifest.
 
 `cmd` is the image's *entrypoint*: arguments to `podman run` are appended
-to it, they don't replace it.
+to it, they don't replace it. It's optional, so a base image that only
+needs its environment can set just that:
+
+```toml
+[entrypoint.env]
+PATH = "/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+```
 
 Architectures take Debian names or the usual aliases (`x86_64`, `aarch64`,
 `ppc64le`, ...) and map to the right OCI platform, variants included

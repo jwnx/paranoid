@@ -272,7 +272,9 @@ impl OciConfig {
         }
 
         if let Some(entrypoint) = &image.entrypoint {
-            config = config.entrypoint(entrypoint.cmd.iter().cloned());
+            if !entrypoint.cmd.is_empty() {
+                config = config.entrypoint(entrypoint.cmd.iter().cloned());
+            }
             if let Some(env) = &entrypoint.env {
                 config = config.env(
                     env.iter()
@@ -1007,5 +1009,29 @@ mod tests {
         let unnamed = OciConfig::new();
         let json = serde_json::to_string(&unnamed.image_index(&digest, 1)).unwrap();
         assert!(!json.contains("io.containerd.image.name"), "{json}");
+    }
+
+    #[test]
+    fn an_image_can_set_env_without_an_entrypoint() {
+        let manifest: crate::config::Manifest = std::str::FromStr::from_str(
+            "[image]\narchitecture = \"arm64\"\n\n\
+             [repositories.debian]\nurl = \"https://deb.debian.org/debian\"\n\
+             distribution = \"bookworm\"\ncomponents = [\"main\"]\nsigned_by = \"keys/debian.asc\"\n\n\
+             [[packages]]\nname = \"bash\"\n\n\
+             [entrypoint.env]\nPATH = \"/usr/local/go/bin:/usr/bin:/bin\"\n",
+        )
+        .unwrap();
+        let image = &manifest.images[crate::config::DEFAULT_IMAGE];
+        let config = OciConfig::from_image(image, Architecture::Arm64, Timestamp::epoch()).unwrap();
+        assert!(config.entrypoint.is_none());
+        assert_eq!(
+            config
+                .env
+                .unwrap()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["PATH=/usr/local/go/bin:/usr/bin:/bin"]
+        );
     }
 }

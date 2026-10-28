@@ -628,6 +628,9 @@ impl<'de> Deserialize<'de> for HoldSpec {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EntrypointConfig {
+    /// The image's entrypoint. Empty leaves it unset, for an image that
+    /// only wants `env` or `workdir`.
+    #[serde(default)]
     pub cmd: Vec<String>,
     /// Environment variables, kept in declaration order so the image config
     /// is stable across builds.
