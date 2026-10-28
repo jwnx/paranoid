@@ -8,6 +8,7 @@ pub mod dpkg;
 pub mod files;
 pub mod hash;
 pub mod http;
+pub mod locales;
 pub mod lock;
 pub mod oci;
 pub mod paths;

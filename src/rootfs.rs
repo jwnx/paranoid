@@ -310,6 +310,20 @@ impl Rootfs {
         Ok(stats)
     }
 
+    /// Remove `path` and everything under it. Returns how many entries went.
+    pub(crate) fn remove_tree(&mut self, path: &str) -> usize {
+        let prefix = format!("{path}/");
+        let before = self.nodes.len();
+        self.nodes.remove(path);
+        self.nodes.retain(|p, _| !p.starts_with(&prefix));
+        before - self.nodes.len()
+    }
+
+    /// Put `node` at `path`, an entry that's there already.
+    pub(crate) fn replace_node(&mut self, path: &str, node: Node) -> Result<(), RootfsError> {
+        self.replace(path.to_string(), node)
+    }
+
     /// Make `path` a directory with `meta`: create it, and any parents it
     /// lacks, or give the directory that's there `meta`. Its parents are
     /// resolved through symlinks, as a package's paths are, but `path`

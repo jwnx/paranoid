@@ -87,6 +87,10 @@ pub struct ImageSpec {
     pub packages: Vec<PackageSpec>,
     /// The ids of the files it gets, in manifest order.
     pub files: Vec<String>,
+    /// The locales it keeps from `locales-all`, as `LANG` spells them
+    /// (`en_US.UTF-8`), or `all` to keep every one. Asking for any adds
+    /// `locales-all` to `packages`.
+    pub locales: Vec<String>,
     pub entrypoint: Option<EntrypointConfig>,
     /// Where `build` writes the image, as written: relative to the
     /// manifest, with `{image}` standing for the image's id. See
@@ -146,6 +150,8 @@ struct RawImageConfig {
     source: Option<String>,
     #[serde(default)]
     unconfigured: bool,
+    #[serde(default)]
+    locales: Vec<String>,
     output: Option<String>,
 }
 
@@ -160,6 +166,7 @@ struct RawDefaults {
     authors: Option<String>,
     source: Option<String>,
     unconfigured: Option<bool>,
+    locales: Option<Vec<String>>,
     entrypoint: Option<EntrypointConfig>,
     output: Option<String>,
 }
@@ -180,6 +187,7 @@ struct RawImage {
     packages: Vec<String>,
     #[serde(default)]
     files: Vec<String>,
+    locales: Option<Vec<String>>,
     entrypoint: Option<EntrypointConfig>,
     output: Option<String>,
 }
@@ -231,8 +239,9 @@ impl RawManifest {
                         authors: i.authors,
                         source: i.source,
                         unconfigured: i.unconfigured,
-                        packages: self.packages,
+                        packages: with_locales_all(self.packages, &i.locales),
                         files: self.files.keys().cloned().collect(),
+                        locales: i.locales,
                         entrypoint: self.entrypoint,
                         output: i.output,
                     },
@@ -290,6 +299,18 @@ impl RawManifest {
             let mut seen = std::collections::HashSet::new();
             names.retain(|name| seen.insert(name.clone()));
 
+            let locales = raw
+                .locales
+                .or_else(|| defaults.locales.clone())
+                .unwrap_or_default();
+            let packages = names
+                .into_iter()
+                .map(|name| PackageSpec {
+                    name,
+                    version: None,
+                    repository: None,
+                })
+                .collect();
             let image = ImageSpec {
                 name: raw.name,
                 tag: raw.tag.or_else(|| defaults.tag.clone()),
@@ -297,15 +318,9 @@ impl RawManifest {
                 authors: raw.authors.or_else(|| defaults.authors.clone()),
                 source: raw.source.or_else(|| defaults.source.clone()),
                 unconfigured: raw.unconfigured.or(defaults.unconfigured).unwrap_or(false),
-                packages: names
-                    .into_iter()
-                    .map(|name| PackageSpec {
-                        name,
-                        version: None,
-                        repository: None,
-                    })
-                    .collect(),
+                packages: with_locales_all(packages, &locales),
                 files: raw.files,
+                locales,
                 entrypoint: raw.entrypoint.or_else(|| defaults.entrypoint.clone()),
                 output: raw.output.or_else(|| defaults.output.clone()),
             };
@@ -332,6 +347,33 @@ impl RawManifest {
             dir: PathBuf::new(),
         })
     }
+}
+
+/// Whether `name` could name a locale: letters, digits, `_`, `.`, `-` and
+/// one `@`, as in `de_DE.ISO-8859-15@euro`.
+fn is_locale_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.matches('@').count() <= 1
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | '@'))
+}
+
+/// The package that has every locale precompiled, which `locales` take
+/// theirs from.
+pub const LOCALES_PACKAGE: &str = "locales-all";
+
+/// `packages`, with `locales-all` if the image asks for locales and
+/// doesn't list it already.
+fn with_locales_all(mut packages: Vec<PackageSpec>, locales: &[String]) -> Vec<PackageSpec> {
+    if !locales.is_empty() && !packages.iter().any(|p| p.name == LOCALES_PACKAGE) {
+        packages.push(PackageSpec {
+            name: LOCALES_PACKAGE.to_string(),
+            version: None,
+            repository: None,
+        });
+    }
+    packages
 }
 
 /// Image and file ids end up in paths (`-o '{image}.tar'`) and in the
@@ -810,6 +852,14 @@ impl Manifest {
         }
 
         for (id, image) in &self.images {
+            if let Some(bad) = image.locales.iter().find(|l| !is_locale_name(l)) {
+                return Err(ManifestError::Validation {
+                    field: "locales",
+                    message: format!(
+                        "image '{id}': '{bad}' is not a locale name, like \"en_US.UTF-8\" or \"all\""
+                    ),
+                });
+            }
             if image.packages.is_empty() && image.files.is_empty() {
                 return Err(ManifestError::Validation {
                     field: "packages",
@@ -1194,6 +1244,43 @@ name = \"bash\"
             let err = single(paths).unwrap_err();
             assert!(err.to_string().contains(wanted), "{paths}: {err}");
         }
+    }
+
+    #[test]
+    fn locales_bring_locales_all() {
+        let single = Manifest::from_str(&format!(
+            "{SET_REPOS}\n[image]\narchitecture = \"amd64\"\nlocales = [\"en_US.UTF-8\"]\n\n\
+             [[packages]]\nname = \"bash\"\n"
+        ))
+        .unwrap();
+        let image = &single.images[DEFAULT_IMAGE];
+        assert_eq!(image.locales, ["en_US.UTF-8"]);
+        let names: Vec<&str> = image.packages.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["bash", "locales-all"]);
+
+        let set = set(
+            "[defaults]\narchitecture = \"amd64\"\nlocales = [\"C.UTF-8\"]\n\n\
+             [images.a]\npackages = [\"bash\"]\n\n\
+             [images.b]\npackages = [\"bash\", \"locales-all\"]\nlocales = [\"all\"]\n\n\
+             [images.c]\npackages = [\"bash\"]\nlocales = []\n",
+        )
+        .unwrap();
+        assert_eq!(set.images["a"].locales, ["C.UTF-8"]);
+        assert_eq!(set.images["a"].packages.len(), 2);
+        assert_eq!(set.images["b"].packages.len(), 2);
+        assert!(set.images["c"].locales.is_empty());
+        assert_eq!(set.images["c"].packages.len(), 1);
+
+        let err = set_err("locales = [\"en US\"]");
+        assert!(err.contains("not a locale name"), "{err}");
+    }
+
+    fn set_err(defaults: &str) -> String {
+        set(&format!(
+            "[defaults]\narchitecture = \"amd64\"\n{defaults}\n\n[images.a]\npackages = [\"bash\"]\n"
+        ))
+        .unwrap_err()
+        .to_string()
     }
 
     #[test]

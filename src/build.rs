@@ -2,7 +2,8 @@
 //!
 //! The pipeline is: download every locked package and file into the cache,
 //! apply the packages to an in-memory [`Rootfs`] in lock order, record them
-//! in the dpkg database (`/var/lib/dpkg`), write the manifest's accounts,
+//! in the dpkg database (`/var/lib/dpkg`), keep the locales the image asks
+//! for out of `locales-all`, write the manifest's accounts,
 //! place the files, write the paths, and write a single-layer OCI image
 //! from it.
 
@@ -20,6 +21,7 @@ use crate::download::{
 };
 use crate::dpkg::{DpkgDatabase, DpkgError, PackageState};
 use crate::files::{PlaceError, render_extract};
+use crate::locales::{self, LocalesError};
 use crate::lock::{LockFile, LockedFile};
 use crate::oci::{ImageOutput, OciConfig, OciConfigError, OciError, OciImageResult, Timestamp};
 use crate::paths::{self, PathsError};
@@ -68,6 +70,9 @@ pub enum BuildError {
 
     #[error(transparent)]
     Download(#[from] DownloadFailures),
+
+    #[error("failed to keep the locales")]
+    Locales(#[from] LocalesError),
 
     #[error("failed to write the accounts")]
     Accounts(#[from] AccountsError),
@@ -165,6 +170,9 @@ pub async fn build(
         PackageState::Installed
     };
     let mut rootfs = assemble(&fetched, state, reporter)?;
+    if !spec.locales.is_empty() {
+        locales::keep(&mut rootfs, &spec.locales)?;
+    }
     if !manifest.accounts.is_empty() {
         accounts::write(&mut rootfs, &manifest.accounts)?;
     }
