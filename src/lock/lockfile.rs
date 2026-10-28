@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::arch::Architecture;
-use crate::config::{HoldSpec, Manifest, PackageSpec, RepositoryConfig};
+use crate::config::{FileSpec, HoldSpec, Manifest, PackageSpec, RepositoryConfig};
 use crate::hash::Sha256;
 use crate::oci::Digest;
 use crate::repository::debian::{Keyring, KeyringError};
@@ -326,8 +326,11 @@ impl LockFile {
     /// We hash a canonical JSON serialization of exactly the fields that
     /// affect resolution: the target architecture, the repositories in
     /// declaration order (order breaks version ties), and the requested
-    /// packages. Serializing rather than concatenating keeps field
-    /// boundaries, so `["ab", "c"]` and `["a", "bc"]` hash differently.
+    /// packages, and the files and which images get them. Serializing
+    /// rather than concatenating keeps field boundaries, so `["ab", "c"]`
+    /// and `["a", "bc"]` hash differently. What a manifest doesn't use is
+    /// left out, so adding a kind of input doesn't change the hash of a
+    /// manifest without it.
     fn compute_config_hash(manifest: &Manifest) -> String {
         #[derive(Serialize)]
         struct ResolutionInputs<'a> {
@@ -336,6 +339,10 @@ impl LockFile {
             images: Vec<(&'a str, Vec<&'a PackageSpec>)>,
             #[serde(skip_serializing_if = "Vec::is_empty")]
             holds: Vec<(&'a str, &'a HoldSpec)>,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            files: Vec<(&'a str, &'a FileSpec)>,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            image_files: Vec<(&'a str, &'a [String])>,
         }
 
         let images = manifest
@@ -363,6 +370,17 @@ impl LockFile {
                 .collect(),
             images,
             holds: holds_sorted,
+            files: manifest
+                .files
+                .iter()
+                .map(|(id, file)| (id.as_str(), file))
+                .collect(),
+            image_files: manifest
+                .images
+                .iter()
+                .filter(|(_, image)| !image.files.is_empty())
+                .map(|(id, image)| (id.as_str(), image.files.as_slice()))
+                .collect(),
         };
 
         let json = serde_json::to_vec(&inputs).expect("resolution inputs always serialize");
@@ -594,6 +612,22 @@ direct = ["bash"]
             LockFile::compute_config_hash(&without),
             LockFile::compute_config_hash(&with)
         );
+    }
+
+    #[test]
+    fn files_are_resolution_inputs() {
+        let file = |sha256: &str| {
+            format!(
+                "[files.tini]\nurl = \"https://example.com/tini\"\n\
+                 sha256 = \"{sha256}\"\npath = \"/usr/bin/tini\"\n"
+            )
+        };
+        let hash = |toml: &str| LockFile::compute_config_hash(&Manifest::from_str(toml).unwrap());
+        let plain = hash(&make_manifest_toml());
+        let one = hash(&format!("{}{}", make_manifest_toml(), file(TEST_HASH_1)));
+        let other = hash(&format!("{}{}", make_manifest_toml(), file(TEST_HASH_2)));
+        assert_ne!(plain, one);
+        assert_ne!(one, other);
     }
 
     #[test]

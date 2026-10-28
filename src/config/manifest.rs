@@ -13,6 +13,8 @@ use crate::arch::Architecture;
 use crate::repository::DebianVersion;
 use crate::version::VersionConstraint;
 
+use super::FileSpec;
+
 /// A manifest: repositories, holds, and the images built from them.
 ///
 /// A manifest describes either one image (`[image]` and `[[packages]]`) or
@@ -35,6 +37,9 @@ pub struct Manifest {
     pub architecture: Architecture,
     /// The images by id, in declaration order.
     pub images: IndexMap<String, ImageSpec>,
+    /// Files fetched from a URL rather than a repository, by id, in
+    /// declaration order.
+    pub files: IndexMap<String, FileSpec>,
     /// Stores to fetch packages from by their SHA-256, before trying their
     /// repositories: `<store>/sha256/<2 hex>/<sha256>.deb`, the layout of
     /// the local cache. Like `mirrors`, they're left out of the config
@@ -72,6 +77,8 @@ pub struct ImageSpec {
     pub unconfigured: bool,
     /// What the image asks for, groups expanded.
     pub packages: Vec<PackageSpec>,
+    /// The ids of the files it gets, in manifest order.
+    pub files: Vec<String>,
     pub entrypoint: Option<EntrypointConfig>,
     /// Where `build` writes the image, as written: relative to the
     /// manifest, with `{image}` standing for the image's id. See
@@ -89,6 +96,8 @@ struct RawManifest {
     #[serde(default)]
     holds: IndexMap<String, HoldSpec>,
     download: Option<RawDownload>,
+    #[serde(default)]
+    files: IndexMap<String, FileSpec>,
 
     // One image.
     image: Option<RawImageConfig>,
@@ -157,6 +166,8 @@ struct RawImage {
     groups: Vec<String>,
     #[serde(default)]
     packages: Vec<String>,
+    #[serde(default)]
+    files: Vec<String>,
     entrypoint: Option<EntrypointConfig>,
     output: Option<String>,
 }
@@ -199,6 +210,7 @@ impl RawManifest {
                         source: i.source,
                         unconfigured: i.unconfigured,
                         packages: self.packages,
+                        files: self.files.keys().cloned().collect(),
                         entrypoint: self.entrypoint,
                         output: i.output,
                     },
@@ -207,6 +219,7 @@ impl RawManifest {
                     Architecture::Amd64,
                     ImageSpec {
                         packages: self.packages,
+                        files: self.files.keys().cloned().collect(),
                         entrypoint: self.entrypoint,
                         ..ImageSpec::default()
                     },
@@ -218,6 +231,7 @@ impl RawManifest {
                 holds: self.holds,
                 architecture,
                 images: IndexMap::from([(DEFAULT_IMAGE.to_string(), image)]),
+                files: self.files,
                 stores,
                 set: false,
                 dir: PathBuf::new(),
@@ -232,7 +246,7 @@ impl RawManifest {
         })?;
         let mut images = IndexMap::new();
         for (id, raw) in self.images {
-            if !is_image_id(&id) {
+            if !is_id(&id) {
                 return Err(invalid(
                     "images",
                     format!("image id '{id}' must be lower-case letters, digits, '.', '-' or '_'"),
@@ -267,6 +281,7 @@ impl RawManifest {
                         repository: None,
                     })
                     .collect(),
+                files: raw.files,
                 entrypoint: raw.entrypoint.or_else(|| defaults.entrypoint.clone()),
                 output: raw.output.or_else(|| defaults.output.clone()),
             };
@@ -285,6 +300,7 @@ impl RawManifest {
             holds: self.holds,
             architecture: defaults.architecture,
             images,
+            files: self.files,
             stores,
             set: true,
             dir: PathBuf::new(),
@@ -292,8 +308,9 @@ impl RawManifest {
     }
 }
 
-/// Image ids end up in paths (`-o '{image}.tar'`), so keep them tame.
-fn is_image_id(id: &str) -> bool {
+/// Image and file ids end up in paths (`-o '{image}.tar'`) and in the
+/// lock, so keep them tame.
+fn is_id(id: &str) -> bool {
     !id.is_empty()
         && id
             .chars()
@@ -767,16 +784,46 @@ impl Manifest {
         }
 
         for (id, image) in &self.images {
-            if image.packages.is_empty() {
+            if image.packages.is_empty() && image.files.is_empty() {
                 return Err(ManifestError::Validation {
                     field: "packages",
                     message: if self.set {
-                        format!("image '{id}' asks for no packages")
+                        format!("image '{id}' asks for no packages or files")
                     } else {
-                        "at least one package must be specified".to_string()
+                        "at least one package or file must be specified".to_string()
                     },
                 });
             }
+            let mut seen = std::collections::HashSet::new();
+            for file in &image.files {
+                if !self.files.contains_key(file) {
+                    return Err(ManifestError::Validation {
+                        field: "files",
+                        message: format!("image '{id}' asks for unknown file '{file}'"),
+                    });
+                }
+                if !seen.insert(file) {
+                    return Err(ManifestError::Validation {
+                        field: "files",
+                        message: format!("image '{id}' asks for file '{file}' twice"),
+                    });
+                }
+            }
+        }
+
+        for (id, file) in &self.files {
+            if !is_id(id) {
+                return Err(ManifestError::Validation {
+                    field: "files",
+                    message: format!(
+                        "file id '{id}' must be lower-case letters, digits, '.', '-' or '_'"
+                    ),
+                });
+            }
+            file.check().map_err(|message| ManifestError::Validation {
+                field: "files",
+                message: format!("file '{id}': {message}"),
+            })?;
         }
 
         for pkg in self.images.values().flat_map(|i| &i.packages) {
@@ -1031,6 +1078,64 @@ entrypoint = { cmd = ["make"] }
         ))
         .unwrap();
         assert_eq!(single.output(DEFAULT_IMAGE), Some(PathBuf::from("out")));
+    }
+
+    const FILES: &str = r#"
+[files.etcdctl]
+url = "https://example.com/etcd.tar.gz"
+sha256 = "a665a45920422f9d417e4867efdc4fb8a04a1f3fff1fa07e998e86f7f7a27ae3"
+extract = "etcd/etcdctl"
+path = "/usr/local/bin/etcdctl"
+
+[files.tini]
+url = "https://example.com/tini"
+sha256 = "b3a8e0e1f9ab1bfe3a36f231f676f78bb30a519d2b21e6c530c0eee8ebb4a5d0"
+path = "/usr/bin/tini"
+mode = "0755"
+"#;
+
+    #[test]
+    fn a_single_image_gets_every_file() {
+        let manifest = Manifest::from_str(&format!(
+            "{SET_REPOS}
+[[packages]]
+name = \"bash\"
+{FILES}"
+        ))
+        .unwrap();
+        assert_eq!(
+            manifest.files.keys().collect::<Vec<_>>(),
+            ["etcdctl", "tini"]
+        );
+        assert_eq!(manifest.images[DEFAULT_IMAGE].files, ["etcdctl", "tini"]);
+    }
+
+    #[test]
+    fn images_of_a_set_name_their_files() {
+        let manifest = set(&format!(
+            "[defaults]\narchitecture = \"amd64\"\n\n\
+             [images.etcd]\npackages = [\"bash\"]\nfiles = [\"etcdctl\"]\n\n\
+             [images.init]\nfiles = [\"tini\"]\n\n\
+             [images.plain]\npackages = [\"bash\"]\n{FILES}"
+        ))
+        .unwrap();
+        assert_eq!(manifest.images["etcd"].files, ["etcdctl"]);
+        assert_eq!(manifest.images["init"].files, ["tini"]);
+        assert!(manifest.images["init"].packages.is_empty());
+        assert!(manifest.images["plain"].files.is_empty());
+    }
+
+    #[test]
+    fn an_image_can_only_name_files_that_exist() {
+        let err = set(&format!(
+            "[defaults]\narchitecture = \"amd64\"\n\n\
+             [images.a]\nfiles = [\"etcd\"]\n{FILES}"
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown file 'etcd'"), "{err}");
+
+        let err = set("[defaults]\narchitecture = \"amd64\"\n\n[images.a]\n").unwrap_err();
+        assert!(err.to_string().contains("no packages or files"), "{err}");
     }
 
     #[test]

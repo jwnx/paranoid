@@ -1,6 +1,8 @@
+mod files;
 mod manifest;
 mod snapshot;
 
+pub use files::{Extract, FileMode, FileSpec, ImagePath};
 pub use manifest::{
     ConfigFormat, DEFAULT_IMAGE, EntrypointConfig, HoldSpec, ImageSpec, Manifest, ManifestError,
     PackageSpec, RepositoryConfig, SnapshotTime, check_base_url,
