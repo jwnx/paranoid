@@ -101,6 +101,19 @@ pub enum KeyTime {
     Signing,
 }
 
+/// What a detached signature is over, which decides the kinds of
+/// signature that count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Signed {
+    /// Exact bytes: only a binary signature counts. A text signature
+    /// ignores line endings, so it would also vouch for the same file with
+    /// `\r\n` for `\n`.
+    Bytes,
+    /// Text, where line endings don't matter, such as a checksums file:
+    /// a binary or a text signature counts.
+    Text,
+}
+
 /// Keys trusted to sign a repository.
 #[derive(Debug, Clone)]
 pub struct Keyring {
@@ -116,6 +129,8 @@ struct Signer {
     primary: Fingerprint,
     can_sign: bool,
     revoked: bool,
+    /// Seconds since the epoch.
+    created: u64,
     /// Seconds since the epoch, `None` if the key never expires.
     expires: Option<u64>,
 }
@@ -186,6 +201,23 @@ impl Keyring {
         fps
     }
 
+    /// Primary fingerprints of the keys that can still vouch for what they
+    /// signed: those with a primary key or subkey that may sign and isn't
+    /// revoked. Expiry doesn't matter here; a signature checked when it
+    /// was made stays good after its key expires, but not after it's
+    /// revoked.
+    pub fn vouching(&self) -> Vec<Fingerprint> {
+        let mut fps: Vec<_> = self
+            .signers
+            .iter()
+            .filter(|s| s.can_sign && !s.revoked)
+            .map(|s| s.primary.clone())
+            .collect();
+        fps.sort();
+        fps.dedup();
+        fps
+    }
+
     /// Verify a clearsigned message, as of `now`.
     pub fn verify_cleartext(
         &self,
@@ -209,7 +241,7 @@ impl Keyring {
         let signed = msg.signed_text();
         let now = now.timestamp().max(0) as u64;
 
-        let signers = self.judge(msg.signatures(), signed.as_bytes(), now, keys)?;
+        let signers = self.judge(msg.signatures(), signed.as_bytes(), now, keys, Signed::Text)?;
         Ok(Verified {
             text: signed.replace("\r\n", "\n"),
             signers,
@@ -223,6 +255,7 @@ impl Keyring {
         &self,
         signature: &[u8],
         data: &[u8],
+        signed: Signed,
         now: DateTime<Utc>,
         keys: KeyTime,
     ) -> Result<Vec<Fingerprint>, VerifyError> {
@@ -233,7 +266,7 @@ impl Keyring {
             .collect::<Result<_, _>>()
             .map_err(malformed)?;
         let now = now.timestamp().max(0) as u64;
-        self.judge(&sigs, data, now, keys)
+        self.judge(&sigs, data, now, keys, signed)
     }
 
     /// The signers of every signature that counts, sorted, when at least
@@ -244,11 +277,12 @@ impl Keyring {
         data: &[u8],
         now: u64,
         keys: KeyTime,
+        signed: Signed,
     ) -> Result<Vec<Fingerprint>, VerifyError> {
         let mut signers = Vec::new();
         let mut rejected = Vec::new();
         for sig in sigs {
-            match self.check(sig, data, now, keys)? {
+            match self.check(sig, data, now, keys, signed)? {
                 Ok(fp) => signers.push(fp),
                 Err(reason) => rejected.push(reason),
             }
@@ -273,6 +307,7 @@ impl Keyring {
         data: &[u8],
         now: u64,
         keys: KeyTime,
+        signed: Signed,
     ) -> Result<Result<Fingerprint, String>, VerifyError> {
         // A signature naming its issuer only by key ID can match more than
         // one key; it's BAD only if none of them verify it.
@@ -300,20 +335,37 @@ impl Keyring {
         };
         let fp = &signer.primary;
 
-        let created = sig.created().map_or(0, |t| u64::from(t.as_secs()));
+        let created = sig.created().map(|t| u64::from(t.as_secs()));
         let key_time = match keys {
             KeyTime::Now => now,
-            KeyTime::Signing => created,
+            KeyTime::Signing => created.unwrap_or(0),
         };
-        let reason = if !matches!(sig.typ(), Some(SignatureType::Text | SignatureType::Binary)) {
-            Some("is not a document signature")
+        let document = match signed {
+            Signed::Bytes => matches!(sig.typ(), Some(SignatureType::Binary)),
+            Signed::Text => matches!(sig.typ(), Some(SignatureType::Text | SignatureType::Binary)),
+        };
+        let reason = if !document {
+            Some(match signed {
+                Signed::Bytes => "is not a binary document signature",
+                Signed::Text => "is not a document signature",
+            })
+        } else if created.is_none() {
+            Some("has no creation time")
+        } else if created.is_some_and(|t| t < signer.created) {
+            // gpg calls this a time conflict: the signature claims to be
+            // older than the key that made it.
+            Some("is dated before its key was made")
+        } else if keys == KeyTime::Signing && created.is_some_and(|t| t > now) {
+            Some("is dated in the future")
         } else if signer.revoked {
             Some("is from a revoked key")
         } else if !signer.can_sign {
             Some("is from a key not allowed to sign")
         } else if signer.expires.is_some_and(|t| t <= key_time) {
             Some("is from an expired key")
-        } else if expiry(created, sig.signature_expiration_time()).is_some_and(|t| t <= now) {
+        } else if expiry(created.unwrap_or(0), sig.signature_expiration_time())
+            .is_some_and(|t| t <= now)
+        {
             Some("has expired")
         } else {
             None
@@ -414,6 +466,7 @@ fn signers_of(key: &SignedPublicKey) -> Result<Vec<Signer>, KeyringError> {
         primary: primary_fp.clone(),
         can_sign: primary_can_sign,
         revoked,
+        created: primary_created,
         expires: primary_expires,
     }];
 
@@ -447,6 +500,7 @@ fn signers_of(key: &SignedPublicKey) -> Result<Vec<Signer>, KeyringError> {
             primary: primary_fp.clone(),
             can_sign,
             revoked: revoked || sub_revoked,
+            created: sub_created,
             // A subkey can't outlive its primary.
             expires: match (sub_expires, primary_expires) {
                 (Some(a), Some(b)) => Some(a.min(b)),
@@ -597,9 +651,11 @@ mod tests {
         #[test]
         fn verifies_armored_and_binary_signatures() {
             let ring = keyring(&[RELEASE]);
-            let signed = ring.verify_detached(TOOL_SIG, TOOL, now(), KeyTime::Signing);
+            let signed =
+                ring.verify_detached(TOOL_SIG, TOOL, Signed::Bytes, now(), KeyTime::Signing);
             assert_eq!(fps(signed.unwrap()), [RELEASE_FP]);
-            let signed = ring.verify_detached(SUMS_SIG, SUMS, now(), KeyTime::Signing);
+            let signed =
+                ring.verify_detached(SUMS_SIG, SUMS, Signed::Bytes, now(), KeyTime::Signing);
             assert_eq!(fps(signed.unwrap()), [RELEASE_FP]);
             let v = ring
                 .verify_cleartext_with(SUMS_CLEARSIGNED, now(), KeyTime::Signing)
@@ -612,7 +668,7 @@ mod tests {
         fn a_key_that_expired_after_signing_counts_only_when_judged_at_signing() {
             let ring = keyring(&[RELEASE]);
             let err = ring
-                .verify_detached(TOOL_SIG, TOOL, now(), KeyTime::Now)
+                .verify_detached(TOOL_SIG, TOOL, Signed::Bytes, now(), KeyTime::Now)
                 .unwrap_err();
             assert!(err.to_string().contains("expired key"), "{err}");
             let err = ring.verify_cleartext(SUMS_CLEARSIGNED, now()).unwrap_err();
@@ -622,7 +678,13 @@ mod tests {
         #[test]
         fn rejects_modified_data() {
             let err = keyring(&[RELEASE])
-                .verify_detached(TOOL_SIG, b"a tool, changed\n", now(), KeyTime::Signing)
+                .verify_detached(
+                    TOOL_SIG,
+                    b"a tool, changed\n",
+                    Signed::Bytes,
+                    now(),
+                    KeyTime::Signing,
+                )
                 .unwrap_err();
             assert!(matches!(err, VerifyError::BadSignature(_)), "{err}");
         }
@@ -630,12 +692,12 @@ mod tests {
         #[test]
         fn rejects_revoked_keys_and_strangers() {
             let err = keyring(&[REVOKED])
-                .verify_detached(REVOKED_SIG, TOOL, now(), KeyTime::Signing)
+                .verify_detached(REVOKED_SIG, TOOL, Signed::Bytes, now(), KeyTime::Signing)
                 .unwrap_err();
             assert!(err.to_string().contains("revoked key"), "{err}");
 
             let err = keyring(&[STRANGER])
-                .verify_detached(TOOL_SIG, TOOL, now(), KeyTime::Signing)
+                .verify_detached(TOOL_SIG, TOOL, Signed::Bytes, now(), KeyTime::Signing)
                 .unwrap_err();
             assert!(err.to_string().contains("not in the keyring"), "{err}");
         }
@@ -643,13 +705,61 @@ mod tests {
         #[test]
         fn rejects_what_is_not_a_signature() {
             let err = keyring(&[RELEASE])
-                .verify_detached(b"not a signature", TOOL, now(), KeyTime::Signing)
+                .verify_detached(
+                    b"not a signature",
+                    TOOL,
+                    Signed::Bytes,
+                    now(),
+                    KeyTime::Signing,
+                )
                 .unwrap_err();
             assert!(matches!(err, VerifyError::MalformedSignature(_)), "{err}");
             let err = keyring(&[RELEASE])
-                .verify_detached(RELEASE, TOOL, now(), KeyTime::Signing)
+                .verify_detached(RELEASE, TOOL, Signed::Bytes, now(), KeyTime::Signing)
                 .unwrap_err();
             assert!(matches!(err, VerifyError::MalformedSignature(_)), "{err}");
+        }
+
+        const OTHER: &[u8] = include_bytes!("testdata/files/other.asc");
+        const TEXT_SIG: &[u8] = include_bytes!("testdata/files/tool.text.asc");
+        const BACKDATED_SIG: &[u8] = include_bytes!("testdata/files/tool.backdated.asc");
+
+        #[test]
+        fn a_text_signature_counts_only_for_text() {
+            let ring = keyring(&[OTHER]);
+            let crlf = b"a tool\r\n";
+            // A text signature ignores line endings, so it vouches for
+            // bytes nobody signed.
+            for data in [TOOL, crlf] {
+                assert!(
+                    ring.verify_detached(TEXT_SIG, data, Signed::Text, now(), KeyTime::Signing)
+                        .is_ok()
+                );
+                let err = ring
+                    .verify_detached(TEXT_SIG, data, Signed::Bytes, now(), KeyTime::Signing)
+                    .unwrap_err();
+                assert!(
+                    err.to_string().contains("not a binary document signature"),
+                    "{err}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_signature_cannot_predate_its_key() {
+            for keys in [KeyTime::Signing, KeyTime::Now] {
+                let err = keyring(&[OTHER])
+                    .verify_detached(BACKDATED_SIG, TOOL, Signed::Bytes, now(), keys)
+                    .unwrap_err();
+                assert!(err.to_string().contains("dated before its key"), "{err}");
+            }
+        }
+
+        #[test]
+        fn a_revoked_key_vouches_for_nothing() {
+            assert_eq!(fps(keyring(&[RELEASE]).vouching()), [RELEASE_FP]);
+            assert!(keyring(&[REVOKED]).vouching().is_empty());
+            assert_eq!(keyring(&[REVOKED]).fingerprints().len(), 1);
         }
     }
 }

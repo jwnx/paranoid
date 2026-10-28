@@ -11,7 +11,9 @@ use crate::hash::Sha256;
 use crate::http::{Client, ClientError, Retry};
 use crate::lock::{LockFile, LockedFile, Trust};
 use crate::report::Reporter;
-use crate::repository::debian::{Fingerprint, KeyTime, Keyring, KeyringError, VerifyError};
+use crate::repository::debian::{
+    Fingerprint, KeyTime, Keyring, KeyringError, Signed as SignedAs, VerifyError,
+};
 
 /// The most `lock` reads of a file before it knows the file's size.
 pub const MAX_FILE_SIZE: u64 = 4 << 30;
@@ -179,7 +181,7 @@ fn still_stands(old: &LockedFile, spec: &FileSpec, keyring: Option<&Keyring>) ->
     let signed = match (keyring, old.trust) {
         (None, Trust::Pinned) => true,
         (Some(keyring), Trust::Signed) => {
-            let trusted = keyring.fingerprints();
+            let trusted = keyring.vouching();
             old.signed_by.iter().any(|fp| trusted.contains(fp))
         }
         _ => false,
@@ -210,7 +212,7 @@ impl Fetcher {
             let signature = spec.signature.as_ref().expect("a signed file has one");
             let sig = self.fetch(signature, MAX_SIGNED_SIZE).await?;
             let data = self.fetch(&spec.url, MAX_FILE_SIZE).await?;
-            let signers = self.verify(keyring, &sig, &data, &spec.url)?;
+            let signers = self.verify(keyring, &sig, &data, SignedAs::Bytes, &spec.url)?;
             return Ok(Signed {
                 sha256: Sha256::of(&data),
                 signers,
@@ -222,7 +224,7 @@ impl Fetcher {
         let (text, signers) = match &spec.signature {
             Some(signature) => {
                 let sig = self.fetch(signature, MAX_SIGNED_SIZE).await?;
-                let signers = self.verify(keyring, &sig, &sums, checksums)?;
+                let signers = self.verify(keyring, &sig, &sums, SignedAs::Text, checksums)?;
                 (String::from_utf8_lossy(&sums).into_owned(), signers)
             }
             None => {
@@ -272,10 +274,11 @@ impl Fetcher {
         keyring: &Keyring,
         signature: &[u8],
         data: &[u8],
+        signed: SignedAs,
         url: &Url,
     ) -> Result<Vec<Fingerprint>, FileError> {
         keyring
-            .verify_detached(signature, data, self.now, KeyTime::Signing)
+            .verify_detached(signature, data, signed, self.now, KeyTime::Signing)
             .map_err(|source| FileError::Verify {
                 url: url.to_string(),
                 source,

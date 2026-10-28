@@ -361,10 +361,20 @@ checksums file, as with `SHA256SUMS` and `SHA256SUMS.sig`. A checksums
 file lists the file by the last part of its URL. `lock` checks the
 signature the way it checks a repository's, with one difference: a key
 only has to have been valid when it signed, since a release outlives the
-key that signed it. A revoked key never counts. The lock records the hash
-with `trust = "signed"` and the signers' fingerprints, and stays current
-only while `signed_by` still has one of them. `sha256` is optional for a
-signed file; when it's there, the signature has to agree with it.
+key that signed it. A signature dated before its key was made, or in the
+future, doesn't count, and neither does a revoked key. A signature over
+the file itself has to be a binary one: a text signature ignores line
+endings, so it would vouch for bytes nobody signed. The lock records the
+hash with `trust = "signed"` and the signers' fingerprints, and stays
+current only while `signed_by` still has one of them that isn't revoked;
+add a revocation to `signed_by` and the next `lock` checks the file again.
+`sha256` is optional for a signed file; when it's there, the signature
+has to agree with it. `lock --force` checks every file again.
+
+A signature says who made a file, not which release it is: anything the
+key ever signed checks out, and so does an older checksums file that lists
+the same name. Prefer URLs and checksums names with the version in them,
+like the ones above, over `latest` links, or pin `sha256` as well.
 
 Publishers retire keys from the files they publish. Go's 1.23 tarballs
 were signed by a Google subkey that's gone from Google's current key, so

@@ -378,10 +378,12 @@ impl LockFile {
     }
 
     /// Whether the lock still stands for the manifest: it was resolved from
-    /// this manifest, and each snapshot and signed file it records was
-    /// signed by a key the manifest still trusts for it. The config hash
-    /// covers the `signed_by` paths but not what's in the files, hence the
-    /// second check.
+    /// this manifest, each snapshot and signed file it records was signed
+    /// by a key the manifest still trusts for it and that isn't revoked,
+    /// and each file is recorded the way the manifest asks for it: from
+    /// the same URLs, with the same pin, signed if and only if the
+    /// manifest names keys. The config hash covers the `signed_by` paths
+    /// but not what's in the files, nor what the lock says, hence the rest.
     pub fn is_current(&self, manifest: &Manifest) -> Result<bool, LockFileError> {
         if !self.matches_config(manifest) {
             return Ok(false);
@@ -397,18 +399,25 @@ impl LockFile {
                         source: Box::new(source),
                     }
                 })?;
-            let trusted = keyring.fingerprints();
+            let trusted = keyring.vouching();
             if !repo.signed_by.iter().any(|fp| trusted.contains(fp)) {
                 return Ok(false);
             }
         }
-        for file in self.files.iter().filter(|f| f.trust == Trust::Signed) {
-            let Some(signed_by) = manifest
-                .files
-                .get(&file.name)
-                .and_then(|spec| spec.signed_by.as_ref())
-            else {
+        for file in &self.files {
+            let Some(spec) = manifest.files.get(&file.name) else {
                 return Ok(false);
+            };
+            let as_asked = file.url == spec.url
+                && file.signature == spec.signature
+                && file.checksums == spec.checksums
+                && spec.sha256.is_none_or(|sha256| sha256 == file.sha256)
+                && (file.trust == Trust::Signed) == spec.signed_by.is_some();
+            if !as_asked {
+                return Ok(false);
+            }
+            let Some(signed_by) = &spec.signed_by else {
+                continue;
             };
             let keyring = Keyring::load(&manifest.resolve_path(signed_by)).map_err(|source| {
                 LockFileError::FileKeyring {
@@ -416,7 +425,7 @@ impl LockFile {
                     source: Box::new(source),
                 }
             })?;
-            let trusted = keyring.fingerprints();
+            let trusted = keyring.vouching();
             if !file.signed_by.iter().any(|fp| trusted.contains(fp)) {
                 return Ok(false);
             }
@@ -780,10 +789,31 @@ direct = ["bash"]
         }];
         assert!(lock.is_current(&trusted).unwrap());
 
+        // A lock edited to say the file is only pinned.
+        lock.files[0].trust = Trust::Pinned;
+        assert!(!lock.is_current(&trusted).unwrap());
+        lock.files[0].trust = Trust::Signed;
+
         // The same keyring path with other keys in it.
         let stranger = manifest("stranger.asc");
         lock.config_hash = LockFile::compute_config_hash(&stranger);
         assert!(!lock.is_current(&stranger).unwrap());
+
+        // A signer that has been revoked since.
+        let revoked = manifest("revoked.asc");
+        lock.config_hash = LockFile::compute_config_hash(&revoked);
+        lock.files[0].signed_by =
+            vec![serde_json::from_str("\"42D7C88C41C585732BDAEFACB8BA386B1127FC7C\"").unwrap()];
+        assert!(!lock.is_current(&revoked).unwrap());
+    }
+
+    #[test]
+    fn a_pinned_file_has_to_have_the_manifests_hash() {
+        let (manifest, mut lock) = with_tini();
+        lock.repositories.clear();
+        assert!(lock.is_current(&manifest).unwrap());
+        lock.files[0].sha256 = TEST_HASH_2.parse().unwrap();
+        assert!(!lock.is_current(&manifest).unwrap());
     }
 
     #[test]

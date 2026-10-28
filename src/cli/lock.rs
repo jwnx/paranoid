@@ -26,7 +26,8 @@ pub struct LockArgs {
     #[arg(short, long, value_name = "FILE")]
     output: Option<PathBuf>,
 
-    /// Re-resolve even if the lock file is already up to date.
+    /// Re-resolve, and check every file again, even if the lock file is
+    /// already up to date.
     #[arg(long)]
     force: bool,
 
@@ -184,7 +185,9 @@ pub async fn run(args: LockArgs, quiet: bool) -> Result<(), CliError> {
         .map_err(CliError::files)?;
         let downloads = DownloadService::with_cache(cache, DownloadConfig::default())
             .map_err(CliError::files)?;
-        files::lock(&manifest, existing.as_ref(), &downloads, &())
+        // `--force` checks every file again too.
+        let existing = existing.as_ref().filter(|_| !args.force);
+        files::lock(&manifest, existing, &downloads, &())
             .await
             .map_err(CliError::files)?
     };
