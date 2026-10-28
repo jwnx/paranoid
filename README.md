@@ -333,18 +333,54 @@ every file. In a set, each image names the ones it wants with
 `files = ["tini"]`, and an image may have files and no packages.
 
 `paranoid lock` downloads each file, checks it against `sha256` and
-records it in the lock with its size. Nothing signs these files: the hash
-in the manifest is all that vouches for them, which the lock records as
+records it in the lock with its size. With only `sha256`, the hash in the
+manifest is all that vouches for a file, which the lock records as
 `trust = "pinned"`. Review a new hash the way you would a new dependency.
+
+When the publisher signs its releases, name the keys with `signed_by`, as
+for a repository, and say where the signature is:
+
+```toml
+[files.go]                                   # a signature over the file
+url       = "https://go.dev/dl/go1.27.3.linux-arm64.tar.gz"
+signature = "https://go.dev/dl/go1.27.3.linux-arm64.tar.gz.asc"
+signed_by = "keys/google-linux.asc"
+extract   = "go/"
+path      = "/usr/local/go"
+
+[files.node]                                 # a clearsigned checksums file
+url       = "https://nodejs.org/dist/v26.13.0/node-v26.13.0-linux-arm64.tar.xz"
+checksums = "https://nodejs.org/dist/v26.13.0/SHASUMS256.txt.asc"
+signed_by = "keys/node-release.asc"
+extract   = "node-v26.13.0-linux-arm64/bin/node"
+path      = "/usr/local/bin/node"
+```
+
+With both `checksums` and `signature`, the signature is over the
+checksums file, as with `SHA256SUMS` and `SHA256SUMS.sig`. A checksums
+file lists the file by the last part of its URL. `lock` checks the
+signature the way it checks a repository's, with one difference: a key
+only has to have been valid when it signed, since a release outlives the
+key that signed it. A revoked key never counts. The lock records the hash
+with `trust = "signed"` and the signers' fingerprints, and stays current
+only while `signed_by` still has one of them. `sha256` is optional for a
+signed file; when it's there, the signature has to agree with it.
+
+Publishers retire keys from the files they publish. Go's 1.23 tarballs
+were signed by a Google subkey that's gone from Google's current key, so
+keep the key file that verified a release next to the manifest rather
+than fetching it again.
+
 `build` checks each file against the lock, like a package, and places the
 files after every package. A file can add to a directory that's there,
 like `/usr/local/bin`, but it can't replace anything a package installed,
-or another file.
+or another file. Nothing checks that a binary's libraries are in the
+image, so list them as packages: Node needs `libstdc++6` and
+`libatomic1`.
 
 dpkg doesn't know about files, so scanners that read its database, like
 trivy and syft, won't see them. [`docs/files.md`](docs/files.md) has what
-comes next: signed URLs, and versions resolved from Go's and GitHub's
-release lists.
+comes next: versions resolved from Go's and GitHub's release lists.
 
 ## LOCK
 

@@ -1,6 +1,7 @@
 # Files
 
-Status: phase 1 (pinned URLs) is implemented. The rest is a proposal.
+Status: phases 1 and 2 (pinned and signed URLs) are implemented. The rest
+is a proposal.
 
 ## Why
 
@@ -157,9 +158,10 @@ contract:
 1. **Pinned URLs:** `url` and `sha256`, `extract`, lock, build, stores,
    cache push and diff. This is what's being built now.
 2. **Signed URLs:** a detached OpenPGP signature over the file
-   (`signature`), or over a checksums file that lists it (`checksums`,
-   the `SHA256SUMS` + `SHA256SUMS.asc` pattern), checked with `signed_by`
-   at lock time. Uses the OpenPGP code we already have.
+   (`signature`), a clearsigned checksums file that lists it
+   (`checksums`), or a checksums file with a detached signature over it
+   (both), checked with `signed_by` at lock time. A key only has to have
+   been valid when it signed, since releases outlive their keys.
 3. **Go:** resolve `go = "1.23"` against `go.dev/dl/?mode=json`, check the
    tarball's `.asc`, and `extract = "go/"` by default.
 4. **GitHub releases:** resolve `version` against the Releases API and
