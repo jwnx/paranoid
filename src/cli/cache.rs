@@ -1,4 +1,4 @@
-//! `paranoid cache`: fill a store with the lock's packages.
+//! `paranoid cache`: fill a store with the lock's packages and files.
 
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -7,10 +7,12 @@ use clap::{Parser, Subcommand};
 use url::Url;
 
 use paranoid::config::Manifest;
-use paranoid::download::{DownloadConfig, DownloadService, PackageCache, Sources};
+use paranoid::download::{
+    Blob, DownloadConfig, DownloadFailures, DownloadService, PackageCache, Sources,
+};
 use paranoid::http::Retry;
-use paranoid::lock::{LockFile, LockedPackage};
-use paranoid::store::{PushFailures, Store};
+use paranoid::lock::LockFile;
+use paranoid::store::{PushFailures, PushReport, Store};
 
 use super::error::CliError;
 use super::progress::DotsReporter;
@@ -24,7 +26,7 @@ pub struct CacheArgs {
 
 #[derive(Subcommand)]
 enum CacheCommand {
-    /// Upload the lock's packages that a store doesn't have yet.
+    /// Upload the lock's packages and files that a store doesn't have yet.
     Push(PushArgs),
 }
 
@@ -104,58 +106,126 @@ async fn push(args: PushArgs, quiet: bool) -> Result<(), CliError> {
         }
     };
 
-    let packages: Vec<&LockedPackage> = lock.packages.iter().collect();
-    let missing = store.missing(&packages, args.jobs).await.map_err(refused)?;
-    let present = packages.len() - missing.len();
-
     let reporter = DotsReporter::new(quiet);
-    let pushed = if missing.is_empty() {
-        None
-    } else {
-        let cache = match &args.cache_dir {
-            Some(dir) => PackageCache::with_base_dir(dir.clone()),
-            None => PackageCache::new(),
-        }
-        .map_err(CliError::push)?;
-        let config = DownloadConfig {
-            jobs: args.jobs,
-            ..DownloadConfig::default()
-        };
-        let downloader = DownloadService::with_cache(cache, config).map_err(CliError::push)?;
-        // Not from the store we're filling: it may hold a broken copy,
-        // which is why we're pushing.
-        let stores: Vec<Url> = manifest
-            .stores
-            .iter()
-            .filter(|url| !store.is_at(url))
-            .cloned()
-            .collect();
-        let sources = Sources {
+    let cache = match &args.cache_dir {
+        Some(dir) => PackageCache::with_base_dir(dir.clone()),
+        None => PackageCache::new(),
+    }
+    .map_err(CliError::push)?;
+    let config = DownloadConfig {
+        jobs: args.jobs,
+        ..DownloadConfig::default()
+    };
+    let downloader = DownloadService::with_cache(cache, config).map_err(CliError::push)?;
+    // Not from the store we're filling: it may hold a broken copy, which
+    // is why we're pushing.
+    let stores: Vec<Url> = manifest
+        .stores
+        .iter()
+        .filter(|url| !store.is_at(url))
+        .cloned()
+        .collect();
+    let filler = Filler {
+        store: &store,
+        downloader: &downloader,
+        sources: Sources {
             stores: &stores,
             repositories: &manifest.repositories,
-        };
-        let fetched = downloader
-            .download_all(&missing, sources, &reporter)
-            .await
-            .map_err(CliError::push)?;
-        Some(
-            store
-                .push(&fetched, args.jobs, &reporter)
-                .await
-                .map_err(refused)?,
-        )
+        },
+        jobs: args.jobs,
+        reporter: &reporter,
     };
+    let fail = |e| match e {
+        FillError::Download(e) => CliError::push(e),
+        FillError::Push(e) => refused(e),
+    };
+    let packages = filler.fill(&lock.packages).await.map_err(fail)?;
+    let files = filler.fill(&lock.files).await.map_err(fail)?;
 
     if !quiet {
         let unsigned = if unsigned { ", unsigned" } else { "" };
-        match pushed {
-            Some(report) => eprintln!(
-                "Pushed {} packages ({}) to {store}{unsigned}; {present} were there already.",
-                report.pushed,
-                st::fmt_size(report.bytes),
-            ),
-            None => eprintln!("{store} has all {present} packages."),
+        let present = packages.present + files.present;
+        let pushed = |f: &Filled| f.pushed.as_ref().map_or(0, |r| r.pushed);
+        let bytes = |f: &Filled| f.pushed.as_ref().map_or(0, |r| r.bytes);
+        if packages.pushed.is_none() && files.pushed.is_none() {
+            eprintln!(
+                "{store} has all {}.",
+                counted(lock.packages.len(), lock.files.len())
+            );
+        } else {
+            eprintln!(
+                "Pushed {} ({}) to {store}{unsigned}; {present} were there already.",
+                counted(pushed(&packages), pushed(&files)),
+                st::fmt_size(bytes(&packages) + bytes(&files)),
+            );
         }
     }
     Ok(())
+}
+
+/// "3 packages", or "3 packages and 1 file" when there are files.
+fn counted(packages: usize, files: usize) -> String {
+    match files {
+        0 => format!("{packages} packages"),
+        1 => format!("{packages} packages and 1 file"),
+        n => format!("{packages} packages and {n} files"),
+    }
+}
+
+/// Fills a store with what it lacks of a lock's packages or files.
+struct Filler<'a> {
+    store: &'a Store,
+    downloader: &'a DownloadService,
+    /// Where to download what the cache doesn't have.
+    sources: Sources<'a>,
+    jobs: NonZeroUsize,
+    reporter: &'a DotsReporter,
+}
+
+/// Why a [`Filler`] failed.
+enum FillError {
+    /// What was missing couldn't be downloaded.
+    Download(DownloadFailures),
+    /// The store refused what was.
+    Push(PushFailures),
+}
+
+/// What a [`Filler`] did.
+struct Filled {
+    /// How many the store had already.
+    present: usize,
+    /// What was pushed, unless nothing was missing.
+    pushed: Option<PushReport>,
+}
+
+impl Filler<'_> {
+    async fn fill<B: Blob + Sync>(&self, blobs: &[B]) -> Result<Filled, FillError> {
+        let blobs: Vec<&B> = blobs.iter().collect();
+        let missing = self
+            .store
+            .missing(&blobs, self.jobs)
+            .await
+            .map_err(FillError::Push)?;
+        let present = blobs.len() - missing.len();
+        if missing.is_empty() {
+            return Ok(Filled {
+                present,
+                pushed: None,
+            });
+        }
+        let fetched = self
+            .downloader
+            .download_all(&missing, self.sources, self.reporter)
+            .await
+            .map_err(FillError::Download)?;
+        let pushed = self
+            .store
+            .push(&fetched, self.jobs, self.reporter)
+            .await
+            .map_err(FillError::Push)?;
+        Ok(Filled {
+            present,
+            pushed: Some(pushed),
+        })
+    }
 }
