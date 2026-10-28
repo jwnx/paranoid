@@ -3,6 +3,7 @@ pub mod apt;
 pub mod arch;
 pub mod build;
 pub mod config;
+pub mod configure;
 pub mod deb;
 pub mod download;
 pub mod dpkg;

@@ -319,6 +319,18 @@ impl Rootfs {
         before - self.nodes.len()
     }
 
+    /// Make `path`, and everything under it, what it is in `before`:
+    /// gone if `before` has nothing there.
+    pub(crate) fn restore(&mut self, before: &Rootfs, path: &str) {
+        self.remove_tree(path);
+        let prefix = format!("{path}/");
+        for (p, node) in before.iter() {
+            if p == path || p.starts_with(&prefix) {
+                self.nodes.insert(p.to_string(), node.clone());
+            }
+        }
+    }
+
     /// Put `node` at `path`, an entry that's there already.
     pub(crate) fn replace_node(&mut self, path: &str, node: Node) -> Result<(), RootfsError> {
         self.replace(path.to_string(), node)

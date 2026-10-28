@@ -28,6 +28,7 @@ fn presentation(phase: Phase) -> (&'static str, fn(u64) -> String) {
         Phase::Download => ("Downloading packages", style::fmt_size),
         Phase::DownloadFiles => ("Downloading files", style::fmt_size),
         Phase::Assemble => ("Installing packages", |n| format!("{n} files")),
+        Phase::Configure => ("Configuring", |n| format!("{n} packages")),
         Phase::Image => ("Building image", style::fmt_size),
         Phase::Push => ("Pushing packages", style::fmt_size),
         Phase::PushFiles => ("Pushing files", style::fmt_size),

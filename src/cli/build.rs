@@ -7,6 +7,7 @@ use clap::Parser;
 
 use paranoid::build::{BuildOptions, build};
 use paranoid::config::Manifest;
+use paranoid::configure::Runtime;
 use paranoid::download::DownloadConfig;
 use paranoid::lock::LockFile;
 use paranoid::oci::{ImageOutput, Timestamp};
@@ -46,6 +47,11 @@ pub struct BuildArgs {
     /// Directory to hold downloaded packages (defaults to system cache).
     #[arg(long, value_name = "DIR")]
     cache_dir: Option<PathBuf>,
+
+    /// What runs an image's maintainer scripts when it asks to be
+    /// configured: podman or docker. Defaults to the first on PATH.
+    #[arg(long, value_name = "podman|docker")]
+    runtime: Option<Runtime>,
 
     /// Re-download packages even if they are cached.
     #[arg(long)]
@@ -135,6 +141,7 @@ pub async fn run(args: BuildArgs, quiet: bool) -> Result<(), CliError> {
             cache_dir: args.cache_dir.clone(),
             output: ImageOutput::from_path(&output),
             created: created.clone(),
+            runtime: args.runtime,
         };
         if !quiet && images.len() > 1 {
             eprintln!("== {id}");

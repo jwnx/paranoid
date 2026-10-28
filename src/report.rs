@@ -16,6 +16,9 @@ pub enum Phase {
     DownloadFiles,
     /// Applying packages to the rootfs. Work is measured in packages.
     Assemble,
+    /// Running maintainer scripts in a container. Work is measured in
+    /// steps.
+    Configure,
     /// Writing the layer and image. Work is measured in steps.
     Image,
     /// Uploading packages to a store. Work is measured in bytes.

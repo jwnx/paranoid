@@ -83,6 +83,10 @@ pub struct ImageSpec {
     /// to run later in the image (say, in a Dockerfile). paranoid itself
     /// never runs them.
     pub unconfigured: bool,
+    /// Run every package's maintainer scripts, as `dpkg --configure`
+    /// would on a Debian system, in a container, so the image comes out
+    /// finished. See `docs/configure.md`.
+    pub configure: bool,
     /// What the image asks for, groups expanded.
     pub packages: Vec<PackageSpec>,
     /// The ids of the files it gets, in manifest order.
@@ -154,6 +158,8 @@ struct RawImageConfig {
     #[serde(default)]
     unconfigured: bool,
     #[serde(default)]
+    configure: bool,
+    #[serde(default)]
     locales: Vec<String>,
     #[serde(default)]
     apt_sources: bool,
@@ -171,6 +177,7 @@ struct RawDefaults {
     authors: Option<String>,
     source: Option<String>,
     unconfigured: Option<bool>,
+    configure: Option<bool>,
     locales: Option<Vec<String>>,
     apt_sources: Option<bool>,
     entrypoint: Option<EntrypointConfig>,
@@ -187,6 +194,7 @@ struct RawImage {
     authors: Option<String>,
     source: Option<String>,
     unconfigured: Option<bool>,
+    configure: Option<bool>,
     #[serde(default)]
     groups: Vec<String>,
     #[serde(default)]
@@ -246,6 +254,7 @@ impl RawManifest {
                         authors: i.authors,
                         source: i.source,
                         unconfigured: i.unconfigured,
+                        configure: i.configure,
                         packages: with_locales_all(self.packages, &i.locales),
                         files: self.files.keys().cloned().collect(),
                         locales: i.locales,
@@ -326,6 +335,7 @@ impl RawManifest {
                 authors: raw.authors.or_else(|| defaults.authors.clone()),
                 source: raw.source.or_else(|| defaults.source.clone()),
                 unconfigured: raw.unconfigured.or(defaults.unconfigured).unwrap_or(false),
+                configure: raw.configure.or(defaults.configure).unwrap_or(false),
                 packages: with_locales_all(packages, &locales),
                 files: raw.files,
                 locales,
@@ -861,6 +871,12 @@ impl Manifest {
         }
 
         for (id, image) in &self.images {
+            if image.configure && image.unconfigured {
+                return Err(ManifestError::Validation {
+                    field: "configure",
+                    message: format!("image '{id}' can't be both configured and unconfigured"),
+                });
+            }
             if let Some(bad) = image.locales.iter().find(|l| !is_locale_name(l)) {
                 return Err(ManifestError::Validation {
                     field: "locales",

@@ -15,6 +15,7 @@ use crate::accounts::{self, AccountsError};
 use crate::apt::{self, AptError};
 use crate::arch::Architecture;
 use crate::config::{FileSpec, Manifest};
+use crate::configure::{self, ConfigureError, Runtime};
 use crate::deb::{DebArchive, DebError};
 use crate::download::{
     DownloadConfig, DownloadError, DownloadFailures, DownloadService, Fetched, Origin,
@@ -39,6 +40,9 @@ pub struct BuildOptions {
     /// Image creation time. Pin it (e.g. from `SOURCE_DATE_EPOCH`) for
     /// reproducible images.
     pub created: Timestamp,
+    /// What configures an image that asks for it; podman or Docker on
+    /// `PATH` when `None`.
+    pub runtime: Option<Runtime>,
 }
 
 /// What a build produced.
@@ -77,6 +81,9 @@ pub enum BuildError {
 
     #[error("failed to write the accounts")]
     Accounts(#[from] AccountsError),
+
+    #[error("failed to configure the image")]
+    Configure(#[from] ConfigureError),
 
     #[error("failed to configure apt")]
     Apt(#[from] AptError),
@@ -168,7 +175,7 @@ pub async fn build(
             .await?
     };
 
-    let state = if spec.unconfigured {
+    let state = if spec.unconfigured || spec.configure {
         PackageState::Unpacked
     } else {
         PackageState::Installed
@@ -188,6 +195,28 @@ pub async fn build(
     }
     if !manifest.paths.is_empty() {
         paths::apply(&mut rootfs, &manifest.paths)?;
+    }
+    if spec.configure {
+        let runtime = options
+            .runtime
+            .or_else(Runtime::detect)
+            .ok_or(ConfigureError::NoRuntime)?;
+        let packages = packages.len() as u64;
+        reporter.report(Event::Begin {
+            phase: Phase::Configure,
+            total: 1,
+        });
+        let epoch = options.created.as_datetime().timestamp();
+        rootfs = configure::configure(&rootfs, runtime, manifest.architecture, epoch).await?;
+        reporter.report(Event::Advance {
+            phase: Phase::Configure,
+            units: 1,
+            item: &runtime.to_string(),
+        });
+        reporter.report(Event::End {
+            phase: Phase::Configure,
+            summary: packages,
+        });
     }
     let image = crate::oci::write_image(&config, &rootfs, &options.output, reporter)?;
 
