@@ -736,25 +736,34 @@ With `configure = true` under `[image]`, `[defaults]` or `[images.<id>]`,
    and nothing on stdin, in debootstrap's order: base-passwd first, then
    every package that's required or essential, then the rest. `dpkg
    --audit` has to find nothing. The scripts see
-   `DEBIAN_FRONTEND=noninteractive`, `LC_ALL=C.UTF-8`, `TZ=UTC` and the
-   build's `SOURCE_DATE_EPOCH`.
+   `DEBIAN_FRONTEND=noninteractive`, `LC_ALL=C.UTF-8`, `TZ=UTC`, the
+   hostname `localhost` and the build's `SOURCE_DATE_EPOCH`. A conffile the
+   manifest declares in `[paths]` or `[files]` stays as declared
+   (`--force-confold`), and the package's version beside it goes.
 3. The container's filesystem is read back. What the runtime mounts over
-   (`/etc/hosts`, `/dev`, ...) goes back to what the image had, and what
-   varies from one run to the next goes: dpkg's and alternatives' logs,
-   the `*-old` backups, ldconfig's aux-cache, ssl-cert's snakeoil key
-   pair, machine IDs and the `policy-rc.d`. `/etc/shadow`'s day of last
-   change is the build's.
+   (`/etc/hosts`, `/dev`, ...) goes back to what the image had, along
+   with `/run`, `/tmp` and `/var/tmp`, and what varies from one run to
+   the next goes: dpkg's and alternatives' logs, the `*-old` and
+   `/etc/shadow-` style backups, ldconfig's aux-cache, ssl-cert's
+   snakeoil key pair, machine IDs and the `policy-rc.d`. `/etc/shadow`'s
+   day of last change is the build's. Since the runtime mounts its own
+   `/etc/hosts`, a script that writes one (netbase's) writes it there; if
+   the image needs one, declare it in `[paths]`.
 4. What the manifest declares wins: directories in `[paths]` get their
    owner and mode back, and a script that changed a declared file,
    symlink or account fails the build.
 
 The image needs dash and dpkg, and whatever the scripts call, and since
 nothing pulls Essential packages in, you list them. The scripts run as
-root in the container, as they would under apt. The same lock and
-paranoid version give the same image whichever runtime runs them. No
-cleanup list is ever complete, though: `--check-reproducible` configures
-twice and fails naming every path that came out different, such as the
-host keys openssh-server's `postinst` generates. A container emulates
+root in the container, as they would under apt. Ctrl-C or SIGTERM while
+they run removes the container and its image. The same lock and paranoid
+version give the same image whichever runtime runs them. No cleanup list
+is ever complete, though: `--check-reproducible` configures twice and
+fails naming every path that came out different, such as the host keys
+openssh-server's `postinst` generates. Both runs happen on the same day,
+on the same machine, so it can't see what depends on the date or the
+kernel; building on another day, or another machine, and comparing
+digests can. A container emulates
 another architecture slowly, if the runtime can at all (binfmt and
 qemu-user-static on Linux; podman machine and Docker Desktop do it on
 macOS). Extended attributes, like the file capabilities `setcap` gives

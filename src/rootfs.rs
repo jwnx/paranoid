@@ -287,7 +287,9 @@ impl Rootfs {
             match entry_type {
                 tar::EntryType::Directory => self.add_dir(path, meta)?,
                 tar::EntryType::Regular | tar::EntryType::Continuous => {
-                    let mut data = Vec::with_capacity(entry.size() as usize);
+                    // A header can claim any size; don't trust it with the
+                    // allocation.
+                    let mut data = Vec::with_capacity(entry.size().min(64 << 20) as usize);
                     entry.read_to_end(&mut data)?;
                     self.replace(path, Node::File(meta, data.into()))?;
                 }

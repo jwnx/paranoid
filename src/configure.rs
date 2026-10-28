@@ -86,6 +86,9 @@ pub enum ConfigureError {
     #[error("could not run {0}")]
     Spawn(Runtime, #[source] std::io::Error),
 
+    #[error("interrupted by {0}")]
+    Interrupted(&'static str),
+
     #[error("could not stage the image for the container")]
     Io(#[from] std::io::Error),
 
@@ -102,10 +105,35 @@ pub enum ConfigureError {
 /// How many lines of a failed step's output an error shows.
 const OUTPUT_LINES: usize = 40;
 
+/// What of a failed step's output an error shows: dpkg's errors, which a
+/// long list of packages it then gave up on can push out of sight, and
+/// the last lines.
+fn summary(output: &str) -> String {
+    let lines: Vec<&str> = output.lines().collect();
+    let tail = &lines[lines.len().saturating_sub(OUTPUT_LINES)..];
+    let mut summary: Vec<&str> = lines[..lines.len() - tail.len()]
+        .iter()
+        .filter(|l| l.starts_with("dpkg: error") || l.starts_with("dpkg: ") && l.contains("error"))
+        .take(OUTPUT_LINES / 4)
+        .copied()
+        .collect();
+    if !summary.is_empty() {
+        summary.push("...");
+    }
+    summary.extend(tail);
+    summary.join("\n")
+}
+
 /// What a container runtime makes in a container's filesystem for itself:
 /// the files it mounts over, and the filesystems it mounts. They go back
 /// to what the image had.
+///
+/// `/run`, `/tmp` and `/var/tmp` go back too: what a script leaves there
+/// has a name `mktemp` picked, and a container gets `/run` empty anyway.
 const RUNTIME_PATHS: &[&str] = &[
+    "run",
+    "tmp",
+    "var/tmp",
     ".dockerenv",
     "run/.containerenv",
     "run/secrets",
@@ -155,15 +183,19 @@ pub async fn configure(
     }
 
     let dir = tempfile::tempdir()?;
-    let container = Container::create(runtime, &staged, arch, dir.path()).await?;
+    let mut container = Container::create(runtime, &staged, arch, dir.path()).await?;
     let script = script(
         &required(rootfs),
         rootfs.get("var/lib/dpkg/info/base-passwd.list").is_some(),
     );
-    let result = container.run(&script, source_date_epoch).await;
-    let exported = match result {
-        Ok(()) => container.export(dir.path()).await,
-        Err(e) => Err(e),
+    // Ctrl-C or a SIGTERM while the scripts run removes the container and
+    // its image before paranoid exits, rather than leaving them behind.
+    let exported = tokio::select! {
+        result = async {
+            container.run(&script, source_date_epoch).await?;
+            container.export(dir.path()).await
+        } => result,
+        signal = interrupted() => Err(ConfigureError::Interrupted(signal)),
     };
     container.remove().await;
     let mut configured = Rootfs::new();
@@ -179,21 +211,34 @@ pub async fn configure(
     Ok(configured)
 }
 
+/// Wait for Ctrl-C or SIGTERM, and say which.
+async fn interrupted() -> &'static str {
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => "SIGINT",
+        Some(()) = async { term.as_mut()?.recv().await } => "SIGTERM",
+    }
+}
+
 /// The script the container runs: base-passwd first, then the required
 /// set, then everything else, then an audit, as debootstrap does.
 fn script(required: &[String], base_passwd: bool) -> String {
     let mut script = String::from(
         "set -eu\n\
-         exec </dev/null\n",
+         exec </dev/null 2>&1\n",
     );
     // Users and groups first: other packages' scripts chown to them.
     if base_passwd {
-        script.push_str("dpkg --configure --force-depends base-passwd\n");
+        script.push_str(
+            "dpkg --configure --force-depends --force-confdef --force-confold base-passwd\n",
+        );
     }
     // Essential packages depend on each other in cycles dpkg can't order,
     // and packages assume the required set is set up without saying so.
     if !required.is_empty() {
-        script.push_str("dpkg --configure --force-depends --force-configure-any");
+        script.push_str(
+            "dpkg --configure --force-depends --force-configure-any --force-confdef --force-confold",
+        );
         for package in required {
             script.push(' ');
             script.push_str(package);
@@ -201,7 +246,8 @@ fn script(required: &[String], base_passwd: bool) -> String {
         script.push('\n');
     }
     script.push_str(
-        "dpkg --configure --pending --force-depends --force-configure-any\n\
+        "dpkg --configure --pending --force-depends --force-configure-any \
+         --force-confdef --force-confold\n\
          audit=$(dpkg --audit)\n\
          if [ -n \"$audit\" ]; then echo \"$audit\" >&2; exit 1; fi\n",
     );
@@ -226,7 +272,13 @@ fn required(rootfs: &Rootfs) -> Vec<String> {
             let package = field("Package")?;
             let required =
                 field("Priority") == Some("required") || field("Essential") == Some("yes");
-            (required && package != "base-passwd").then(|| package.to_string())
+            let unpacked = field("Status").is_some_and(|s| s.ends_with(" unpacked"));
+            // It goes into a shell command, so only what Debian allows in
+            // a package name.
+            let valid = package.chars().all(|c| {
+                c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '+' | '-' | '.')
+            });
+            (required && unpacked && valid && package != "base-passwd").then(|| package.to_string())
         })
         .collect()
 }
@@ -246,6 +298,13 @@ fn clean(rootfs: &mut Rootfs, source_date_epoch: i64) {
         "etc/ssl/certs/ssl-cert-snakeoil.pem",
         "etc/machine-id",
         "var/lib/dbus/machine-id",
+        // The backups shadow's tools make, with today's date in them.
+        "etc/passwd-",
+        "etc/group-",
+        "etc/shadow-",
+        "etc/gshadow-",
+        "etc/subuid-",
+        "etc/subgid-",
     ] {
         rootfs.remove_tree(path);
     }
@@ -258,7 +317,10 @@ fn clean(rootfs: &mut Rootfs, source_date_epoch: i64) {
             // The hash link to the snakeoil certificate.
             let snakeoil = path.starts_with("etc/ssl/certs/")
                 && matches!(node, Node::Symlink(_, target) if target.ends_with("ssl-cert-snakeoil.pem"));
-            backup || snakeoil
+            // The package's version of a conffile the manifest declares,
+            // which `--force-confold` leaves beside ours.
+            let dist = path.ends_with(".dpkg-dist");
+            backup || snakeoil || dist
         })
         .map(|(path, _)| path.to_string())
         .collect();
@@ -272,7 +334,8 @@ fn clean(rootfs: &mut Rootfs, source_date_epoch: i64) {
             .lines()
             .map(|line| {
                 let mut fields: Vec<&str> = line.split(':').collect();
-                if fields.len() > 2 && !fields[2].is_empty() {
+                // 0 means "change it at the next login": keep that.
+                if fields.len() > 2 && !fields[2].is_empty() && fields[2] != "0" {
                     fields[2] = &day;
                 }
                 format!("{}\n", fields.join(":"))
@@ -291,6 +354,26 @@ struct Container {
     image: String,
     name: String,
     platform: String,
+    /// Whether [`Self::remove`] ran; if not, dropping it removes them.
+    removed: bool,
+}
+
+impl Drop for Container {
+    /// Remove the container and its image if a panic, or a future dropped
+    /// halfway, got in the way of [`Container::remove`].
+    fn drop(&mut self) {
+        if self.removed {
+            return;
+        }
+        for args in [["rm", "-f", &self.name], ["rmi", "-f", &self.image]] {
+            let _ = std::process::Command::new(self.runtime.program())
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
 }
 
 impl Container {
@@ -323,6 +406,7 @@ impl Container {
             runtime,
             image: image.reference,
             name: format!("paranoid-configure-{unique}"),
+            removed: false,
             platform: match platform.variant {
                 Some(variant) => format!("linux/{}/{variant}", platform.architecture),
                 None => format!("linux/{}", platform.architecture),
@@ -349,6 +433,9 @@ impl Container {
                 "--platform",
                 &self.platform,
                 "--user=0:0",
+                // A script that records the hostname records this one,
+                // not the runtime's random one.
+                "--hostname=localhost",
                 "--env=DEBIAN_FRONTEND=noninteractive",
                 "--env=LC_ALL=C.UTF-8",
                 "--env=TZ=UTC",
@@ -374,15 +461,17 @@ impl Container {
     }
 
     /// Remove the container and its image, whatever happened.
-    async fn remove(&self) {
+    async fn remove(&mut self) {
         let _ = self.step("rm", &["rm", "-f", &self.name]).await;
         let _ = self.step("rmi", &["rmi", "-f", &self.image]).await;
+        self.removed = true;
     }
 
     async fn step(&self, step: &'static str, args: &[&str]) -> Result<(), ConfigureError> {
         let output = Command::new(self.runtime.program())
             .args(args)
             .stdin(Stdio::null())
+            .kill_on_drop(true)
             .output()
             .await
             .map_err(|e| ConfigureError::Spawn(self.runtime, e))?;
@@ -394,13 +483,11 @@ impl Container {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        let lines: Vec<&str> = text.lines().collect();
-        let tail = lines[lines.len().saturating_sub(OUTPUT_LINES)..].join("\n");
         Err(ConfigureError::Runtime {
             runtime: self.runtime,
             step,
             status: output.status.to_string(),
-            output: tail,
+            output: summary(&text),
         })
     }
 }
@@ -431,18 +518,22 @@ mod tests {
     fn configures_the_required_set_after_base_passwd() {
         let rootfs = with_files(&[(
             "var/lib/dpkg/status",
-            "Package: base-passwd\nEssential: yes\nPriority: required\n\n\
-             Package: bash\nEssential: yes\nPriority: required\n\n\
-             Package: libc6\nPriority: optional\n\n\
-             Package: login\nPriority: required\n\n\
-             Package: postgresql-common\nPriority: optional\n",
+            "Package: base-passwd\nStatus: install ok unpacked\nEssential: yes\n\
+             Priority: required\n\n\
+             Package: bash\nStatus: install ok unpacked\nEssential: yes\nPriority: required\n\n\
+             Package: libc6\nStatus: install ok unpacked\nPriority: optional\n\n\
+             Package: login\nStatus: install ok unpacked\nPriority: required\n\n\
+             Package: mawk\nStatus: install ok installed\nPriority: required\n\n\
+             Package: evil;rm\nStatus: install ok unpacked\nPriority: required\n\n\
+             Package: postgresql-common\nStatus: install ok unpacked\nPriority: optional\n",
         )]);
         let required = required(&rootfs);
         assert_eq!(required, ["bash", "login"]);
         let script = script(&required, true);
-        assert!(script.contains("exec </dev/null"));
-        let base_passwd = script.find("--force-depends base-passwd").unwrap();
-        let essential = script.find("--force-configure-any bash login").unwrap();
+        assert!(script.contains("exec </dev/null 2>&1"));
+        assert_eq!(script.matches("--force-confdef --force-confold").count(), 3);
+        let base_passwd = script.find("--force-confold base-passwd").unwrap();
+        let essential = script.find("--force-confold bash login\n").unwrap();
         let rest = script.find("--configure --pending").unwrap();
         assert!(base_passwd < essential && essential < rest, "{script}");
         assert!(script.contains("dpkg --audit"));
@@ -465,8 +556,12 @@ mod tests {
             ("etc/machine-id", "random"),
             (
                 "etc/shadow",
-                "root:*:20754:0:99999:7:::\nnobody:*::0:99999:7:::\n",
+                "root:*:20754:0:99999:7:::\nnobody:*::0:99999:7:::\nnew:*:0:0:99999:7:::\n",
             ),
+            ("etc/shadow-", "root:*:20754:0:99999:7:::\n"),
+            ("etc/passwd-", "root:x:0:0::/root:/bin/sh\n"),
+            ("etc/adduser.conf", "# ours\n"),
+            ("etc/adduser.conf.dpkg-dist", "# the package's\n"),
         ]);
         let link = Node::Symlink(
             Meta {
@@ -504,6 +599,7 @@ mod tests {
         assert_eq!(
             left,
             [
+                "etc/adduser.conf",
                 "etc/shadow",
                 "etc/ssl/certs/ca-certificates.crt",
                 "var/lib/dpkg/status",
@@ -513,7 +609,7 @@ mod tests {
         match rootfs.get("etc/shadow") {
             Some(Node::File(_, data)) => assert_eq!(
                 &data[..],
-                b"root:*:1000:0:99999:7:::\nnobody:*::0:99999:7:::\n"
+                b"root:*:1000:0:99999:7:::\nnobody:*::0:99999:7:::\nnew:*:0:0:99999:7:::\n"
             ),
             other => panic!("{other:?}"),
         }
@@ -546,5 +642,22 @@ mod tests {
         assert_eq!("podman".parse(), Ok(Runtime::Podman));
         assert_eq!("docker".parse(), Ok(Runtime::Docker));
         assert!("buildah".parse::<Runtime>().is_err());
+    }
+
+    #[test]
+    fn an_error_shows_dpkgs_reason_first() {
+        let mut output = String::from("Setting up adduser ...\n");
+        output.push_str("dpkg: error processing package adduser (--configure):\n");
+        output.push_str(" end of file on stdin at conffile prompt\n");
+        for _ in 0..60 {
+            output.push_str(" adduser\n");
+        }
+        let summary = summary(&output);
+        assert!(
+            summary.starts_with("dpkg: error processing package adduser"),
+            "{summary}"
+        );
+        assert_eq!(summary.lines().count(), 2 + OUTPUT_LINES);
+        assert_eq!(super::summary("short\n"), "short");
     }
 }
