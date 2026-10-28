@@ -1,6 +1,7 @@
 # Configuring images
 
-Status: proposal.
+Status: phase 1 (configuring through podman or Docker) is implemented.
+The rest is a proposal.
 
 ## Why
 

@@ -67,6 +67,7 @@ paranoid lock    [-f MANIFEST] [-o LOCK] [--force] [--allow-unmet] [--json]
 paranoid build   [-f MANIFEST] [--lock LOCK] [-o OUT] [--image ID]...
                  [--cache-dir DIR] [--jobs N] [--force-download]
                  [--allow-stale] [--allow-unmet]
+                 [--runtime podman|docker] [--check-reproducible]
 paranoid cache push    [URL|DIR] [-f MANIFEST] [--lock LOCK] [--cache-dir DIR]
                        [--jobs N]
 paranoid diff    OLD NEW [--json]
@@ -718,10 +719,46 @@ change what they mean.
   signed it are in `signed_by` any more. `--allow-stale` builds from it
   anyway.
 
-paranoid never runs maintainer scripts (`preinst`, `postinst`, ...). By
-default every package is marked installed anyway, so packages that rely on
-their `postinst` to finish setting up (creating users, generating config,
-running `update-alternatives`) won't be fully set up.
+By default paranoid never runs maintainer scripts (`preinst`,
+`postinst`, ...), and every package is marked installed anyway, so
+packages that rely on their `postinst` to finish setting up (generating
+the CA bundle, running `update-alternatives`, setting up PAM) won't be
+fully set up.
+
+With `configure = true` under `[image]`, `[defaults]` or `[images.<id>]`,
+`build` runs them, in a container:
+
+1. The image is assembled unpacked, with its locales, accounts, files,
+   apt sources and paths, and a `policy-rc.d` that keeps services from
+   starting.
+2. It's loaded into podman or Docker (`--runtime`, or whichever is on
+   `PATH` first), and dpkg configures it in a container with no network
+   and nothing on stdin, in debootstrap's order: base-passwd first, then
+   every package that's required or essential, then the rest. `dpkg
+   --audit` has to find nothing. The scripts see
+   `DEBIAN_FRONTEND=noninteractive`, `LC_ALL=C.UTF-8`, `TZ=UTC` and the
+   build's `SOURCE_DATE_EPOCH`.
+3. The container's filesystem is read back. What the runtime mounts over
+   (`/etc/hosts`, `/dev`, ...) goes back to what the image had, and what
+   varies from one run to the next goes: dpkg's and alternatives' logs,
+   the `*-old` backups, ldconfig's aux-cache, ssl-cert's snakeoil key
+   pair, machine IDs and the `policy-rc.d`. `/etc/shadow`'s day of last
+   change is the build's.
+4. What the manifest declares wins: directories in `[paths]` get their
+   owner and mode back, and a script that changed a declared file,
+   symlink or account fails the build.
+
+The image needs dash and dpkg, and whatever the scripts call, and since
+nothing pulls Essential packages in, you list them. The scripts run as
+root in the container, as they would under apt. The same lock and
+paranoid version give the same image whichever runtime runs them. No
+cleanup list is ever complete, though: `--check-reproducible` configures
+twice and fails naming every path that came out different, such as the
+host keys openssh-server's `postinst` generates. A container emulates
+another architecture slowly, if the runtime can at all (binfmt and
+qemu-user-static on Linux; podman machine and Docker Desktop do it on
+macOS). Extended attributes, like the file capabilities `setcap` gives
+`ping`, don't survive. See [`docs/configure.md`](docs/configure.md).
 
 With `unconfigured = true` under `[image]`, the image is left the way `dpkg
 --unpack` leaves a system: every package unpacked, its maintainer scripts in
