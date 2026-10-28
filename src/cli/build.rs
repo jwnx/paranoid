@@ -53,6 +53,11 @@ pub struct BuildArgs {
     #[arg(long, value_name = "podman|docker")]
     runtime: Option<Runtime>,
 
+    /// Configure each configured image twice, and fail naming every path
+    /// that came out different.
+    #[arg(long)]
+    check_reproducible: bool,
+
     /// Re-download packages even if they are cached.
     #[arg(long)]
     force_download: bool,
@@ -142,6 +147,7 @@ pub async fn run(args: BuildArgs, quiet: bool) -> Result<(), CliError> {
             output: ImageOutput::from_path(&output),
             created: created.clone(),
             runtime: args.runtime,
+            check_reproducible: args.check_reproducible,
         };
         if !quiet && images.len() > 1 {
             eprintln!("== {id}");

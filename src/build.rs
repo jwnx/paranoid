@@ -43,6 +43,8 @@ pub struct BuildOptions {
     /// What configures an image that asks for it; podman or Docker on
     /// `PATH` when `None`.
     pub runtime: Option<Runtime>,
+    /// Configure twice and fail if the results differ, naming the paths.
+    pub check_reproducible: bool,
 }
 
 /// What a build produced.
@@ -84,6 +86,12 @@ pub enum BuildError {
 
     #[error("failed to configure the image")]
     Configure(#[from] ConfigureError),
+
+    #[error(
+        "configuring twice gave different images; these paths differ:\n  {}",
+        .0.join("\n  ")
+    )]
+    NotReproducible(Vec<String>),
 
     #[error("failed to configure apt")]
     Apt(#[from] AptError),
@@ -202,24 +210,38 @@ pub async fn build(
             .or_else(Runtime::detect)
             .ok_or(ConfigureError::NoRuntime)?;
         let packages = packages.len() as u64;
+        let runs = if options.check_reproducible { 2 } else { 1 };
         reporter.report(Event::Begin {
             phase: Phase::Configure,
-            total: 1,
+            total: runs,
         });
         let epoch = options.created.as_datetime().timestamp();
-        rootfs = configure::configure(&rootfs, runtime, manifest.architecture, epoch).await?;
-        // What the manifest declares wins over what a script did.
-        if !manifest.accounts.is_empty() {
-            accounts::verify(&rootfs, &manifest.accounts)?;
+        let unpacked = rootfs;
+        let mut configured = Vec::new();
+        for _ in 0..runs {
+            let mut rootfs =
+                configure::configure(&unpacked, runtime, manifest.architecture, epoch).await?;
+            // What the manifest declares wins over what a script did.
+            if !manifest.accounts.is_empty() {
+                accounts::verify(&rootfs, &manifest.accounts)?;
+            }
+            if !manifest.paths.is_empty() {
+                paths::reapply(&mut rootfs, &manifest.paths)?;
+            }
+            reporter.report(Event::Advance {
+                phase: Phase::Configure,
+                units: 1,
+                item: &runtime.to_string(),
+            });
+            configured.push(rootfs);
         }
-        if !manifest.paths.is_empty() {
-            paths::reapply(&mut rootfs, &manifest.paths)?;
+        if let [first, second] = &configured[..] {
+            let differ = first.differences(second);
+            if !differ.is_empty() {
+                return Err(BuildError::NotReproducible(differ));
+            }
         }
-        reporter.report(Event::Advance {
-            phase: Phase::Configure,
-            units: 1,
-            item: &runtime.to_string(),
-        });
+        rootfs = configured.swap_remove(0);
         reporter.report(Event::End {
             phase: Phase::Configure,
             summary: packages,

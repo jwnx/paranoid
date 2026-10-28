@@ -17,7 +17,7 @@
 //!   nothing above it.
 //! - When two packages ship the same path, the later one in lock order wins.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::Read;
 use std::sync::Arc;
 
@@ -349,6 +349,17 @@ impl Rootfs {
         let key = join(&resolved.join("/"), name);
         let node = self.nodes.get(&key)?;
         Some((key, node))
+    }
+
+    /// The paths whose entries differ between `self` and `other`, or that
+    /// only one of them has, sorted.
+    pub fn differences(&self, other: &Rootfs) -> Vec<String> {
+        let paths: BTreeSet<&String> = self.nodes.keys().chain(other.nodes.keys()).collect();
+        paths
+            .into_iter()
+            .filter(|path| self.nodes.get(*path) != other.nodes.get(*path))
+            .map(|path| format!("/{path}"))
+            .collect()
     }
 
     /// Remove `path` and everything under it. Returns how many entries went.
@@ -779,5 +790,30 @@ mod tests {
         fs.apply_deb(&crate::deb::test_utils::deb(&data_tar))
             .unwrap();
         assert_eq!(file_data(&fs, "usr/share/doc/x"), b"doc");
+    }
+
+    #[test]
+    fn lists_the_paths_that_differ() {
+        let mut a = Rootfs::new();
+        apply(
+            &mut a,
+            &[
+                E::File("./etc/a", b"same", 0o644),
+                E::File("./etc/key", b"one", 0o600),
+            ],
+        )
+        .unwrap();
+        let mut b = Rootfs::new();
+        apply(
+            &mut b,
+            &[
+                E::File("./etc/a", b"same", 0o644),
+                E::File("./etc/key", b"two", 0o600),
+                E::File("./etc/new", b"", 0o644),
+            ],
+        )
+        .unwrap();
+        assert_eq!(a.differences(&b), ["/etc/key", "/etc/new"]);
+        assert!(a.differences(&a.clone()).is_empty());
     }
 }
