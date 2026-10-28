@@ -91,6 +91,9 @@ pub struct ImageSpec {
     /// (`en_US.UTF-8`), or `all` to keep every one. Asking for any adds
     /// `locales-all` to `packages`.
     pub locales: Vec<String>,
+    /// Configure apt in the image for the manifest's repositories, at the
+    /// snapshots they're locked to.
+    pub apt_sources: bool,
     pub entrypoint: Option<EntrypointConfig>,
     /// Where `build` writes the image, as written: relative to the
     /// manifest, with `{image}` standing for the image's id. See
@@ -152,6 +155,8 @@ struct RawImageConfig {
     unconfigured: bool,
     #[serde(default)]
     locales: Vec<String>,
+    #[serde(default)]
+    apt_sources: bool,
     output: Option<String>,
 }
 
@@ -167,6 +172,7 @@ struct RawDefaults {
     source: Option<String>,
     unconfigured: Option<bool>,
     locales: Option<Vec<String>>,
+    apt_sources: Option<bool>,
     entrypoint: Option<EntrypointConfig>,
     output: Option<String>,
 }
@@ -188,6 +194,7 @@ struct RawImage {
     #[serde(default)]
     files: Vec<String>,
     locales: Option<Vec<String>>,
+    apt_sources: Option<bool>,
     entrypoint: Option<EntrypointConfig>,
     output: Option<String>,
 }
@@ -242,6 +249,7 @@ impl RawManifest {
                         packages: with_locales_all(self.packages, &i.locales),
                         files: self.files.keys().cloned().collect(),
                         locales: i.locales,
+                        apt_sources: i.apt_sources,
                         entrypoint: self.entrypoint,
                         output: i.output,
                     },
@@ -321,6 +329,7 @@ impl RawManifest {
                 packages: with_locales_all(packages, &locales),
                 files: raw.files,
                 locales,
+                apt_sources: raw.apt_sources.or(defaults.apt_sources).unwrap_or(false),
                 entrypoint: raw.entrypoint.or_else(|| defaults.entrypoint.clone()),
                 output: raw.output.or_else(|| defaults.output.clone()),
             };

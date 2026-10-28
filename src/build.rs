@@ -4,14 +4,15 @@
 //! apply the packages to an in-memory [`Rootfs`] in lock order, record them
 //! in the dpkg database (`/var/lib/dpkg`), keep the locales the image asks
 //! for out of `locales-all`, write the manifest's accounts,
-//! place the files, write the paths, and write a single-layer OCI image
-//! from it.
+//! place the files, configure apt for the repositories, write the paths,
+//! and write a single-layer OCI image from it.
 
 use std::path::PathBuf;
 
 use thiserror::Error;
 
 use crate::accounts::{self, AccountsError};
+use crate::apt::{self, AptError};
 use crate::arch::Architecture;
 use crate::config::{FileSpec, Manifest};
 use crate::deb::{DebArchive, DebError};
@@ -76,6 +77,9 @@ pub enum BuildError {
 
     #[error("failed to write the accounts")]
     Accounts(#[from] AccountsError),
+
+    #[error("failed to configure apt")]
+    Apt(#[from] AptError),
 
     #[error("failed to write a path")]
     Paths(#[from] PathsError),
@@ -178,6 +182,9 @@ pub async fn build(
     }
     for (fetched, (_, spec)) in fetched_files.iter().zip(&files) {
         place(&mut rootfs, fetched, spec, manifest.architecture)?;
+    }
+    if spec.apt_sources {
+        apt::write(&mut rootfs, manifest)?;
     }
     if !manifest.paths.is_empty() {
         paths::apply(&mut rootfs, &manifest.paths)?;

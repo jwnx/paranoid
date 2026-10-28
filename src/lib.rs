@@ -1,4 +1,5 @@
 pub mod accounts;
+pub mod apt;
 pub mod arch;
 pub mod build;
 pub mod config;
