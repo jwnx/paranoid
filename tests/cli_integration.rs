@@ -697,3 +697,80 @@ fn e2e_build_is_reproducible() {
 
     assert!(build(1) == build(2), "builds must be bit-identical");
 }
+
+/// The image format, and the digest an image built in it gets. A change
+/// that fails this test changes what paranoid writes for the same inputs:
+/// bump `IMAGE_FORMAT` and pin the new digest next to it, so digests
+/// recorded with the old format stop being checked instead of failing.
+const PINNED: (u32, &str) = (
+    1,
+    "sha256:d6361374f6e6d904fded61a597bb6652fd8211eb3e11009fa81a48849552a362",
+);
+
+/// What an image builds to doesn't change within an image format.
+///
+/// The manifest locks at a snapshot, so the packages stay where they were,
+/// and uses what a build writes without a container runtime: accounts,
+/// paths and apt sources besides the packages.
+#[test]
+#[ignore]
+fn e2e_image_format_pins_the_digest() {
+    assert_eq!(
+        paranoid::build::IMAGE_FORMAT,
+        PINNED.0,
+        "pin the digest the new image format gives"
+    );
+
+    let tmp = TempDir::new().unwrap();
+    fs::write(
+        tmp.path().join("paranoid.toml"),
+        format!(
+            r#"
+[image]
+architecture = "amd64"
+apt_sources  = true
+
+[repositories.debian]
+url          = "https://snapshot.debian.org/archive/debian"
+snapshot     = "20261005T000000Z"
+distribution = "bookworm"
+components   = ["main"]
+signed_by    = "{}"
+
+[[packages]]
+name = "base-passwd"
+
+[[packages]]
+name = "ca-certificates"
+
+[accounts.users.app]
+uid = 999
+
+[paths."/srv/app"]
+owner = "app"
+mode  = "0750"
+
+[paths."/etc/app.conf"]
+content = "pinned = true\n"
+
+[entrypoint]
+cmd = ["/bin/sh"]
+"#,
+            debian_key().display()
+        ),
+    )
+    .unwrap();
+
+    let out = paranoid_in(tmp.path(), &["lock"]);
+    assert!(out.status.success(), "lock failed: {}", stderr(&out));
+    let out = paranoid_in(tmp.path(), &["build", "-o", "image.tar", "--record"]);
+    assert!(out.status.success(), "build failed: {}", stderr(&out));
+    let out = paranoid_in(tmp.path(), &["inspect", "lock", "--json"]);
+    let summary: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let expected = &summary["images"][0]["expected"];
+    assert_eq!(expected["format"], PINNED.0);
+    assert_eq!(
+        expected["digest"], PINNED.1,
+        "the image's digest changed: bump IMAGE_FORMAT and pin the new digest"
+    );
+}
