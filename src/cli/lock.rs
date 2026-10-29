@@ -206,7 +206,24 @@ pub async fn run(args: LockArgs, quiet: bool) -> Result<(), CliError> {
         eprint!(" Done ");
     }
 
-    let lock = LockFile::from_resolved(&manifest, resolved).with_files(files);
+    let mut lock = LockFile::from_resolved(&manifest, resolved).with_files(files);
+    // A recorded digest holds as long as what the image is built from
+    // does, which re-resolving often leaves as it was.
+    if let Some(existing) = &existing {
+        let carried: Vec<_> = lock
+            .images
+            .iter()
+            .enumerate()
+            .filter_map(|(i, image)| {
+                let expected = existing.image(&image.name)?.expected.clone()?;
+                let inputs = paranoid::build::inputs(&manifest, &lock, &image.name).ok()?;
+                (inputs == expected.inputs).then_some((i, expected))
+            })
+            .collect();
+        for (i, expected) in carried {
+            lock.images[i].expected = Some(expected);
+        }
+    }
     if lock.unmet().next().is_some() && !quiet {
         // Finish the progress line before the warning or error.
         eprintln!();

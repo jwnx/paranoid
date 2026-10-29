@@ -11,6 +11,7 @@
 
 use std::io::Write;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use paranoid::report::{Event, Phase, Reporter};
 
@@ -42,6 +43,8 @@ pub struct DotsReporter {
     quiet: bool,
     /// Units done and total for the phase in progress.
     progress: Mutex<(u64, u64)>,
+    /// Whether a phase's line is open, waiting for its end.
+    open: AtomicBool,
 }
 
 impl DotsReporter {
@@ -49,6 +52,14 @@ impl DotsReporter {
         Self {
             quiet,
             progress: Mutex::new((0, 0)),
+            open: AtomicBool::new(false),
+        }
+    }
+
+    /// End a line a failure left open, so the error starts on its own.
+    pub fn interrupt(&self) {
+        if self.open.swap(false, Ordering::Relaxed) {
+            eprintln!();
         }
     }
 }
@@ -60,12 +71,14 @@ impl Reporter for DotsReporter {
             Event::Begin { phase, total } => {
                 *progress = (0, total);
                 if !self.quiet {
+                    self.open.store(true, Ordering::Relaxed);
                     print_line(presentation(phase).0, 0.0, "");
                 }
             }
             Event::Advance { phase, units, item } => {
                 progress.0 += units;
                 if !self.quiet {
+                    self.open.store(true, Ordering::Relaxed);
                     let (done, total) = *progress;
                     let frac = if total > 0 {
                         done as f64 / total as f64
@@ -76,11 +89,13 @@ impl Reporter for DotsReporter {
                 }
             }
             Event::Failed { item, error, .. } => {
+                self.open.store(false, Ordering::Relaxed);
                 eprintln!();
                 style::error(format!("{item}: {error}"));
             }
             Event::End { phase, summary } => {
                 if !self.quiet {
+                    self.open.store(false, Ordering::Relaxed);
                     let (label, format) = presentation(phase);
                     finish_line(label, &format(summary));
                 }

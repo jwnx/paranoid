@@ -53,6 +53,11 @@ pub enum OciError {
     /// Failed to compress layer.
     #[error("compression failed: {0}")]
     Compression(String),
+
+    /// The image came out with another digest than the one expected, so
+    /// nothing was written.
+    #[error("the image's digest is {got}, not the {expected} expected")]
+    UnexpectedDigest { expected: Digest, got: Digest },
 }
 
 /// Result of a successful OCI image generation.

@@ -9,12 +9,13 @@
 
 use std::path::PathBuf;
 
+use serde::Serialize;
 use thiserror::Error;
 
 use crate::accounts::{self, AccountsError};
 use crate::apt::{self, AptError};
 use crate::arch::Architecture;
-use crate::config::{FileSpec, Manifest};
+use crate::config::{FileSpec, ImageSpec, Manifest};
 use crate::configure::{self, ConfigureError, Runtime};
 use crate::deb::{DebArchive, DebError};
 use crate::download::{
@@ -24,8 +25,10 @@ use crate::download::{
 use crate::dpkg::{DpkgDatabase, DpkgError, PackageState};
 use crate::files::{PlaceError, render_extract};
 use crate::locales::{self, LocalesError};
-use crate::lock::{LockFile, LockedFile};
-use crate::oci::{ImageOutput, OciConfig, OciConfigError, OciError, OciImageResult, Timestamp};
+use crate::lock::{LockFile, LockedFile, LockedPackage};
+use crate::oci::{
+    Digest, ImageOutput, OciConfig, OciConfigError, OciError, OciImageResult, Timestamp,
+};
 use crate::paths::{self, PathsError};
 use crate::report::{Event, Phase, Reporter};
 use crate::rootfs::{Rootfs, RootfsError};
@@ -45,6 +48,9 @@ pub struct BuildOptions {
     pub runtime: Option<Runtime>,
     /// Configure twice and fail if the results differ, naming the paths.
     pub check_reproducible: bool,
+    /// The digest the image must come out with, from the lock. A build
+    /// that gets another fails without writing anything.
+    pub expected: Option<Digest>,
 }
 
 /// What a build produced.
@@ -139,6 +145,65 @@ pub enum BuildError {
 
     #[error("failed to write image")]
     Image(#[from] OciError),
+
+    #[error(
+        "the image's digest is {got}, but the lock records {expected} for the same inputs, \
+         paranoid and SOURCE_DATE_EPOCH: this build didn't reproduce it"
+    )]
+    NotAsRecorded { expected: Digest, got: Digest },
+}
+
+/// A hash of everything a build of `image` reads besides the paranoid
+/// binary and the creation time: the image as the manifest describes it,
+/// the packages and files the lock has for it, and the apt files it
+/// writes. Two builds with the same inputs, paranoid and creation time give
+/// the same image, so a digest recorded with all three holds for a later
+/// build only while they match.
+///
+/// The image's part is hashed in its `Debug` form, which can change
+/// between paranoid versions. That's fine: a digest only holds for the
+/// version that recorded it.
+pub fn inputs(manifest: &Manifest, lock: &LockFile, image: &str) -> Result<Digest, BuildError> {
+    let unknown = || BuildError::UnknownImage(image.to_string());
+    let spec = manifest.images.get(image).ok_or_else(unknown)?;
+    let locked = lock.image(image).ok_or_else(unknown)?;
+    // Where the image goes doesn't change it.
+    let spec = ImageSpec {
+        output: None,
+        ..spec.clone()
+    };
+    let files = lock
+        .image_files(locked)
+        .into_iter()
+        .map(|file| {
+            let spec = manifest.files.get(&file.name);
+            spec.map(|spec| (file, format!("{spec:?}")))
+                .ok_or_else(|| BuildError::UnknownFile(file.name.clone()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let apt = if spec.apt_sources {
+        apt::files(manifest)?
+    } else {
+        Vec::new()
+    };
+
+    #[derive(Serialize)]
+    struct Inputs<'a> {
+        architecture: String,
+        image: String,
+        packages: Vec<&'a LockedPackage>,
+        files: Vec<(&'a LockedFile, String)>,
+        apt: Vec<(String, Vec<u8>)>,
+    }
+    let inputs = Inputs {
+        architecture: manifest.architecture.to_string(),
+        image: format!("{spec:?}"),
+        packages: lock.image_packages(locked),
+        files,
+        apt,
+    };
+    let json = serde_json::to_vec(&inputs).expect("build inputs always serialize");
+    Ok(Digest::from_bytes(&json))
 }
 
 /// Build one image of a manifest, by id, from its packages in `lock`.
@@ -164,7 +229,10 @@ pub async fn build(
         .collect::<Result<_, _>>()?;
 
     // Validate the image configuration before doing any work.
-    let config = OciConfig::from_image(spec, manifest.architecture, options.created.clone())?;
+    let mut config = OciConfig::from_image(spec, manifest.architecture, options.created.clone())?;
+    if let Some(expected) = options.expected {
+        config = config.expect_digest(expected);
+    }
 
     let cache = match &options.cache_dir {
         Some(dir) => PackageCache::with_base_dir(dir.clone())?,
@@ -247,7 +315,14 @@ pub async fn build(
             summary: packages,
         });
     }
-    let image = crate::oci::write_image(&config, &rootfs, &options.output, reporter)?;
+    let image = crate::oci::write_image(&config, &rootfs, &options.output, reporter).map_err(
+        |e| match e {
+            OciError::UnexpectedDigest { expected, got } => {
+                BuildError::NotAsRecorded { expected, got }
+            }
+            e => BuildError::Image(e),
+        },
+    )?;
 
     let origins = fetched
         .iter()
@@ -362,4 +437,76 @@ pub fn assemble(
         summary: rootfs.len() as u64,
     });
     Ok(rootfs)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use super::*;
+
+    const MANIFEST: &str = r#"
+[image]
+architecture = "amd64"
+
+[repositories.debian]
+url = "https://deb.debian.org/debian"
+distribution = "bookworm"
+components = ["main"]
+signed_by = "keys/debian.asc"
+
+[[packages]]
+name = "bash"
+"#;
+
+    const LOCK: &str = r#"
+config_hash = "sha256:aaaa"
+
+[[repository]]
+name = "debian"
+date = "2026-07-11T10:16:37Z"
+inrelease = "b3a8e0e1f9ab1bfe3a36f231f676f78bb30a519d2b21e6c530c0eee8ebb4a5d0"
+signed_by = []
+
+[[package]]
+name = "bash"
+version = "5.0"
+architecture = "amd64"
+sha256 = "a665a45920422f9d417e4867efdc4fb8a04a1f3fff1fa07e998e86f7f7a27ae3"
+filename = "pool/main/b/bash/bash_5.0_amd64.deb"
+size = 1000
+repository = "debian"
+
+[[image]]
+name = "default"
+packages = ["bash"]
+direct = ["bash"]
+"#;
+
+    fn inputs_of(manifest: &str, lock: &str) -> Digest {
+        let manifest = Manifest::from_str(manifest).unwrap();
+        let lock = LockFile::from_str(lock).unwrap();
+        inputs(&manifest, &lock, "default").unwrap()
+    }
+
+    #[test]
+    fn inputs_follow_what_the_image_is_built_from() {
+        let base = inputs_of(MANIFEST, LOCK);
+        assert_eq!(inputs_of(MANIFEST, LOCK), base);
+
+        // Where the image goes doesn't change it.
+        let elsewhere = MANIFEST.replace(
+            "architecture = \"amd64\"",
+            "architecture = \"amd64\"\noutput = \"out.tar\"",
+        );
+        assert_eq!(inputs_of(&elsewhere, LOCK), base);
+
+        // What's in it does, whether the manifest or the lock says so.
+        let with_path = format!("{MANIFEST}\n[paths.\"/etc/x\"]\ncontent = \"x\"\n");
+        assert_ne!(inputs_of(&with_path, LOCK), base);
+        let with_env = format!("{MANIFEST}\n[entrypoint.env]\nA = \"b\"\n");
+        assert_ne!(inputs_of(&with_env, LOCK), base);
+        let rebuilt = LOCK.replace("version = \"5.0\"", "version = \"5.0+b1\"");
+        assert_ne!(inputs_of(MANIFEST, &rebuilt), base);
+    }
 }

@@ -321,6 +321,7 @@ mod tests {
                     files: Vec::new(),
                     unmet: Vec::new(),
                     deps: Vec::new(),
+                    expected: None,
                 })
                 .collect(),
         }

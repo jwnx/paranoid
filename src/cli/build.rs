@@ -9,7 +9,7 @@ use paranoid::build::{BuildOptions, build};
 use paranoid::config::Manifest;
 use paranoid::configure::Runtime;
 use paranoid::download::DownloadConfig;
-use paranoid::lock::LockFile;
+use paranoid::lock::{ExpectedDigest, LockFile};
 use paranoid::oci::{ImageOutput, Timestamp};
 
 use super::error::CliError;
@@ -58,6 +58,11 @@ pub struct BuildArgs {
     #[arg(long)]
     check_reproducible: bool,
 
+    /// Record each image's digest in the lock, for later builds to check
+    /// theirs against, replacing one recorded for the same inputs.
+    #[arg(long)]
+    record: bool,
+
     /// Re-download packages even if they are cached.
     #[arg(long)]
     force_download: bool,
@@ -85,9 +90,16 @@ pub async fn run(args: BuildArgs, quiet: bool) -> Result<(), CliError> {
     if !lock_path.exists() {
         return Err(CliError::missing_lock(&lock_path));
     }
-    let lock = LockFile::from_file(&lock_path).map_err(CliError::lock)?;
+    let mut lock = LockFile::from_file(&lock_path).map_err(CliError::lock)?;
     match lock.is_current(&manifest) {
         Ok(true) => {}
+        // A digest from a stale lock would be one no later build checks.
+        Ok(false) | Err(_) if args.record => {
+            return Err(CliError::config(format!(
+                "--record needs a lock that's current, and {} isn't; run `paranoid lock` first",
+                lock_path.display()
+            )));
+        }
         Ok(false) if args.allow_stale => {
             st::warning(format!("{} is stale", lock_path.display()));
         }
@@ -134,9 +146,17 @@ pub async fn run(args: BuildArgs, quiet: bool) -> Result<(), CliError> {
             .unwrap_or_else(|| PathBuf::from(default.to_string_lossy().replace("{image}", id))),
     };
     let created = source_date_epoch()?;
+    let epoch = created.as_datetime().timestamp();
+    let mut changed = false;
 
     for id in &images {
         let output = output_for(id);
+        let inputs = paranoid::build::inputs(&manifest, &lock, id).map_err(CliError::build)?;
+        let recorded = lock.image(id).and_then(|image| image.expected.as_ref());
+        let expected = recorded
+            .filter(|expected| expected.applies(&inputs, epoch))
+            .map(|expected| expected.digest);
+        let recorded = recorded.is_some();
         let options = BuildOptions {
             download: DownloadConfig {
                 jobs: args.jobs,
@@ -148,15 +168,43 @@ pub async fn run(args: BuildArgs, quiet: bool) -> Result<(), CliError> {
             created: created.clone(),
             runtime: args.runtime,
             check_reproducible: args.check_reproducible,
+            expected: expected.filter(|_| !args.record),
         };
         if !quiet && images.len() > 1 {
             eprintln!("== {id}");
         }
         // Failures of individual packages are reported as they happen; the
         // returned error summarizes them.
-        let report = build(&manifest, &lock, id, &options, &DotsReporter::new(quiet))
+        let reporter = DotsReporter::new(quiet);
+        let report = build(&manifest, &lock, id, &options, &reporter)
             .await
-            .map_err(CliError::build)?;
+            .map_err(|e| {
+                reporter.interrupt();
+                CliError::build(e)
+            })?;
+        let digest = report.image.manifest_digest;
+        if args.record {
+            if expected.is_some_and(|expected| expected != digest) {
+                st::warning(format!(
+                    "{id}: replacing {} recorded for the same inputs",
+                    expected.expect("checked")
+                ));
+            }
+            if expected != Some(digest) {
+                let image = lock
+                    .images
+                    .iter_mut()
+                    .find(|image| &image.name == id)
+                    .expect("built images are in the lock");
+                image.expected = Some(ExpectedDigest {
+                    digest,
+                    paranoid: env!("CARGO_PKG_VERSION").to_string(),
+                    epoch,
+                    inputs,
+                });
+                changed = true;
+            }
+        }
 
         if !quiet {
             eprintln!("Done.");
@@ -191,7 +239,25 @@ pub async fn run(args: BuildArgs, quiet: bool) -> Result<(), CliError> {
                 report.cached,
                 st::fmt_size(report.image.total_size),
             );
-            st::footer(&output, &report.image.manifest_digest.to_string());
+            if !args.record {
+                eprintln!(
+                    "{}",
+                    match (expected, recorded) {
+                        (Some(_), _) => "The digest matches the one the lock records.",
+                        (None, true) =>
+                            "The lock's digest is for other inputs, another paranoid or another \
+                             SOURCE_DATE_EPOCH, so it wasn't checked.",
+                        (None, false) => "The lock records no digest for this build to check.",
+                    }
+                );
+            }
+            st::footer(&output, &digest.to_string());
+        }
+    }
+    if changed {
+        lock.write(&lock_path).map_err(CliError::lock)?;
+        if !quiet {
+            eprintln!("Recorded the digests in {}.", lock_path.display());
         }
     }
 

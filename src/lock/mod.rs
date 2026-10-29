@@ -8,5 +8,6 @@ mod lockfile;
 
 pub use diff::{Change, ChangeKind, FileChange, LockDiff};
 pub use lockfile::{
-    LockFile, LockFileError, LockedFile, LockedImage, LockedPackage, LockedUnmet, Trust,
+    ExpectedDigest, LockFile, LockFileError, LockedFile, LockedImage, LockedPackage, LockedUnmet,
+    Trust,
 };

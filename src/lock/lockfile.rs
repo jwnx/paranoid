@@ -109,6 +109,37 @@ pub struct LockedImage {
     /// serializes to nothing, hence the default.
     #[serde(rename = "dep", default)]
     pub deps: Vec<DepEdge>,
+    /// The digest `build --record` got for the image, and what it got it
+    /// from. `build` checks a later build against it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected: Option<ExpectedDigest>,
+}
+
+/// An image's digest, as one build got it.
+///
+/// The digest follows from the image's inputs, the paranoid that built it
+/// and the creation time, so it's recorded with all three and holds only
+/// for a build that has the same.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExpectedDigest {
+    /// The image manifest's digest, which a registry knows it by.
+    pub digest: Digest,
+    /// The paranoid version that built it.
+    pub paranoid: String,
+    /// The creation time it was built with, `SOURCE_DATE_EPOCH`, in
+    /// seconds.
+    pub epoch: i64,
+    /// A hash of what the build read; see [`crate::build::inputs`].
+    pub inputs: Digest,
+}
+
+impl ExpectedDigest {
+    /// Whether this digest is the one a build of `inputs` at `epoch` by
+    /// the running paranoid should get.
+    #[must_use]
+    pub fn applies(&self, inputs: &Digest, epoch: i64) -> bool {
+        self.paranoid == env!("CARGO_PKG_VERSION") && self.epoch == epoch && &self.inputs == inputs
+    }
 }
 
 /// The lock file structure.
@@ -248,6 +279,7 @@ impl LockFile {
                     files,
                     unmet,
                     deps,
+                    expected: None,
                 }
             })
             .collect();
@@ -676,6 +708,33 @@ name = "default"
 packages = ["bash"]
 direct = ["bash"]
 "#;
+
+    #[test]
+    fn records_an_expected_digest() {
+        let mut lock = LockFile::from_resolved(&make_manifest(), make_resolved());
+        let inputs = Digest::from_bytes(b"inputs");
+        let expected = ExpectedDigest {
+            digest: Digest::from_bytes(b"manifest"),
+            paranoid: env!("CARGO_PKG_VERSION").to_string(),
+            epoch: 1700000000,
+            inputs,
+        };
+        lock.images[0].expected = Some(expected.clone());
+        let serialized = lock.serialize().unwrap();
+        assert!(serialized.contains("[image.expected]"), "{serialized}");
+        let parsed = LockFile::from_str(&serialized).unwrap();
+        assert_eq!(parsed.images[0].expected.as_ref(), Some(&expected));
+
+        // It holds only for the same inputs, epoch and paranoid.
+        assert!(expected.applies(&inputs, 1700000000));
+        assert!(!expected.applies(&Digest::from_bytes(b"other"), 1700000000));
+        assert!(!expected.applies(&inputs, 0));
+        let older = ExpectedDigest {
+            paranoid: "0.5.0".to_string(),
+            ..expected
+        };
+        assert!(!older.applies(&inputs, 1700000000));
+    }
 
     #[test]
     fn records_repository_snapshots() {

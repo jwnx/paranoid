@@ -78,6 +78,8 @@ pub struct OciConfig {
     image_name: Option<ImageName>,
     /// Image tag.
     image_tag: ImageTag,
+    /// The manifest digest the image must have to be written.
+    expected: Option<Digest>,
 }
 
 impl OciConfig {
@@ -95,6 +97,13 @@ impl OciConfig {
     /// Set the layer compression format.
     pub fn compression(mut self, compression: Compression) -> Self {
         self.compression = compression;
+        self
+    }
+
+    /// Write the image only if its manifest has this digest, and fail
+    /// with [`OciError::UnexpectedDigest`] otherwise.
+    pub fn expect_digest(mut self, digest: Digest) -> Self {
+        self.expected = Some(digest);
         self
     }
 
@@ -305,6 +314,7 @@ impl Default for OciConfig {
             user: None,
             image_name: None,
             image_tag: ImageTag::default(), // "latest"
+            expected: None,
         }
     }
 }
@@ -408,6 +418,14 @@ pub fn write_image(
         )],
     ))?;
     let manifest_digest = Digest::from_bytes(&manifest);
+    if let Some(expected) = config.expected
+        && expected != manifest_digest
+    {
+        return Err(OciError::UnexpectedDigest {
+            expected,
+            got: manifest_digest,
+        });
+    }
     let index = serde_json::to_vec_pretty(&config.image_index(&manifest_digest, manifest.len()))?;
     step("manifest");
 
@@ -832,6 +850,40 @@ mod tests {
         let events = recorder.0.into_inner().unwrap();
         assert_eq!(events.first().unwrap(), "begin Image 3");
         assert!(events.last().unwrap().starts_with("end Image"));
+    }
+
+    #[test]
+    fn writes_an_image_only_with_the_expected_digest() {
+        let output = TempDir::new().unwrap();
+        let first = ImageOutput::Tarball(output.path().join("first.tar"));
+        let written = write_image(&OciConfig::new(), &test_rootfs(), &first, &()).unwrap();
+
+        let other = Digest::from_bytes(b"another image");
+        let path = output.path().join("second.tar");
+        let config = OciConfig::new().expect_digest(other);
+        let err = write_image(
+            &config,
+            &test_rootfs(),
+            &ImageOutput::Tarball(path.clone()),
+            &(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, OciError::UnexpectedDigest { expected, got }
+                if expected == other && got == written.manifest_digest),
+            "{err}"
+        );
+        assert!(!path.exists());
+
+        let config = OciConfig::new().expect_digest(written.manifest_digest);
+        let _ = write_image(
+            &config,
+            &test_rootfs(),
+            &ImageOutput::Tarball(path.clone()),
+            &(),
+        )
+        .unwrap();
+        assert!(path.exists());
     }
 
     #[test]

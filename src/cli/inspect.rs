@@ -139,6 +139,26 @@ fn print_lock_summary(lock: &LockFile, focus: Option<&LockedImage>) {
             ))
         );
     }
+    for image in &lock.images {
+        let Some(expected) = &image.expected else {
+            continue;
+        };
+        if focus.is_some_and(|f| f.name != image.name) {
+            continue;
+        }
+        let whose = if lock.images.len() > 1 {
+            format!("{} ", image.name)
+        } else {
+            String::new()
+        };
+        println!(
+            "{}",
+            st::dim().apply_to(format!(
+                "{whose}digest: {}, built by paranoid {} at epoch {}",
+                expected.digest, expected.paranoid, expected.epoch
+            ))
+        );
+    }
     for (image, unmet) in lock.unmet() {
         if focus.is_some_and(|f| f.name != image) {
             continue;
