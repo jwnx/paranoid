@@ -1,4 +1,4 @@
-paranoid = "~0.5"
+paranoid = "~0.6"
 
 [image]
 architecture = "amd64"
