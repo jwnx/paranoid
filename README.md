@@ -756,9 +756,10 @@ With `configure = true` under `[image]`, `[defaults]` or `[images.<id>]`,
    starting.
 2. It's loaded into podman or Docker (`--runtime`, or whichever is on
    `PATH` first), and dpkg configures it in a container with no network
-   and nothing on stdin, in debootstrap's order: base-passwd first, then
-   every package that's required or essential, then the rest. `dpkg
-   --audit` has to find nothing. The scripts see
+   and nothing on stdin (podman with `--passwd=false`, so it doesn't
+   write its own `/etc/passwd` before base-passwd does), in debootstrap's
+   order: base-passwd first, then every package that's required or
+   essential, then the rest. `dpkg --audit` has to find nothing. The scripts see
    `DEBIAN_FRONTEND=noninteractive`, `LC_ALL=C.UTF-8`, `TZ=UTC`, the
    hostname `localhost` and the build's `SOURCE_DATE_EPOCH`. A conffile the
    manifest declares in `[paths]` or `[files]` stays as declared

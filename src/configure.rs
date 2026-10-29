@@ -34,6 +34,19 @@ impl Runtime {
         }
     }
 
+    /// What `run` needs besides the flags both runtimes share.
+    ///
+    /// podman adds the user it runs as to `/etc/passwd` and `/etc/group`,
+    /// writing them when the image has none yet, as it doesn't before
+    /// base-passwd is configured. base-passwd then keeps what it finds,
+    /// and the files lack the users and groups the other packages need.
+    fn run_flags(self) -> &'static [&'static str] {
+        match self {
+            Self::Podman => &["--passwd=false"],
+            Self::Docker => &[],
+        }
+    }
+
     /// The first of podman and Docker on `PATH`.
     pub fn detect() -> Option<Self> {
         let path = std::env::var_os("PATH")?;
@@ -421,33 +434,29 @@ impl Container {
     /// Run `script` in a new container, with no network and no stdin.
     async fn run(&self, script: &str, source_date_epoch: i64) -> Result<(), ConfigureError> {
         let epoch = format!("SOURCE_DATE_EPOCH={source_date_epoch}");
-        self.step(
+        let mut args = vec![
             "run",
-            &[
-                "run",
-                "--name",
-                &self.name,
-                "--network=none",
-                "--pull=never",
-                "--platform",
-                &self.platform,
-                "--user=0:0",
-                // A script that records the hostname records this one,
-                // not the runtime's random one.
-                "--hostname=localhost",
-                "--env=DEBIAN_FRONTEND=noninteractive",
-                "--env=LC_ALL=C.UTF-8",
-                "--env=TZ=UTC",
-                "--env=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-                "--env",
-                &epoch,
-                "--entrypoint=/bin/sh",
-                &self.image,
-                "-c",
-                script,
-            ],
-        )
-        .await
+            "--name",
+            &self.name,
+            "--network=none",
+            "--pull=never",
+            "--platform",
+            &self.platform,
+            "--user=0:0",
+            // A script that records the hostname records this one,
+            // not the runtime's random one.
+            "--hostname=localhost",
+            "--env=DEBIAN_FRONTEND=noninteractive",
+            "--env=LC_ALL=C.UTF-8",
+            "--env=TZ=UTC",
+            "--env=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "--env",
+            &epoch,
+            "--entrypoint=/bin/sh",
+        ];
+        args.extend(self.runtime.run_flags());
+        args.extend([self.image.as_str(), "-c", script]);
+        self.step("run", &args).await
     }
 
     /// The container's filesystem, as a tar file in `dir`.

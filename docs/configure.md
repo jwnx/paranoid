@@ -121,7 +121,9 @@ found on `PATH`:
 1. Write the rootfs as an image (the layer we'd write anyway) and load
    it.
 2. `run --rm --network=none --pull=never -i` the steps above, with `/dev/null`
-   as stdin.
+   as stdin. podman also gets `--passwd=false`: otherwise it writes an
+   `/etc/passwd` and `/etc/group` for the user it runs as when the image
+   has none, before base-passwd can, and base-passwd keeps them.
 3. `export` the container's filesystem and read it into a fresh rootfs.
 
 This works wherever the Dockerfile `RUN` works today: rootless podman,
