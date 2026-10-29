@@ -68,6 +68,7 @@ paranoid build   [-f MANIFEST] [--lock LOCK] [-o OUT] [--image ID]...
                  [--cache-dir DIR] [--jobs N] [--force-download]
                  [--allow-stale] [--allow-unmet]
                  [--runtime podman|docker] [--check-reproducible]
+                 [--record]
 paranoid cache push    [URL|DIR] [-f MANIFEST] [--lock LOCK] [--cache-dir DIR]
                        [--jobs N]
 paranoid diff    OLD NEW [--json]
@@ -784,8 +785,8 @@ is ever complete, though: `--check-reproducible` configures twice and
 fails naming every path that came out different, such as the host keys
 openssh-server's `postinst` generates. Both runs happen on the same day,
 on the same machine, so it can't see what depends on the date or the
-kernel; building on another day, or another machine, and comparing
-digests can. A container emulates
+kernel; a digest [recorded](#recorded-digests) in the lock and checked
+by a build on another day or machine can. A container emulates
 another architecture slowly, if the runtime can at all (binfmt and
 qemu-user-static on Linux; podman machine and Docker Desktop do it on
 macOS). Extended attributes, like the file capabilities `setcap` gives
@@ -811,6 +812,45 @@ flags; debootstrap uses them too. The scripts then run in the image, as
 root, the same as with apt. The image needs whatever they call (a shell,
 Perl for debconf), and since nothing pulls Essential packages in, you
 list them in the manifest.
+
+### Recorded digests
+
+An image's digest follows from what it's built from, the paranoid that
+builds it and `SOURCE_DATE_EPOCH`. So the lock can say which digest a
+build should get, and `build` can check it:
+
+```sh
+$ paranoid build --record    # writes each image's digest into the lock
+$ git commit paranoid.lock
+$ paranoid build             # elsewhere, later: fails on another digest
+```
+
+`--record` stores the digest next to what it holds for, in the image's
+part of the lock:
+
+```toml
+[image.expected]
+digest   = "sha256:47dc50fa8fd99d9632b59471600c39d4af040c4b67db05177fdf7518a9cb3a18"
+paranoid = "0.6.0"
+epoch    = 0
+inputs   = "sha256:3fabf2cf..."
+```
+
+`inputs` is a hash of everything the build reads: the image as the
+manifest describes it, the packages and files the lock has for it, and
+the apt files it writes. A build checks its image against the recorded
+digest only when its inputs, paranoid version and epoch are the same, so
+changing the manifest, upgrading paranoid or building at another epoch
+skips the check instead of failing it, and says so. When the check
+applies and the image comes out different, the build fails without
+writing it: something that should be reproducible isn't. `--record`
+then replaces the digest, with a warning, and records digests only from
+a lock that's current. `lock` keeps a recorded digest when it
+re-resolves, as long as the image's inputs stay the same. `inspect lock`
+shows them.
+
+Since the digest is known before building, CI can pull the image by
+digest from a registry and build only when it isn't there.
 
 ## CACHE
 
