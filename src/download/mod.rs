@@ -52,6 +52,7 @@ pub(crate) mod test_utils {
             filename: format!("pool/main/{}/{}_1.0.0_amd64.deb", &name[..1], name),
             size: 1000,
             repository: "test".to_string(),
+            source: None,
         }
     }
 }

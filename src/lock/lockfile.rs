@@ -26,6 +26,29 @@ pub struct LockedPackage {
     pub filename: String,
     pub size: u64,
     pub repository: String,
+    /// The source package it was built from, as Debian writes it:
+    /// `openssl`, or `glibc (2.36-9)` when the source's version differs.
+    /// Left out when the source has the package's own name and version,
+    /// and by locks written before paranoid kept it; see
+    /// [`LockedPackage::source`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+impl LockedPackage {
+    /// The source package's name and version. A lock written before
+    /// paranoid kept them gives the package's own, which is right only
+    /// for a package built from a source of its name.
+    #[must_use]
+    pub fn source(&self) -> (&str, &str) {
+        match self.source.as_deref() {
+            None => (&self.name, &self.version),
+            Some(source) => match source.split_once(" (") {
+                Some((name, version)) => (name, version.trim_end_matches(')')),
+                None => (source, &self.version),
+            },
+        }
+    }
 }
 
 /// A locked file, fetched from a URL rather than a repository.
@@ -271,6 +294,7 @@ impl LockFile {
                 filename: p.filename,
                 size: p.size,
                 repository: p.repository,
+                source: p.source,
             })
             .collect();
         packages.sort_by(|a, b| a.name.cmp(&b.name));
@@ -668,6 +692,7 @@ name = "coreutils"
                     filename: "pool/main/b/bash/bash_5.2.15-2_amd64.deb".to_string(),
                     size: 1234567,
                     repository: "debian".to_string(),
+                    source: None,
                 },
                 ResolvedPackage {
                     name: "coreutils".to_string(),
@@ -677,6 +702,7 @@ name = "coreutils"
                     filename: "pool/main/c/coreutils/coreutils_9.1-1_amd64.deb".to_string(),
                     size: 2345678,
                     repository: "debian".to_string(),
+                    source: None,
                 },
             ],
             images: vec![ResolvedImage {
@@ -794,6 +820,29 @@ direct = ["bash"]
         .unwrap();
         assert_eq!(older.format, None);
         assert_eq!(older.unchecked(&older.inputs, 0), Some(Unchecked::Format));
+    }
+
+    #[test]
+    fn records_source_packages() {
+        let mut resolved = make_resolved();
+        resolved.packages[1].source = Some("coreutils-src (9.1-0)".to_string());
+        let lock = LockFile::from_resolved(&make_manifest(), resolved);
+        let serialized = lock.serialize().unwrap();
+        assert!(
+            serialized.contains("source = \"coreutils-src (9.1-0)\""),
+            "{serialized}"
+        );
+        assert_eq!(serialized.matches("source = ").count(), 1, "{serialized}");
+
+        let parsed = LockFile::from_str(&serialized).unwrap();
+        let source = |name: &str| parsed.get_package(name).unwrap().source();
+        assert_eq!(source("bash"), ("bash", "5.2.15-2"));
+        assert_eq!(source("coreutils"), ("coreutils-src", "9.1-0"));
+        let renamed = LockedPackage {
+            source: Some("shells".to_string()),
+            ..parsed.get_package("bash").unwrap().clone()
+        };
+        assert_eq!(renamed.source(), ("shells", "5.2.15-2"));
     }
 
     #[test]

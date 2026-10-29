@@ -71,6 +71,10 @@ pub struct ResolvedPackage {
     pub size: u64,
     /// The repository this package came from.
     pub repository: String,
+    /// The source package it was built from, as Debian writes it:
+    /// `openssl`, or `glibc (2.36-9)` when the source's version differs.
+    /// `None` when the source has the package's own name and version.
+    pub source: Option<String>,
 }
 
 impl ResolvedPackage {
@@ -89,6 +93,11 @@ impl ResolvedPackage {
                 package: pkg.name.clone(),
                 source,
             })?;
+        let source = match pkg.source() {
+            (name, version) if name == pkg.name && *version == pkg.version => None,
+            (name, version) if *version == pkg.version => Some(name.to_string()),
+            (name, version) => Some(format!("{name} ({version})")),
+        };
         Ok(Self {
             name: pkg.name.clone(),
             version: pkg.version.to_string(),
@@ -97,6 +106,7 @@ impl ResolvedPackage {
             filename: pkg.filename.clone(),
             size: pkg.size,
             repository: repository.into(),
+            source,
         })
     }
 }
@@ -428,6 +438,28 @@ mod tests {
         let mut set = PackageIndexSet::new();
         set.add_index("debian".into(), PackageIndex::from_str(&text).unwrap());
         set
+    }
+
+    #[test]
+    fn keeps_the_source_package() {
+        let source = |stanza: &str| {
+            let package = DebianPackage::from_str(&format!(
+                "Package: libssl3\nVersion: 3.0.16-1\nArchitecture: amd64\n\
+                 Filename: pool/x.deb\nSHA256: {}\n{stanza}",
+                "a".repeat(64)
+            ))
+            .unwrap();
+            ResolvedPackage::from_debian_package(&package, "debian")
+                .unwrap()
+                .source
+        };
+        assert_eq!(source(""), None);
+        assert_eq!(source("Source: libssl3"), None);
+        assert_eq!(source("Source: openssl"), Some("openssl".to_string()));
+        assert_eq!(
+            source("Source: openssl (3.0.16-0)"),
+            Some("openssl (3.0.16-0)".to_string())
+        );
     }
 
     fn manifest(rest: &str) -> Manifest {

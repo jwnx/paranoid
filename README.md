@@ -616,6 +616,7 @@ sha256       = "01f4330719fd4f65580e16ea5a0527f372fca750e8f588d26deaf09f2d3b1cf4
 filename     = "pool/main/g/glibc/libc6_2.36-9+deb12u14_arm64.deb"
 size         = 2324660
 repository   = "debian"
+source       = "glibc"
 
 [[image]]
 name     = "default"
@@ -627,7 +628,9 @@ parent   = "nodejs"
 children = ["libc6", "libnode108"]
 ```
 
-Each package is listed once. Each `[[image]]` names the packages it
+Each package is listed once, with the `source` package it was built
+from when that has another name, or `glibc (2.36-9)` when another
+version, as Debian writes it. Each `[[image]]` names the packages it
 contains, the ones the manifest asked for, and its dependency graph. A
 single-image manifest has one image, `default`; a set has one per image.
 

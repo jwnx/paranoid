@@ -315,6 +315,7 @@ mod tests {
                 filename: String::new(),
                 size: 0,
                 repository: "debian".to_string(),
+                source: None,
             })
             .collect();
         packages.sort_by(|a, b| a.name.cmp(&b.name));
