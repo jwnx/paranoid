@@ -1,0 +1,126 @@
+# Install a paranoid release on a GitHub Actions runner, and cache the
+# packages and files it downloads.
+#
+#   - uses: jwnx/paranoid@v0.7.2
+#   - run: paranoid build
+#
+# The release is the action's own tag, or `version` when the action is
+# pinned by commit. Its archive has to match the release's SHA256SUMS and
+# carry the build provenance attestation the release workflow made for that
+# tag, so a release asset swapped after the fact doesn't install.
+#
+# The cache can't change an image: `build` checks everything it reads from
+# it against the lock's SHA-256, so a stale or tampered cache only costs the
+# downloads.
+
+name: Set up paranoid
+description: Install a verified paranoid release and cache what it downloads.
+
+inputs:
+  version:
+    description: >-
+      The release to install, like 0.7.2. Defaults to the action's own tag,
+      so it's needed only when the action is pinned by commit.
+    default: ""
+  cache:
+    description: Cache the packages and files paranoid downloads, keyed by `lock`.
+    default: "true"
+  lock:
+    description: The lock files the cache is keyed by, as a hashFiles pattern.
+    default: "**/paranoid.lock"
+  token:
+    description: The token gh downloads the release and its attestation with.
+    default: ${{ github.token }}
+
+outputs:
+  version:
+    description: The paranoid version installed.
+    value: ${{ steps.install.outputs.version }}
+  path:
+    description: The paranoid binary.
+    value: ${{ steps.install.outputs.path }}
+  cache-dir:
+    description: Where paranoid keeps what it downloads.
+    value: ${{ steps.install.outputs.cache-dir }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install paranoid
+      id: install
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        VERSION: ${{ inputs.version }}
+        ACTION_REF: ${{ github.action_ref }}
+      run: |
+        set -euo pipefail
+        version=${VERSION#v}
+        if [ -z "$version" ]; then
+          case "$ACTION_REF" in
+          v[0-9]*) version=${ACTION_REF#v} ;;
+          *)
+            echo "::error::jwnx/paranoid is used at '$ACTION_REF', which isn't a release tag; set its version input"
+            exit 1
+            ;;
+          esac
+        fi
+        case "$RUNNER_OS/$RUNNER_ARCH" in
+        Linux/X64) target=x86_64-unknown-linux-musl ;;
+        Linux/ARM64) target=aarch64-unknown-linux-musl ;;
+        macOS/X64) target=x86_64-apple-darwin ;;
+        macOS/ARM64) target=aarch64-apple-darwin ;;
+        *)
+          echo "::error::paranoid has no release for $RUNNER_OS on $RUNNER_ARCH"
+          exit 1
+          ;;
+        esac
+
+        name=paranoid-v$version-$target
+        dir=$RUNNER_TEMP/paranoid-v$version
+        mkdir -p "$dir"
+        cd "$dir"
+        gh release download "v$version" --repo jwnx/paranoid --clobber \
+          --pattern "$name.tar.gz" --pattern SHA256SUMS
+        if ! grep -q " $name.tar.gz\$" SHA256SUMS; then
+          echo "::error::v$version's SHA256SUMS doesn't list $name.tar.gz"
+          exit 1
+        fi
+        # macOS runners have shasum, and maybe a BSD sha256sum without -c's
+        # GNU behaviour; both read the same format.
+        if command -v shasum >/dev/null; then
+          grep " $name.tar.gz\$" SHA256SUMS | shasum -a 256 -c -
+        else
+          grep " $name.tar.gz\$" SHA256SUMS | sha256sum -c -
+        fi
+        gh attestation verify "$name.tar.gz" --repo jwnx/paranoid \
+          --signer-workflow jwnx/paranoid/.github/workflows/release.yml \
+          --source-ref "refs/tags/v$version"
+        tar -xzf "$name.tar.gz"
+
+        bin=$dir/$name/paranoid
+        if [ "$("$bin" --version)" != "paranoid $version" ]; then
+          echo "::error::$name.tar.gz holds $("$bin" --version), not paranoid $version"
+          exit 1
+        fi
+        echo "$dir/$name" >>"$GITHUB_PATH"
+
+        if [ "$RUNNER_OS" = macOS ]; then
+          cache_dir=$HOME/Library/Caches/paranoid
+        else
+          cache_dir=${XDG_CACHE_HOME:-$HOME/.cache}/paranoid
+        fi
+        {
+          echo "version=$version"
+          echo "path=$bin"
+          echo "cache-dir=$cache_dir"
+        } >>"$GITHUB_OUTPUT"
+        echo "Installed paranoid $version from $name.tar.gz"
+
+    - name: Cache paranoid's downloads
+      if: inputs.cache == 'true'
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.install.outputs.cache-dir }}
+        key: paranoid-${{ runner.os }}-${{ hashFiles(inputs.lock) }}
+        restore-keys: paranoid-${{ runner.os }}-

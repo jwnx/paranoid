@@ -1049,6 +1049,23 @@ a `SHA256SUMS` file and build provenance you can check with
 `gh attestation verify <archive> -R jwnx/paranoid`. Or build from source
 with `cargo install --path .`.
 
+On GitHub Actions, this repository is an action that installs a release:
+
+```yaml
+- uses: jwnx/paranoid@v0.7.2
+- run: paranoid build
+```
+
+It installs the release it's tagged as, or `with: version: 0.7.2` when
+it's pinned by commit. The archive has to match the release's
+`SHA256SUMS` and carry the provenance the release workflow attested for
+that tag. It also caches what paranoid downloads, keyed by the lock
+files (`lock`, `**/paranoid.lock` by default; `cache: false` turns it
+off): `build` checks everything it reads from the cache against the
+lock, so the cache only saves downloads. Its outputs are the `version`,
+the binary's `path` and the `cache-dir`. It runs on Linux (amd64 and
+arm64) and macOS runners.
+
 ## STATUS
 
 paranoid is early in development. The lock format and the library API will
