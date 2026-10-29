@@ -618,6 +618,42 @@ fn e2e_lock_build_produces_valid_oci_tarball() {
     );
 }
 
+#[test]
+fn diff_images_names_what_needs_building() {
+    let tmp = TempDir::new().unwrap();
+    let old = hello_world_dir().join("paranoid.lock");
+    let lock = fs::read_to_string(&old).unwrap();
+
+    // Nothing changed: nothing to build, and nothing printed.
+    let out = paranoid(&[
+        "diff",
+        "--images",
+        old.to_str().unwrap(),
+        old.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+
+    let (from, to) = (
+        "version = \"20230311+deb12u1\"",
+        "version = \"20230311+deb12u2\"",
+    );
+    assert!(
+        lock.contains(from),
+        "the hello-world lock has ca-certificates {from}"
+    );
+    let new = tmp.path().join("new.lock");
+    fs::write(&new, lock.replace(from, to)).unwrap();
+    let out = paranoid(&[
+        "diff",
+        "--images",
+        old.to_str().unwrap(),
+        new.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "default\n");
+}
+
 /// A set: one lock for both images, then each built on its own.
 #[test]
 #[ignore]

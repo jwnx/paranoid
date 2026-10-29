@@ -71,7 +71,7 @@ paranoid build   [-f MANIFEST] [--lock LOCK] [-o OUT] [--image ID]...
                  [--record]
 paranoid cache push    [URL|DIR] [-f MANIFEST] [--lock LOCK] [--cache-dir DIR]
                        [--jobs N]
-paranoid diff    OLD NEW [--json]
+paranoid diff    OLD NEW [--json | --images]
 paranoid inspect lock  [FILE] [--tree | --json] [--image ID]
 paranoid inspect image [PATH]
 ```
@@ -669,7 +669,7 @@ lock's own layout. Read this rather than the lock:
 ```json
 {
   "changed": true,
-  "images": { "added": [], "removed": [] },
+  "images": { "added": [], "removed": [], "changed": ["server", "builder"] },
   "packages": [
     {
       "name": "libssl3",
@@ -696,9 +696,16 @@ and `images` are the images it changed in. A package that moves into or out
 of an image at the same version counts as a change. A file changes when
 its URL or hash does, and its `from` or `to` is null the same way; each
 has the release's `version` when the file comes from an index.
-`changed` is false when no package, file or image moved, even if the
-snapshots did. Later releases may add fields, but won't remove any or
+`images.changed` are the images both locks have whose packages or files
+changed. `changed` is false when no package, file or image moved, even if
+the snapshots did. Later releases may add fields, but won't remove any or
 change what they mean.
+
+`diff --images` prints just the images the newer lock has that need
+building, one per line: the new ones and the changed ones. A lock doesn't
+see everything an image is built from, so neither does this: a change to
+the manifest alone, such as its `[paths]`, or to paranoid itself, needs
+every image built.
 
 ## BUILD
 

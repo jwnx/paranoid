@@ -19,6 +19,9 @@ pub struct LockDiff<'a> {
     pub added_images: Vec<&'a str>,
     /// Images only the older lock has.
     pub removed_images: Vec<&'a str>,
+    /// Images both locks have whose packages or files changed, in the
+    /// newer lock's order.
+    pub changed_images: Vec<&'a str>,
     /// Package changes in the images both locks have, sorted by name.
     pub changes: Vec<Change<'a>>,
     /// File changes in the images both locks have, sorted by name.
@@ -102,6 +105,7 @@ impl Serialize for LockDiff<'_> {
         struct Images<'a> {
             added: &'a [&'a str],
             removed: &'a [&'a str],
+            changed: &'a [&'a str],
         }
         #[derive(Serialize)]
         struct Package<'a> {
@@ -138,6 +142,7 @@ impl Serialize for LockDiff<'_> {
             images: Images {
                 added: &self.added_images,
                 removed: &self.removed_images,
+                changed: &self.changed_images,
             },
             packages: self
                 .changes
@@ -176,6 +181,7 @@ impl LockFile {
         let mut diff = LockDiff {
             added_images: names(newer).filter(|&i| self.image(i).is_none()).collect(),
             removed_images: names(self).filter(|&i| newer.image(i).is_none()).collect(),
+            changed_images: Vec::new(),
             changes: Vec::new(),
             files: self.diff_files(newer),
         };
@@ -234,6 +240,12 @@ impl LockFile {
                 images,
             })
             .collect();
+        let changed = |image: &str| {
+            let changes = diff.changes.iter().map(|c| &c.images);
+            let files = diff.files.iter().map(|f| &f.images);
+            changes.chain(files).any(|images| images.contains(&image))
+        };
+        diff.changed_images = names(newer).filter(|&i| changed(i)).collect();
         diff
     }
 
@@ -447,7 +459,7 @@ mod tests {
             serde_json::to_value(old.diff(&new)).unwrap(),
             serde_json::json!({
                 "changed": true,
-                "images": {"added": ["tools"], "removed": ["old"]},
+                "images": {"added": ["tools"], "removed": ["old"], "changed": ["server"]},
                 "packages": [
                     {"name": "bash", "from": "5.1", "to": "5.2",
                      "repository": "debian", "images": ["server"]},
@@ -463,7 +475,7 @@ mod tests {
             serde_json::to_value(new.diff(&new)).unwrap(),
             serde_json::json!({
                 "changed": false,
-                "images": {"added": [], "removed": []},
+                "images": {"added": [], "removed": [], "changed": []},
                 "packages": [],
                 "files": [],
             })
@@ -498,6 +510,31 @@ mod tests {
             image.files = files.iter().map(|(name, ..)| name.to_string()).collect();
         }
         lock
+    }
+
+    #[test]
+    fn diff_names_the_images_that_changed() {
+        let old = set_lock(&[
+            ("server", &[("bash", "5.1")]),
+            ("builder", &[("bash", "5.1"), ("gcc", "12")]),
+            ("tools", &[("curl", "7")]),
+        ]);
+        // bash changes in two images, gcc leaves one, tools stays as it was.
+        let new = set_lock(&[
+            ("builder", &[("bash", "5.2")]),
+            ("tools", &[("curl", "7")]),
+            ("server", &[("bash", "5.2")]),
+        ]);
+        assert_eq!(old.diff(&new).changed_images, ["builder", "server"]);
+
+        // A file changes an image too.
+        let tools = |data: &[u8]| {
+            let lock = set_lock(&[("tools", &[("curl", "7")])]);
+            with_files(lock, &[("etcd", "https://example.com/etcd.tar.gz", data)])
+        };
+        let (old, new) = (tools(b"3.6.15"), tools(b"3.6.16"));
+        assert_eq!(old.diff(&new).changed_images, ["tools"]);
+        assert!(new.diff(&new).changed_images.is_empty());
     }
 
     #[test]

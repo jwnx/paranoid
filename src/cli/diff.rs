@@ -25,13 +25,25 @@ pub struct DiffArgs {
     /// releases.
     #[arg(long)]
     json: bool,
+
+    /// Print only the images NEW has that need building: the new ones and
+    /// the ones whose packages or files changed, one per line.
+    #[arg(long, conflicts_with = "json")]
+    images: bool,
 }
 
 pub fn run(args: DiffArgs) -> Result<(), CliError> {
     let load = |path: &PathBuf| LockFile::from_file(path).map_err(|e| CliError::read_lock(path, e));
     let (old, new) = (load(&args.old)?, load(&args.new)?);
     let diff = old.diff(&new);
-    if args.json {
+    if args.images {
+        for image in &new.images {
+            let name = image.name.as_str();
+            if diff.added_images.contains(&name) || diff.changed_images.contains(&name) {
+                println!("{name}");
+            }
+        }
+    } else if args.json {
         print_json(&diff);
     } else if diff.is_empty() {
         println!("No changes.");
