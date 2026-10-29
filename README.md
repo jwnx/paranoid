@@ -833,7 +833,7 @@ part of the lock:
 ```toml
 [image.expected]
 digest   = "sha256:47dc50fa8fd99d9632b59471600c39d4af040c4b67db05177fdf7518a9cb3a18"
-paranoid = "0.7.0"
+paranoid = "0.7.1"
 epoch    = 0
 inputs   = "sha256:3fabf2cf..."
 ```
