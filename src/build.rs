@@ -33,6 +33,16 @@ use crate::paths::{self, PathsError};
 use crate::report::{Event, Phase, Reporter};
 use crate::rootfs::{Rootfs, RootfsError};
 
+/// The version of the bytes paranoid writes for an image.
+///
+/// Builds with the same inputs and creation time give the same image as
+/// long as this stays the same, whichever paranoid makes them, so a
+/// recorded digest holds across paranoid versions that share it. Bump it
+/// with any change to what a build writes for the same inputs: the files
+/// it places and how, the tar headers, the OCI JSON, what configuring
+/// leaves behind.
+pub const IMAGE_FORMAT: u32 = 1;
+
 /// How to build.
 #[derive(Debug, Clone)]
 pub struct BuildOptions {
@@ -148,7 +158,7 @@ pub enum BuildError {
 
     #[error(
         "the image's digest is {got}, but the lock records {expected} for the same inputs, \
-         paranoid and SOURCE_DATE_EPOCH: this build didn't reproduce it"
+         image format and SOURCE_DATE_EPOCH: this build didn't reproduce it"
     )]
     NotAsRecorded { expected: Digest, got: Digest },
 }
@@ -156,13 +166,13 @@ pub enum BuildError {
 /// A hash of everything a build of `image` reads besides the paranoid
 /// binary and the creation time: the image as the manifest describes it,
 /// the packages and files the lock has for it, and the apt files it
-/// writes. Two builds with the same inputs, paranoid and creation time give
-/// the same image, so a digest recorded with all three holds for a later
-/// build only while they match.
+/// writes. Two builds with the same inputs, [`IMAGE_FORMAT`] and creation
+/// time give the same image, so a digest recorded with all three holds for
+/// a later build only while they match.
 ///
 /// The image's part is hashed in its `Debug` form, which can change
-/// between paranoid versions. That's fine: a digest only holds for the
-/// version that recorded it.
+/// between paranoid versions. That's safe: a changed hash only stops a
+/// recorded digest from being checked.
 pub fn inputs(manifest: &Manifest, lock: &LockFile, image: &str) -> Result<Digest, BuildError> {
     let unknown = || BuildError::UnknownImage(image.to_string());
     let spec = manifest.images.get(image).ok_or_else(unknown)?;

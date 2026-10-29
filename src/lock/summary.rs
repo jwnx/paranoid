@@ -51,6 +51,7 @@ impl Serialize for LockSummary<'_> {
         #[derive(Serialize)]
         struct Expected<'a> {
             digest: &'a Digest,
+            format: Option<u32>,
             paranoid: &'a str,
             epoch: i64,
         }
@@ -93,6 +94,7 @@ impl Serialize for LockSummary<'_> {
                     name: &image.name,
                     expected: image.expected.as_ref().map(|e| Expected {
                         digest: &e.digest,
+                        format: e.image_format(),
                         paranoid: &e.paranoid,
                         epoch: e.epoch,
                     }),
@@ -238,6 +240,7 @@ direct = ["libc6"]
                         "name": "server",
                         "expected": {
                             "digest": format!("sha256:{HASH_1}"),
+                            "format": 1,
                             "paranoid": "0.7.1",
                             "epoch": 0,
                         },

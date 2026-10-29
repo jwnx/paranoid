@@ -817,9 +817,9 @@ list them in the manifest.
 
 ### Recorded digests
 
-An image's digest follows from what it's built from, the paranoid that
-builds it and `SOURCE_DATE_EPOCH`. So the lock can say which digest a
-build should get, and `build` can check it:
+An image's digest follows from what it's built from, the image format
+paranoid writes it in and `SOURCE_DATE_EPOCH`. So the lock can say which
+digest a build should get, and `build` can check it:
 
 ```sh
 $ paranoid build --record    # writes each image's digest into the lock
@@ -833,6 +833,7 @@ part of the lock:
 ```toml
 [image.expected]
 digest   = "sha256:47dc50fa8fd99d9632b59471600c39d4af040c4b67db05177fdf7518a9cb3a18"
+format   = 1
 paranoid = "0.7.2"
 epoch    = 0
 inputs   = "sha256:3fabf2cf..."
@@ -840,10 +841,16 @@ inputs   = "sha256:3fabf2cf..."
 
 `inputs` is a hash of everything the build reads: the image as the
 manifest describes it, the packages and files the lock has for it, and
-the apt files it writes. A build checks its image against the recorded
-digest only when its inputs, paranoid version and epoch are the same, so
-changing the manifest, upgrading paranoid or building at another epoch
-skips the check instead of failing it, and says so. When the check
+the apt files it writes. `format` is the version of the bytes paranoid
+writes for an image, which a paranoid release changes only when it
+builds the same inputs into a different image; `paranoid` is the release
+that recorded the digest, and doesn't matter to the check. A build checks
+its image against the recorded digest only when its inputs, image format
+and epoch are the same, so changing the manifest, upgrading to a paranoid
+with another image format or building at another epoch skips the check
+instead of failing it, and says why. Digests recorded before image
+formats count as format 1 if paranoid 0.7.1 or 0.7.2 recorded them; ones
+recorded by 0.7.0 need recording again. When the check
 applies and the image comes out different, the build fails without
 writing it: something that should be reproducible isn't. A lock holds
 one digest per image: `--record` warns when it replaces a different one,
@@ -969,6 +976,7 @@ this rather than the lock, whose layout can change:
       "name": "server",
       "expected": {
         "digest": "sha256:47dc50fa8fd99d9632b59471600c39d4af040c4b67db05177fdf7518a9cb3a18",
+        "format": 1,
         "paranoid": "0.7.2",
         "epoch": 0
       },
@@ -996,8 +1004,9 @@ this rather than the lock, whose layout can change:
 ```
 
 `expected` is the digest [recorded](#recorded-digests) for the image, or
-null; a build checks it only with the same paranoid version and epoch,
-and inputs the JSON doesn't show. `packages` are every package in the
+null; a build checks it only with the same image `format` and epoch, and
+inputs the JSON doesn't show. `format` is null for a digest recorded by
+paranoid 0.7.0, which no build checks. `packages` are every package in the
 image, `direct` the ones the manifest asks for, and `files` what it gets
 from `[files]`, with the release's `version` when one came from an index.
 `unmet` lists the dependencies a lock written with `--allow-unmet` left

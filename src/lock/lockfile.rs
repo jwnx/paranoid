@@ -8,6 +8,7 @@ use thiserror::Error;
 use url::Url;
 
 use crate::arch::Architecture;
+use crate::build::IMAGE_FORMAT;
 use crate::config::{FileSpec, HoldSpec, Manifest, PackageSpec, RepositoryConfig};
 use crate::files::Indexes;
 use crate::hash::Sha256;
@@ -117,14 +118,19 @@ pub struct LockedImage {
 
 /// An image's digest, as one build got it.
 ///
-/// The digest follows from the image's inputs, the paranoid that built it
-/// and the creation time, so it's recorded with all three and holds only
-/// for a build that has the same.
+/// The digest follows from the image's inputs, the image format paranoid
+/// wrote it in and the creation time, so it's recorded with all three and
+/// holds only for a build that has the same.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExpectedDigest {
     /// The image manifest's digest, which a registry knows it by.
     pub digest: Digest,
-    /// The paranoid version that built it.
+    /// The [`IMAGE_FORMAT`] it was built with. Digests recorded before
+    /// paranoid had one leave it out; see [`ExpectedDigest::image_format`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<u32>,
+    /// The paranoid version that built it, for people: whether the digest
+    /// holds doesn't depend on it.
     pub paranoid: String,
     /// The creation time it was built with, `SOURCE_DATE_EPOCH`, in
     /// seconds.
@@ -134,12 +140,51 @@ pub struct ExpectedDigest {
 }
 
 impl ExpectedDigest {
+    /// The image format it was built with. A digest recorded before
+    /// paranoid had one counts as format 1 when paranoid 0.7.1 or 0.7.2
+    /// recorded it, which write format 1. 0.7.0 doesn't: its `configure`
+    /// left Rosetta's cache behind.
+    #[must_use]
+    pub fn image_format(&self) -> Option<u32> {
+        self.format.or(match self.paranoid.as_str() {
+            "0.7.1" | "0.7.2" => Some(1),
+            _ => None,
+        })
+    }
+
+    /// Why a build of `inputs` at `epoch` by the running paranoid can't
+    /// be checked against this digest, or `None` if it can.
+    #[must_use]
+    pub fn unchecked(&self, inputs: &Digest, epoch: i64) -> Option<Unchecked> {
+        if self.image_format() != Some(IMAGE_FORMAT) {
+            Some(Unchecked::Format)
+        } else if self.epoch != epoch {
+            Some(Unchecked::Epoch)
+        } else if &self.inputs != inputs {
+            Some(Unchecked::Inputs)
+        } else {
+            None
+        }
+    }
+
     /// Whether this digest is the one a build of `inputs` at `epoch` by
     /// the running paranoid should get.
     #[must_use]
     pub fn applies(&self, inputs: &Digest, epoch: i64) -> bool {
-        self.paranoid == env!("CARGO_PKG_VERSION") && self.epoch == epoch && &self.inputs == inputs
+        self.unchecked(inputs, epoch).is_none()
     }
+}
+
+/// What a build differs from a recorded digest in, so it can't be checked
+/// against it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unchecked {
+    /// It writes another image format.
+    Format,
+    /// It's at another `SOURCE_DATE_EPOCH`.
+    Epoch,
+    /// It reads other inputs.
+    Inputs,
 }
 
 /// The lock file structure.
@@ -715,6 +760,7 @@ direct = ["bash"]
         let inputs = Digest::from_bytes(b"inputs");
         let expected = ExpectedDigest {
             digest: Digest::from_bytes(b"manifest"),
+            format: Some(IMAGE_FORMAT),
             paranoid: env!("CARGO_PKG_VERSION").to_string(),
             epoch: 1700000000,
             inputs,
@@ -725,15 +771,45 @@ direct = ["bash"]
         let parsed = LockFile::from_str(&serialized).unwrap();
         assert_eq!(parsed.images[0].expected.as_ref(), Some(&expected));
 
-        // It holds only for the same inputs, epoch and paranoid.
+        // It holds only for the same inputs, epoch and image format.
         assert!(expected.applies(&inputs, 1700000000));
-        assert!(!expected.applies(&Digest::from_bytes(b"other"), 1700000000));
-        assert!(!expected.applies(&inputs, 0));
-        let older = ExpectedDigest {
-            paranoid: "0.5.0".to_string(),
+        let other = Digest::from_bytes(b"other");
+        assert_eq!(
+            expected.unchecked(&other, 1700000000),
+            Some(Unchecked::Inputs)
+        );
+        assert_eq!(expected.unchecked(&inputs, 0), Some(Unchecked::Epoch));
+        let newer = ExpectedDigest {
+            format: Some(IMAGE_FORMAT + 1),
+            ..expected.clone()
+        };
+        assert_eq!(
+            newer.unchecked(&inputs, 1700000000),
+            Some(Unchecked::Format)
+        );
+
+        // Which paranoid recorded it doesn't matter.
+        let elsewhere = ExpectedDigest {
+            paranoid: "0.0.0-dev".to_string(),
             ..expected
         };
-        assert!(!older.applies(&inputs, 1700000000));
+        assert!(elsewhere.applies(&inputs, 1700000000));
+    }
+
+    #[test]
+    fn reads_digests_recorded_before_image_formats() {
+        let recorded = |paranoid: &str| {
+            let toml = format!(
+                "digest = \"sha256:{TEST_HASH_1}\"\nparanoid = \"{paranoid}\"\n\
+                 epoch = 0\ninputs = \"sha256:{TEST_HASH_2}\"\n"
+            );
+            toml::from_str::<ExpectedDigest>(&toml).unwrap()
+        };
+        assert_eq!(recorded("0.7.1").image_format(), Some(1));
+        assert_eq!(recorded("0.7.2").image_format(), Some(1));
+        let older = recorded("0.7.0");
+        assert_eq!(older.image_format(), None);
+        assert_eq!(older.unchecked(&older.inputs, 0), Some(Unchecked::Format));
     }
 
     #[test]

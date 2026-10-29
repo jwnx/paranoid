@@ -5,11 +5,12 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
+use paranoid::build::IMAGE_FORMAT;
 use paranoid::build::{BuildOptions, build};
 use paranoid::config::Manifest;
 use paranoid::configure::Runtime;
 use paranoid::download::DownloadConfig;
-use paranoid::lock::{ExpectedDigest, LockFile};
+use paranoid::lock::{ExpectedDigest, LockFile, Unchecked};
 use paranoid::oci::{ImageOutput, Timestamp};
 
 use super::error::CliError;
@@ -153,11 +154,13 @@ pub async fn run(args: BuildArgs, quiet: bool) -> Result<(), CliError> {
         let output = output_for(id);
         let inputs = paranoid::build::inputs(&manifest, &lock, id).map_err(CliError::build)?;
         let previous = lock.image(id).and_then(|image| image.expected.clone());
+        let unchecked = previous
+            .as_ref()
+            .and_then(|previous| previous.unchecked(&inputs, epoch));
         let expected = previous
             .as_ref()
-            .filter(|previous| previous.applies(&inputs, epoch))
+            .filter(|_| unchecked.is_none())
             .map(|previous| previous.digest);
-        let recorded = previous.is_some();
         let options = BuildOptions {
             download: DownloadConfig {
                 jobs: args.jobs,
@@ -187,6 +190,7 @@ pub async fn run(args: BuildArgs, quiet: bool) -> Result<(), CliError> {
         if args.record {
             let current = ExpectedDigest {
                 digest,
+                format: Some(IMAGE_FORMAT),
                 paranoid: env!("CARGO_PKG_VERSION").to_string(),
                 epoch,
                 inputs,
@@ -253,16 +257,29 @@ pub async fn run(args: BuildArgs, quiet: bool) -> Result<(), CliError> {
                 st::fmt_size(report.image.total_size),
             );
             if !args.record {
-                eprintln!(
-                    "{}",
-                    match (expected, recorded) {
-                        (Some(_), _) => "The digest matches the one the lock records.",
-                        (None, true) =>
-                            "The lock's digest is for other inputs, another paranoid or another \
-                             SOURCE_DATE_EPOCH, so it wasn't checked.",
-                        (None, false) => "The lock records no digest for this build to check.",
+                let why = match (&previous, unchecked) {
+                    (Some(_), None) => "The digest matches the one the lock records.".to_string(),
+                    (Some(previous), Some(Unchecked::Format)) => format!(
+                        "The lock's digest was recorded by paranoid {}, which writes {}, so it \
+                         wasn't checked.",
+                        previous.paranoid,
+                        match previous.image_format() {
+                            Some(format) =>
+                                format!("image format {format} (this one writes {IMAGE_FORMAT})"),
+                            None => "another image format".to_string(),
+                        }
+                    ),
+                    (Some(previous), Some(Unchecked::Epoch)) => format!(
+                        "The lock's digest is for SOURCE_DATE_EPOCH {}, not {epoch}, so it \
+                         wasn't checked.",
+                        previous.epoch
+                    ),
+                    (Some(_), Some(Unchecked::Inputs)) => {
+                        "The lock's digest is for other inputs, so it wasn't checked.".to_string()
                     }
-                );
+                    (None, _) => "The lock records no digest for this build to check.".to_string(),
+                };
+                eprintln!("{why}");
             }
             st::footer(&output, &digest.to_string());
         }

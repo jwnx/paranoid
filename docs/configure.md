@@ -181,7 +181,7 @@ started.
 
 `configure` changes the image, not what's in it, so it stays out of the
 config hash, as `unconfigured` does. The image's digest depends on the
-lock, the manifest and the paranoid version, as now. Expected digests in
+lock, the manifest and the image format paranoid writes, as now. Expected digests in
 the lock (TODO item 3) would make "same lock, same image" checkable here
 too, and `--check-reproducible` is how to find out when it isn't.
 
