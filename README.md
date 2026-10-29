@@ -72,7 +72,7 @@ paranoid build   [-f MANIFEST] [--lock LOCK] [-o OUT] [--image ID]...
 paranoid cache push    [URL|DIR] [-f MANIFEST] [--lock LOCK] [--cache-dir DIR]
                        [--jobs N]
 paranoid diff    OLD NEW [--json]
-paranoid inspect lock  [FILE] [--tree] [--image ID]
+paranoid inspect lock  [FILE] [--tree | --json] [--image ID]
 paranoid inspect image [PATH]
 ```
 
@@ -850,7 +850,8 @@ one digest per image: `--record` warns when it replaces a different one,
 writes the lock after each image it builds, and records only from a lock
 that's current. `lock` keeps a recorded digest when it re-resolves, as
 long as the image's inputs stay the same, and says when it drops one.
-`inspect lock` shows them.
+`inspect lock` shows them, and `inspect lock --json` gives them to
+scripts (see [INSPECT](#inspect)).
 
 Since the digest is known before building, CI can pull the image by
 digest from a registry and build only when it isn't there.
@@ -953,7 +954,61 @@ See [`docs/next.md`](docs/next.md) for what's next.
 
 ```sh
 $ paranoid inspect lock --tree         # dependency tree from the lock
+$ paranoid inspect lock --json         # the lock's images, for scripts
 $ paranoid inspect image image.tar     # name, arch, entrypoint, size, digest
+```
+
+`inspect lock --json` prints what the lock holds, image by image, in a
+format paranoid keeps stable across releases, as `diff --json` is. Read
+this rather than the lock, whose layout can change:
+
+```json
+{
+  "images": [
+    {
+      "name": "server",
+      "expected": {
+        "digest": "sha256:47dc50fa8fd99d9632b59471600c39d4af040c4b67db05177fdf7518a9cb3a18",
+        "paranoid": "0.7.1",
+        "epoch": 0
+      },
+      "direct": ["etcd-server"],
+      "packages": [
+        {
+          "name": "etcd-server",
+          "version": "3.4.23-4+b4",
+          "architecture": "arm64",
+          "repository": "debian",
+          "sha256": "9a1f3c0e...",
+          "size": 5482116
+        }
+      ],
+      "files": [
+        { "name": "etcdctl", "url": "https://.../etcd-v3.6.16-linux-arm64.tar.gz", "sha256": "ad756ff2...", "size": 23451028, "version": "v3.6.16" }
+      ],
+      "unmet": []
+    }
+  ],
+  "repositories": [
+    { "name": "debian", "date": "2026-10-28T08:12:41Z", "inrelease": "5c0e7a21..." }
+  ]
+}
+```
+
+`expected` is the digest [recorded](#recorded-digests) for the image, or
+null; a build checks it only with the same paranoid version and epoch,
+and inputs the JSON doesn't show. `packages` are every package in the
+image, `direct` the ones the manifest asks for, and `files` what it gets
+from `[files]`, with the release's `version` when one came from an index.
+`unmet` lists the dependencies a lock written with `--allow-unmet` left
+unmet, as `{ "dependency", "required_by" }`. `--image ID` narrows
+`images` to one image of a set. Later releases may add fields, but won't
+remove any or change what they mean.
+
+For instance, the digest a lock records for `pg17`:
+
+```sh
+$ paranoid inspect lock --json --image pg17 | jq -r '.images[0].expected.digest'
 ```
 
 ## HACKING

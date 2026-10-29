@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 
-use paranoid::lock::{LockFile, LockedImage, LockedPackage, Trust};
+use paranoid::lock::{LockFile, LockSummary, LockedImage, LockedPackage, Trust};
 use paranoid::oci::read_image;
 
 use super::error::CliError;
@@ -27,8 +27,13 @@ enum InspectTarget {
         path: PathBuf,
 
         /// Show dependency tree instead of flat table.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "json")]
         tree: bool,
+
+        /// Print the lock's images to stdout as JSON, in a format paranoid
+        /// keeps stable across releases.
+        #[arg(long)]
+        json: bool,
 
         /// Show only this image of a set.
         #[arg(long, value_name = "ID")]
@@ -45,7 +50,12 @@ enum InspectTarget {
 
 pub fn run(args: InspectArgs) -> Result<(), CliError> {
     match args.target {
-        InspectTarget::Lock { path, tree, image } => {
+        InspectTarget::Lock {
+            path,
+            tree,
+            json,
+            image,
+        } => {
             let lock = LockFile::from_file(&path).map_err(CliError::lock)?;
             // One image to focus on: the one asked for, or the only one.
             let focus = match &image {
@@ -60,6 +70,14 @@ pub fn run(args: InspectArgs) -> Result<(), CliError> {
                 None if lock.images.len() == 1 => lock.images.first(),
                 None => None,
             };
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&LockSummary::new(&lock, focus))
+                        .expect("a lock always serializes")
+                );
+                return Ok(());
+            }
             print_lock_summary(&lock, focus);
             match (tree, focus) {
                 (true, Some(image)) => print_lock_tree(&lock, image),
