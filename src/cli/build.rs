@@ -152,11 +152,12 @@ pub async fn run(args: BuildArgs, quiet: bool) -> Result<(), CliError> {
     for id in &images {
         let output = output_for(id);
         let inputs = paranoid::build::inputs(&manifest, &lock, id).map_err(CliError::build)?;
-        let recorded = lock.image(id).and_then(|image| image.expected.as_ref());
-        let expected = recorded
-            .filter(|expected| expected.applies(&inputs, epoch))
-            .map(|expected| expected.digest);
-        let recorded = recorded.is_some();
+        let previous = lock.image(id).and_then(|image| image.expected.clone());
+        let expected = previous
+            .as_ref()
+            .filter(|previous| previous.applies(&inputs, epoch))
+            .map(|previous| previous.digest);
+        let recorded = previous.is_some();
         let options = BuildOptions {
             download: DownloadConfig {
                 jobs: args.jobs,
@@ -184,24 +185,36 @@ pub async fn run(args: BuildArgs, quiet: bool) -> Result<(), CliError> {
             })?;
         let digest = report.image.manifest_digest;
         if args.record {
-            if expected.is_some_and(|expected| expected != digest) {
-                st::warning(format!(
-                    "{id}: replacing {} recorded for the same inputs",
-                    expected.expect("checked")
-                ));
+            let current = ExpectedDigest {
+                digest,
+                paranoid: env!("CARGO_PKG_VERSION").to_string(),
+                epoch,
+                inputs,
+            };
+            // A lock holds one digest per image, so say what goes.
+            match &previous {
+                Some(previous) if previous.digest != digest && expected.is_some() => {
+                    st::warning(format!(
+                        "{id}: replacing {} recorded for the same inputs",
+                        previous.digest
+                    ));
+                }
+                Some(previous) if previous.digest != digest => st::warning(format!(
+                    "{id}: replacing {}, recorded by paranoid {} at epoch {}",
+                    previous.digest, previous.paranoid, previous.epoch
+                )),
+                _ => {}
             }
-            if expected != Some(digest) {
+            if previous.as_ref() != Some(&current) {
                 let image = lock
                     .images
                     .iter_mut()
                     .find(|image| &image.name == id)
                     .expect("built images are in the lock");
-                image.expected = Some(ExpectedDigest {
-                    digest,
-                    paranoid: env!("CARGO_PKG_VERSION").to_string(),
-                    epoch,
-                    inputs,
-                });
+                image.expected = Some(current);
+                // Each image's, as it's built, so a later image failing
+                // doesn't lose the earlier ones'.
+                lock.write(&lock_path).map_err(CliError::lock)?;
                 changed = true;
             }
         }
@@ -254,11 +267,8 @@ pub async fn run(args: BuildArgs, quiet: bool) -> Result<(), CliError> {
             st::footer(&output, &digest.to_string());
         }
     }
-    if changed {
-        lock.write(&lock_path).map_err(CliError::lock)?;
-        if !quiet {
-            eprintln!("Recorded the digests in {}.", lock_path.display());
-        }
+    if changed && !quiet {
+        eprintln!("Recorded the digests in {}.", lock_path.display());
     }
 
     Ok(())

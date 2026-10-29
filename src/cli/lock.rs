@@ -223,6 +223,26 @@ pub async fn run(args: LockArgs, quiet: bool) -> Result<(), CliError> {
         for (i, expected) in carried {
             lock.images[i].expected = Some(expected);
         }
+        let dropped: Vec<&str> = lock
+            .images
+            .iter()
+            .filter(|image| image.expected.is_none())
+            .filter(|image| {
+                existing
+                    .image(&image.name)
+                    .is_some_and(|i| i.expected.is_some())
+            })
+            .map(|image| image.name.as_str())
+            .collect();
+        if !dropped.is_empty() && !quiet {
+            // Finish the progress line before the note.
+            eprintln!();
+            st::warning(format!(
+                "dropped the recorded digest of {}: what it was built from changed; \
+                 `paranoid build --record` records a new one",
+                dropped.join(", ")
+            ));
+        }
     }
     if lock.unmet().next().is_some() && !quiet {
         // Finish the progress line before the warning or error.

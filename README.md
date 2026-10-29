@@ -843,11 +843,12 @@ digest only when its inputs, paranoid version and epoch are the same, so
 changing the manifest, upgrading paranoid or building at another epoch
 skips the check instead of failing it, and says so. When the check
 applies and the image comes out different, the build fails without
-writing it: something that should be reproducible isn't. `--record`
-then replaces the digest, with a warning, and records digests only from
-a lock that's current. `lock` keeps a recorded digest when it
-re-resolves, as long as the image's inputs stay the same. `inspect lock`
-shows them.
+writing it: something that should be reproducible isn't. A lock holds
+one digest per image: `--record` warns when it replaces a different one,
+writes the lock after each image it builds, and records only from a lock
+that's current. `lock` keeps a recorded digest when it re-resolves, as
+long as the image's inputs stay the same, and says when it drops one.
+`inspect lock` shows them.
 
 Since the digest is known before building, CI can pull the image by
 digest from a registry and build only when it isn't there.
