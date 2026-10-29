@@ -165,6 +165,7 @@ know varies, from configure.sh and from Debian's reproducible builds work:
 | `/etc/shadow`, `/etc/gshadow` | the day of last change is today | set it to `SOURCE_DATE_EPOCH`'s day |
 | `/usr/sbin/policy-rc.d` | ours | remove |
 | `/etc/machine-id`, `/var/lib/dbus/machine-id` | random, if anything makes one | remove |
+| `/.cache/rosetta`, `/root/.cache/rosetta` | Rosetta's cache, when a Mac runs amd64 scripts | remove |
 | file times | when the scripts ran | already: layers carry no times |
 
 `*.pyc` files carry their source's time, which the rootfs fixes, so they

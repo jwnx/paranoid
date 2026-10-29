@@ -766,8 +766,9 @@ With `configure = true` under `[image]`, `[defaults]` or `[images.<id>]`,
    (`--force-confold`), and the package's version beside it goes.
 3. The container's filesystem is read back. What the runtime mounts over
    (`/etc/hosts`, `/dev`, ...) goes back to what the image had, along
-   with `/run`, `/tmp` and `/var/tmp`, and what varies from one run to
-   the next goes: dpkg's and alternatives' logs, the `*-old` and
+   with `/run`, `/tmp`, `/var/tmp` and the empty `~/.cache/rosetta`
+   Rosetta leaves on a Mac, and what varies from one run to the next
+   goes: dpkg's and alternatives' logs, the `*-old` and
    `/etc/shadow-` style backups, ldconfig's aux-cache, ssl-cert's
    snakeoil key pair, machine IDs and the `policy-rc.d`. `/etc/shadow`'s
    day of last change is the build's. Since the runtime mounts its own

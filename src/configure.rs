@@ -158,6 +158,16 @@ const RUNTIME_PATHS: &[&str] = &[
     "sys",
 ];
 
+/// Where Rosetta, which runs amd64 binaries on an Apple silicon Mac
+/// under colima, Docker Desktop or podman machine, makes its cache:
+/// `$HOME/.cache/rosetta`, empty, the first time it translates one. HOME
+/// is `/` until base-passwd writes `/etc/passwd`, and `/root` after. A
+/// build on Linux has neither, so they go, with the `.cache` they made.
+const ROSETTA_CACHES: &[(&str, &str)] = &[
+    (".cache", ".cache/rosetta"),
+    ("root/.cache", "root/.cache/rosetta"),
+];
+
 const POLICY_RC_D: &str = "usr/sbin/policy-rc.d";
 
 /// Configure `rootfs`, an image unpacked with dpkg's database marking
@@ -214,14 +224,31 @@ pub async fn configure(
     let mut configured = Rootfs::new();
     configured.apply_tar(std::io::BufReader::new(std::fs::File::open(exported?)?))?;
 
-    for path in RUNTIME_PATHS {
-        configured.restore(rootfs, path);
-    }
+    restore_runtime_paths(&mut configured, rootfs);
     if wrote_policy {
         configured.remove_tree(POLICY_RC_D);
     }
     clean(&mut configured, source_date_epoch);
     Ok(configured)
+}
+
+/// Put back what the runtime, or the emulator it runs amd64 binaries
+/// with, made in `configured`: as it is in `before`, the rootfs the
+/// container started from.
+fn restore_runtime_paths(configured: &mut Rootfs, before: &Rootfs) {
+    for path in RUNTIME_PATHS {
+        configured.restore(before, path);
+    }
+    for (parent, cache) in ROSETTA_CACHES {
+        configured.restore(before, cache);
+        let prefix = format!("{parent}/");
+        let emptied = before.get(parent).is_none()
+            && matches!(configured.get(parent), Some(Node::Dir(_)))
+            && !configured.iter().any(|(p, _)| p.starts_with(&prefix));
+        if emptied {
+            configured.remove_tree(parent);
+        }
+    }
 }
 
 /// Wait for Ctrl-C or SIGTERM, and say which.
@@ -633,9 +660,7 @@ mod tests {
             ("dev/console", ""),
             ("bin/sh", "dash"),
         ]);
-        for path in RUNTIME_PATHS {
-            after.restore(&before, path);
-        }
+        restore_runtime_paths(&mut after, &before);
         let files: Vec<&str> = after
             .iter()
             .filter(|(_, n)| matches!(n, Node::File(..)))
@@ -643,6 +668,29 @@ mod tests {
             .collect();
         assert_eq!(files, ["bin/sh", "etc/hosts"]);
         assert!(matches!(after.get("etc/hosts"), Some(Node::File(_, d)) if &d[..] == b"ours"));
+    }
+
+    #[test]
+    fn removes_rosettas_cache() {
+        let dir = Meta {
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+        };
+        let before = with_files(&[("root/.profile", "")]);
+        let mut after = before.clone();
+        for path in [".cache/rosetta", "root/.cache/rosetta"] {
+            after.set_dir(path, dir).unwrap();
+        }
+        restore_runtime_paths(&mut after, &before);
+        assert!(after.differences(&before).is_empty());
+
+        // A `.cache` that was there stays, without Rosetta's.
+        let before = with_files(&[("root/.cache/pip/keep", "")]);
+        let mut after = before.clone();
+        after.set_dir("root/.cache/rosetta", dir).unwrap();
+        restore_runtime_paths(&mut after, &before);
+        assert!(after.differences(&before).is_empty());
     }
 
     #[test]
