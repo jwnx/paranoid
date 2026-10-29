@@ -68,7 +68,7 @@ paranoid build   [-f MANIFEST] [--lock LOCK] [-o OUT] [--image ID]...
                  [--cache-dir DIR] [--jobs N] [--force-download]
                  [--allow-stale] [--allow-unmet]
                  [--runtime podman|docker] [--check-reproducible]
-                 [--record]
+                 [--record | --no-check]
 paranoid cache push    [URL|DIR] [-f MANIFEST] [--lock LOCK] [--cache-dir DIR]
                        [--jobs N]
 paranoid diff    OLD NEW [--json | --images]
@@ -860,7 +860,9 @@ an image doesn't use, so a paranoid that adds one doesn't change it
 either. Digests recorded by paranoid 0.7, which have no `format`, need
 recording again. When the check
 applies and the image comes out different, the build fails without
-writing it: something that should be reproducible isn't. A lock holds
+writing it: something that should be reproducible isn't. `--no-check`
+writes the image anyway and warns, leaving the lock as it is, for
+looking into what changed. A lock holds
 one digest per image: `--record` warns when it replaces a different one,
 writes the lock after each image it builds, and records only from a lock
 that's current. `lock` keeps a recorded digest when it re-resolves, as

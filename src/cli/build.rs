@@ -64,6 +64,11 @@ pub struct BuildArgs {
     #[arg(long)]
     record: bool,
 
+    /// Write the image even if its digest isn't the one the lock records,
+    /// and warn instead of failing. The lock stays as it is.
+    #[arg(long, conflicts_with = "record")]
+    no_check: bool,
+
     /// Re-download packages even if they are cached.
     #[arg(long)]
     force_download: bool,
@@ -172,7 +177,7 @@ pub async fn run(args: BuildArgs, quiet: bool) -> Result<(), CliError> {
             created: created.clone(),
             runtime: args.runtime,
             check_reproducible: args.check_reproducible,
-            expected: expected.filter(|_| !args.record),
+            expected: expected.filter(|_| !args.record && !args.no_check),
         };
         if !quiet && images.len() > 1 {
             eprintln!("== {id}");
@@ -187,6 +192,14 @@ pub async fn run(args: BuildArgs, quiet: bool) -> Result<(), CliError> {
                 CliError::build(e)
             })?;
         let digest = report.image.manifest_digest;
+        // What the check would have failed on, had it run.
+        let mismatch = expected.filter(|expected| *expected != digest && args.no_check);
+        if let Some(expected) = mismatch {
+            st::warning(format!(
+                "{id}: the image's digest is {digest}, but the lock records {expected} for the \
+                 same inputs, image format and SOURCE_DATE_EPOCH"
+            ));
+        }
         if args.record {
             let current = ExpectedDigest {
                 digest,
@@ -258,6 +271,10 @@ pub async fn run(args: BuildArgs, quiet: bool) -> Result<(), CliError> {
             );
             if !args.record {
                 let why = match (&previous, unchecked) {
+                    (Some(_), None) if mismatch.is_some() => {
+                        "The digest isn't the one the lock records; --no-check wrote it anyway."
+                            .to_string()
+                    }
                     (Some(_), None) => "The digest matches the one the lock records.".to_string(),
                     (Some(previous), Some(Unchecked::Format)) => match previous.format {
                         Some(format) => format!(

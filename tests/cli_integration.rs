@@ -734,6 +734,56 @@ fn e2e_build_is_reproducible() {
     assert!(build(1) == build(2), "builds must be bit-identical");
 }
 
+/// `--no-check` writes an image the lock records another digest for,
+/// warns, and leaves the lock alone.
+#[test]
+#[ignore]
+fn e2e_no_check_builds_past_a_recorded_digest() {
+    let tmp = TempDir::new().unwrap();
+    // Lock fresh: committed locks go stale as Debian rotates security updates
+    // off the mirrors.
+    let dir = tmp.path();
+    copy_hello_world_manifest(dir);
+    let out = paranoid_in(dir, &["lock"]);
+    assert!(out.status.success(), "lock failed: {}", stderr(&out));
+    let out = paranoid_in(dir, &["build", "-o", "image.tar", "--record"]);
+    assert!(out.status.success(), "build failed: {}", stderr(&out));
+
+    // Another digest for the same inputs: what a build that doesn't
+    // reproduce runs into.
+    let lock_path = dir.join("paranoid.lock");
+    let recorded = fs::read_to_string(&lock_path).unwrap();
+    let digest = recorded
+        .lines()
+        .find_map(|line| line.strip_prefix("digest = "))
+        .unwrap()
+        .trim_matches('"')
+        .to_string();
+    let other = format!("sha256:{}", "0".repeat(64));
+    let tampered = recorded.replace(&digest, &other);
+    fs::write(&lock_path, &tampered).unwrap();
+    fs::remove_file(dir.join("image.tar")).unwrap();
+
+    let out = paranoid_in(dir, &["build", "-o", "image.tar"]);
+    assert!(!out.status.success(), "a build past the digest must fail");
+    assert!(!dir.join("image.tar").exists());
+
+    let out = paranoid_in(dir, &["build", "-o", "image.tar", "--no-check"]);
+    assert!(out.status.success(), "build failed: {}", stderr(&out));
+    assert!(dir.join("image.tar").exists());
+    assert!(
+        stderr(&out).contains(&format!(
+            "the image's digest is {digest}, but the lock records {other}"
+        )),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(fs::read_to_string(&lock_path).unwrap(), tampered);
+
+    let out = paranoid_in(dir, &["build", "--no-check", "--record"]);
+    assert!(!out.status.success());
+}
+
 /// The image format, and the digest an image built in it gets. A change
 /// that fails this test changes what paranoid writes for the same inputs:
 /// bump `IMAGE_FORMAT` and pin the new digest next to it, so digests
