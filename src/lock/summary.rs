@@ -94,7 +94,7 @@ impl Serialize for LockSummary<'_> {
                     name: &image.name,
                     expected: image.expected.as_ref().map(|e| Expected {
                         digest: &e.digest,
-                        format: e.image_format(),
+                        format: e.format,
                         paranoid: &e.paranoid,
                         epoch: e.epoch,
                     }),
@@ -200,6 +200,7 @@ files = ["etcd"]
 
 [image.expected]
 digest = "sha256:{HASH_1}"
+format = 1
 paranoid = "0.7.1"
 epoch = 0
 inputs = "sha256:{HASH_2}"

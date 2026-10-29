@@ -3,25 +3,33 @@
 
 use std::fmt;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::FileMode;
 
 /// One path in the image: a file with `content`, a symlink to `target`, or
 /// a directory, with its owner and mode.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+///
+/// Like [`crate::config::ImageSpec`], it serializes to what a build's
+/// inputs hash, leaving out what's unset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PathSpec {
     /// A file's contents.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     /// Where a symlink points, verbatim.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
     /// Its owner, by name or UID. Defaults to root.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub owner: Option<Owner>,
     /// Its group, by name or GID. Defaults to the owner's primary group.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<Owner>,
     /// Defaults to `0644` for a file and `0755` for a directory. A symlink
     /// has none.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<FileMode>,
 }
 
@@ -34,7 +42,7 @@ pub enum PathKind<'a> {
 }
 
 /// A user or group, by name or by ID.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Owner {
     Id(u32),

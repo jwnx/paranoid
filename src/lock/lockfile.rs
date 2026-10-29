@@ -126,7 +126,8 @@ pub struct ExpectedDigest {
     /// The image manifest's digest, which a registry knows it by.
     pub digest: Digest,
     /// The [`IMAGE_FORMAT`] it was built with. Digests recorded before
-    /// paranoid had one leave it out; see [`ExpectedDigest::image_format`].
+    /// paranoid had one leave it out, and no build checks them: their
+    /// inputs were hashed another way too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<u32>,
     /// The paranoid version that built it, for people: whether the digest
@@ -140,23 +141,11 @@ pub struct ExpectedDigest {
 }
 
 impl ExpectedDigest {
-    /// The image format it was built with. A digest recorded before
-    /// paranoid had one counts as format 1 when paranoid 0.7.1 or 0.7.2
-    /// recorded it, which write format 1. 0.7.0 doesn't: its `configure`
-    /// left Rosetta's cache behind.
-    #[must_use]
-    pub fn image_format(&self) -> Option<u32> {
-        self.format.or(match self.paranoid.as_str() {
-            "0.7.1" | "0.7.2" => Some(1),
-            _ => None,
-        })
-    }
-
     /// Why a build of `inputs` at `epoch` by the running paranoid can't
     /// be checked against this digest, or `None` if it can.
     #[must_use]
     pub fn unchecked(&self, inputs: &Digest, epoch: i64) -> Option<Unchecked> {
-        if self.image_format() != Some(IMAGE_FORMAT) {
+        if self.format != Some(IMAGE_FORMAT) {
             Some(Unchecked::Format)
         } else if self.epoch != epoch {
             Some(Unchecked::Epoch)
@@ -798,17 +787,12 @@ direct = ["bash"]
 
     #[test]
     fn reads_digests_recorded_before_image_formats() {
-        let recorded = |paranoid: &str| {
-            let toml = format!(
-                "digest = \"sha256:{TEST_HASH_1}\"\nparanoid = \"{paranoid}\"\n\
-                 epoch = 0\ninputs = \"sha256:{TEST_HASH_2}\"\n"
-            );
-            toml::from_str::<ExpectedDigest>(&toml).unwrap()
-        };
-        assert_eq!(recorded("0.7.1").image_format(), Some(1));
-        assert_eq!(recorded("0.7.2").image_format(), Some(1));
-        let older = recorded("0.7.0");
-        assert_eq!(older.image_format(), None);
+        let older: ExpectedDigest = toml::from_str(&format!(
+            "digest = \"sha256:{TEST_HASH_1}\"\nparanoid = \"0.7.2\"\n\
+             epoch = 0\ninputs = \"sha256:{TEST_HASH_2}\"\n"
+        ))
+        .unwrap();
+        assert_eq!(older.format, None);
         assert_eq!(older.unchecked(&older.inputs, 0), Some(Unchecked::Format));
     }
 

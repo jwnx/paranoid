@@ -259,16 +259,17 @@ pub async fn run(args: BuildArgs, quiet: bool) -> Result<(), CliError> {
             if !args.record {
                 let why = match (&previous, unchecked) {
                     (Some(_), None) => "The digest matches the one the lock records.".to_string(),
-                    (Some(previous), Some(Unchecked::Format)) => format!(
-                        "The lock's digest was recorded by paranoid {}, which writes {}, so it \
-                         wasn't checked.",
-                        previous.paranoid,
-                        match previous.image_format() {
-                            Some(format) =>
-                                format!("image format {format} (this one writes {IMAGE_FORMAT})"),
-                            None => "another image format".to_string(),
-                        }
-                    ),
+                    (Some(previous), Some(Unchecked::Format)) => match previous.format {
+                        Some(format) => format!(
+                            "The lock's digest is for image format {format}, and this paranoid \
+                             writes {IMAGE_FORMAT}, so it wasn't checked."
+                        ),
+                        None => format!(
+                            "The lock's digest was recorded by paranoid {}, before image \
+                             formats, so it wasn't checked; record it again.",
+                            previous.paranoid
+                        ),
+                    },
                     (Some(previous), Some(Unchecked::Epoch)) => format!(
                         "The lock's digest is for SOURCE_DATE_EPOCH {}, not {epoch}, so it \
                          wasn't checked.",

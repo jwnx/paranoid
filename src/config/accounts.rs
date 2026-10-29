@@ -1,37 +1,44 @@
 //! Users and groups with fixed IDs: `[accounts]`.
 
 use indexmap::IndexMap;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Users and groups an image gets, on top of base-passwd's.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+///
+/// Like [`crate::config::ImageSpec`], it serializes to what a build's
+/// inputs hash, leaving out what's unset.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Accounts {
     /// Groups by name, with their GIDs.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub groups: IndexMap<String, u32>,
     /// Users by name.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub users: IndexMap<String, UserSpec>,
 }
 
 /// One user, as `adduser --system` would make it, but with its IDs fixed.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserSpec {
     pub uid: u32,
     /// Its primary group, by name. Defaults to a group named after the
     /// user. A group named after the user is made with the user's UID as
     /// its GID unless `[accounts.groups]` or base-passwd has it.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
     /// Groups it's a member of besides its primary one.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<String>,
     /// Defaults to `/nonexistent`, as for `adduser --system`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub home: Option<String>,
     /// Defaults to `/usr/sbin/nologin`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub shell: Option<String>,
     /// The comment field: the user's full name, or what it's for.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub gecos: Option<String>,
 }
 

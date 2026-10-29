@@ -170,24 +170,22 @@ pub enum BuildError {
 /// time give the same image, so a digest recorded with all three holds for
 /// a later build only while they match.
 ///
-/// The image's part is hashed in its `Debug` form, which can change
-/// between paranoid versions. That's safe: a changed hash only stops a
-/// recorded digest from being checked.
+/// The hash is of the manifest's and the lock's types serialized, which
+/// leave out what's unset, so it stays the same from one paranoid to the
+/// next unless the image changes: a release that adds an option keeps the
+/// inputs of every image that doesn't use it.
 pub fn inputs(manifest: &Manifest, lock: &LockFile, image: &str) -> Result<Digest, BuildError> {
     let unknown = || BuildError::UnknownImage(image.to_string());
     let spec = manifest.images.get(image).ok_or_else(unknown)?;
     let locked = lock.image(image).ok_or_else(unknown)?;
-    // Where the image goes doesn't change it.
-    let spec = ImageSpec {
-        output: None,
-        ..spec.clone()
-    };
     let files = lock
         .image_files(locked)
         .into_iter()
         .map(|file| {
-            let spec = manifest.files.get(&file.name);
-            spec.map(|spec| (file, format!("{spec:?}")))
+            manifest
+                .files
+                .get(&file.name)
+                .map(|spec| (file, spec))
                 .ok_or_else(|| BuildError::UnknownFile(file.name.clone()))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -200,14 +198,14 @@ pub fn inputs(manifest: &Manifest, lock: &LockFile, image: &str) -> Result<Diges
     #[derive(Serialize)]
     struct Inputs<'a> {
         architecture: String,
-        image: String,
+        image: &'a ImageSpec,
         packages: Vec<&'a LockedPackage>,
-        files: Vec<(&'a LockedFile, String)>,
+        files: Vec<(&'a LockedFile, &'a FileSpec)>,
         apt: Vec<(String, Vec<u8>)>,
     }
     let inputs = Inputs {
         architecture: manifest.architecture.to_string(),
-        image: format!("{spec:?}"),
+        image: spec,
         packages: lock.image_packages(locked),
         files,
         apt,
@@ -518,5 +516,56 @@ direct = ["bash"]
         assert_ne!(inputs_of(&with_env, LOCK), base);
         let rebuilt = LOCK.replace("version = \"5.0\"", "version = \"5.0+b1\"");
         assert_ne!(inputs_of(MANIFEST, &rebuilt), base);
+    }
+
+    /// An image's settings serialize without the options it doesn't use,
+    /// so an option a later paranoid adds leaves its inputs alone.
+    #[test]
+    fn inputs_leave_out_unset_options() {
+        assert_eq!(
+            serde_json::to_value(ImageSpec::default()).unwrap(),
+            serde_json::json!({})
+        );
+        let manifest = Manifest::from_str(MANIFEST).unwrap();
+        assert_eq!(
+            serde_json::to_value(&manifest.images["default"]).unwrap(),
+            serde_json::json!({
+                "packages": [{"name": "bash", "version": null, "repository": null}],
+            })
+        );
+    }
+
+    /// Inputs are compared with ones recorded by other paranoid versions,
+    /// so the same manifest and lock have to hash the same in all of them.
+    /// If this fails, the change makes every recorded digest stop being
+    /// checked: keep the old hash instead, by leaving out what's unset.
+    #[test]
+    fn inputs_stay_the_same_across_versions() {
+        let manifest = format!(
+            r#"{MANIFEST}
+[accounts.users.app]
+uid = 999
+groups = ["staff"]
+
+[paths."/srv/app"]
+owner = "app"
+mode = "0750"
+
+[paths."/etc/app.conf"]
+content = "x = 1\n"
+
+[entrypoint]
+cmd = ["/bin/sh"]
+env = {{ PATH = "/usr/bin", LANG = "C.UTF-8" }}
+"#
+        );
+        assert_eq!(
+            inputs_of(MANIFEST, LOCK).to_string(),
+            "sha256:e5a60bf2b00189b423359720dc0b6f755903306fe596ff18f18b37b0bb997a71"
+        );
+        assert_eq!(
+            inputs_of(&manifest, LOCK).to_string(),
+            "sha256:4a2a5fa4e4f06a695dcb821868c4804a9a63ee27f4a55598778045a96c8b1cf5"
+        );
     }
 }

@@ -63,46 +63,68 @@ pub fn running_version() -> Version {
 pub const DEFAULT_IMAGE: &str = "default";
 
 /// One image of a manifest.
-#[derive(Debug, Clone, Default)]
+///
+/// It serializes to what [`crate::build::inputs`] hashes of it, which has
+/// to stay the same from one paranoid to the next for a recorded digest to
+/// keep being checked. So it leaves out whatever is unset, and a field
+/// added later has to do the same: then images that don't use it keep
+/// their inputs.
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ImageSpec {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub authors: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     /// Leave every package unpacked but not configured, as `dpkg --unpack`
     /// would, with its maintainer scripts in place, for `dpkg --configure`
     /// to run later in the image (say, in a Dockerfile). paranoid itself
     /// never runs them.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub unconfigured: bool,
     /// Run every package's maintainer scripts, as `dpkg --configure`
     /// would on a Debian system, in a container, so the image comes out
     /// finished. See `docs/configure.md`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub configure: bool,
     /// What the image asks for, groups expanded.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub packages: Vec<PackageSpec>,
     /// The ids of the files it gets, in manifest order.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<String>,
     /// The locales it keeps from `locales-all`, as `LANG` spells them
     /// (`en_US.UTF-8`), or `all` to keep every one. Asking for any adds
     /// `locales-all` to `packages`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub locales: Vec<String>,
     /// Configure apt in the image for the manifest's repositories, at the
     /// snapshots they're locked to.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub apt_sources: bool,
     /// Users and groups with fixed IDs, on top of base-passwd's: the
     /// manifest's `[accounts]`, then the image's own, which win. They
     /// shape the image, not what's in it, so they're left out of the
     /// config hash, as an entrypoint is.
+    #[serde(skip_serializing_if = "Accounts::is_empty")]
     pub accounts: Accounts,
     /// Files, directories and symlinks written straight from the manifest:
     /// its `[paths]`, then the image's own, which win, in manifest order.
     /// Like `accounts`, they're left out of the config hash.
+    #[serde(skip_serializing_if = "IndexMap::is_empty")]
     pub paths: IndexMap<ImagePath, PathSpec>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub entrypoint: Option<EntrypointConfig>,
     /// Where `build` writes the image, as written: relative to the
     /// manifest, with `{image}` standing for the image's id. See
-    /// [`Manifest::output`].
+    /// [`Manifest::output`]. Where the image goes doesn't change it, so
+    /// it's no part of its inputs.
+    #[serde(skip)]
     pub output: Option<String>,
 }
 
@@ -625,16 +647,18 @@ impl<'de> Deserialize<'de> for HoldSpec {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EntrypointConfig {
     /// The image's entrypoint. Empty leaves it unset, for an image that
     /// only wants `env` or `workdir`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cmd: Vec<String>,
     /// Environment variables, kept in declaration order so the image config
     /// is stable across builds.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub env: Option<IndexMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub workdir: Option<String>,
 }
 
