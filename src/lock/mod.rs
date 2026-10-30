@@ -9,7 +9,7 @@ mod summary;
 
 pub use diff::{Change, ChangeKind, FileChange, LockDiff};
 pub use lockfile::{
-    ExpectedDigest, LockFile, LockFileError, LockedFile, LockedImage, LockedPackage, LockedUnmet,
-    Trust, Unchecked,
+    DepEdge, ExpectedDigest, LockFile, LockFileError, LockedFile, LockedImage, LockedPackage,
+    LockedUnmet, Trust, Unchecked,
 };
 pub use summary::LockSummary;

@@ -654,6 +654,44 @@ fn diff_images_names_what_needs_building() {
     assert_eq!(stdout(&out), "default\n");
 }
 
+#[test]
+fn sbom_describes_the_lock() {
+    let tmp = TempDir::new().unwrap();
+    let dir = copy_hello_world(tmp.path());
+    let lock = fs::read_to_string(dir.join("paranoid.lock")).unwrap();
+    let packages = lock.matches("[[package]]").count();
+
+    let out = paranoid_in(&dir, &["sbom"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let spdx: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(spdx["spdxVersion"], "SPDX-2.3");
+    // The image, its operating system, then its packages.
+    assert_eq!(spdx["packages"].as_array().unwrap().len(), packages + 2);
+
+    let out = paranoid_in(&dir, &["sbom", "--format", "cyclonedx", "-o", "sbom.json"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let cdx: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.join("sbom.json")).unwrap()).unwrap();
+    assert_eq!(cdx["bomFormat"], "CycloneDX");
+    assert_eq!(cdx["components"].as_array().unwrap().len(), packages + 1);
+    assert_eq!(cdx["components"][0]["type"], "operating-system");
+    let purl = cdx["components"][1]["purl"].as_str().unwrap();
+    assert!(purl.starts_with("pkg:deb/debian/"), "{purl}");
+    assert!(purl.contains("distro=debian-12"), "{purl}");
+}
+
+#[test]
+fn sbom_needs_an_image_of_a_set() {
+    let examples = hello_world_dir().join("..");
+    let set = examples.join("postgres");
+    let out = paranoid(&["sbom", "-f", set.to_str().unwrap()]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("--image"), "{}", stderr(&out));
+
+    let out = paranoid(&["sbom", "-f", set.to_str().unwrap(), "--image", "builder"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+}
+
 /// A set: one lock for both images, then each built on its own.
 #[test]
 #[ignore]

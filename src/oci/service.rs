@@ -541,6 +541,19 @@ impl OciConfig {
         ImageIndex::new(vec![manifest])
     }
 
+    /// The image's repository as Docker names it, `docker.io/library/node`
+    /// for `node`, if the image has a name.
+    pub fn repository(&self) -> Option<String> {
+        self.image_name
+            .as_ref()
+            .map(|name| normalized(name.as_str()))
+    }
+
+    /// The image's tag.
+    pub fn tag(&self) -> &str {
+        self.image_tag.as_str()
+    }
+
     /// `name:tag`, or just the tag when the image has no name.
     pub fn reference(&self) -> String {
         match &self.image_name {

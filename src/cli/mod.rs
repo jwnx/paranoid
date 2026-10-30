@@ -8,4 +8,5 @@ pub mod error;
 pub mod inspect;
 pub mod lock;
 pub mod progress;
+pub mod sbom;
 pub mod style;

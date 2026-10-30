@@ -55,6 +55,14 @@ impl CliError {
         Self::wrap("build failed", e)
     }
 
+    pub fn sbom(e: impl Error) -> Self {
+        Self::wrap("could not describe the image", e)
+    }
+
+    pub fn write(path: &Path, e: impl Error) -> Self {
+        Self::wrap(&format!("could not write {}", path.display()), e)
+    }
+
     pub fn push(e: impl Error) -> Self {
         Self::wrap("push failed", e)
     }

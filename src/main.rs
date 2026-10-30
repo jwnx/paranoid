@@ -6,6 +6,7 @@
 //!   cache    Fill a store with the lock's packages
 //!   diff     Show how two lock files differ
 //!   inspect  Show the contents of a lock file or built image
+//!   sbom     Describe an image of the lock as an SBOM
 
 use std::process::ExitCode;
 
@@ -18,6 +19,7 @@ use cli::cache::CacheArgs;
 use cli::diff::DiffArgs;
 use cli::inspect::InspectArgs;
 use cli::lock::LockArgs;
+use cli::sbom::SbomArgs;
 use cli::style as st;
 
 #[derive(Parser)]
@@ -52,6 +54,9 @@ enum Commands {
 
     /// Show the contents of a lock file or image.
     Inspect(InspectArgs),
+
+    /// Describe an image of the lock as an SBOM: SPDX or CycloneDX.
+    Sbom(SbomArgs),
 }
 
 #[tokio::main]
@@ -65,6 +70,7 @@ async fn main() -> ExitCode {
         Commands::Cache(args) => cli::cache::run(args, quiet).await,
         Commands::Diff(args) => cli::diff::run(args),
         Commands::Inspect(args) => cli::inspect::run(args),
+        Commands::Sbom(args) => cli::sbom::run(args),
     };
 
     match result {
