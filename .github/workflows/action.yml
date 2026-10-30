@@ -29,7 +29,7 @@ jobs:
       - id: paranoid
         uses: ./
         with:
-          version: "0.7.1"
+          version: "0.8.0"
           lock: examples/hello-world/paranoid.lock
       - name: Build an example with it
         working-directory: examples/hello-world
@@ -38,7 +38,27 @@ jobs:
           CACHE_DIR: ${{ steps.paranoid.outputs.cache-dir }}
           VERSION: ${{ steps.paranoid.outputs.version }}
         run: |
-          test "$VERSION" = 0.7.1
+          test "$VERSION" = 0.8.0
           test "$(command -v paranoid)" = "$BIN"
           paranoid build -o "$RUNNER_TEMP/hello-world.tar"
           test -n "$(ls -A "$CACHE_DIR")"
+
+  # As a workflow elsewhere uses it: by its release tag, which the action
+  # takes its version from.
+  tagged:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: paranoid
+        uses: jwnx/paranoid@v0.8.0
+        with:
+          lock: examples/hello-world/paranoid.lock
+      - name: Build an example with it
+        working-directory: examples/hello-world
+        env:
+          VERSION: ${{ steps.paranoid.outputs.version }}
+        run: |
+          test "$VERSION" = 0.8.0
+          paranoid build -o "$RUNNER_TEMP/hello-world.tar"
