@@ -1,7 +1,7 @@
 # Install a paranoid release on a GitHub Actions runner, and cache the
 # packages and files it downloads.
 #
-#   - uses: jwnx/paranoid@v0.8.0
+#   - uses: jwnx/paranoid@v0.8.1
 #   - run: paranoid build
 #
 # The release is the action's own tag, or `version` when the action is
@@ -19,7 +19,7 @@ description: Install a verified paranoid release and cache what it downloads.
 inputs:
   version:
     description: >-
-      The release to install, like 0.8.0. Defaults to the action's own tag,
+      The release to install, like 0.8.1. Defaults to the action's own tag,
       so it's needed only when the action is pinned by commit.
     default: ""
   cache:
