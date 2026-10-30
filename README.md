@@ -101,7 +101,7 @@ v18.20.4
 A misspelled or unknown field makes paranoid reject the manifest.
 
 ```toml
-paranoid     = "~0.7"            # optional, the paranoid versions to use
+paranoid     = "~0.8"            # optional, the paranoid versions to use
 
 [image]
 name         = "node"            # optional, also the title label
@@ -846,7 +846,7 @@ part of the lock:
 [image.expected]
 digest   = "sha256:47dc50fa8fd99d9632b59471600c39d4af040c4b67db05177fdf7518a9cb3a18"
 format   = 1
-paranoid = "0.7.2"
+paranoid = "0.8.0"
 epoch    = 0
 inputs   = "sha256:3fabf2cf..."
 ```
@@ -992,7 +992,7 @@ this rather than the lock, whose layout can change:
       "expected": {
         "digest": "sha256:47dc50fa8fd99d9632b59471600c39d4af040c4b67db05177fdf7518a9cb3a18",
         "format": 1,
-        "paranoid": "0.7.2",
+        "paranoid": "0.8.0",
         "epoch": 0
       },
       "direct": ["etcd-server"],
@@ -1125,11 +1125,11 @@ with `cargo install --path .`.
 On GitHub Actions, this repository is an action that installs a release:
 
 ```yaml
-- uses: jwnx/paranoid@v0.7.2
+- uses: jwnx/paranoid@v0.8.0
 - run: paranoid build
 ```
 
-It installs the release it's tagged as, or `with: version: 0.7.2` when
+It installs the release it's tagged as, or `with: version: 0.8.0` when
 it's pinned by commit. The archive has to match the release's
 `SHA256SUMS` and carry the provenance the release workflow attested for
 that tag. It also caches what paranoid downloads, keyed by the lock

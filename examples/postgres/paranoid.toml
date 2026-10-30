@@ -2,7 +2,7 @@
 # build extensions for it. They share one lock, so the headers always
 # match the server that loads what they build.
 
-paranoid = "~0.7"
+paranoid = "~0.8"
 
 [repositories.debian]
 url = "https://deb.debian.org/debian"
