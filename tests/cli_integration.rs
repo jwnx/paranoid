@@ -692,6 +692,53 @@ fn sbom_needs_an_image_of_a_set() {
     assert!(out.status.success(), "{}", stderr(&out));
 }
 
+#[test]
+fn require_recorded_fails_before_building_what_it_cant_check() {
+    let tmp = TempDir::new().unwrap();
+    let dir = copy_hello_world(tmp.path());
+    let lock_path = dir.join("paranoid.lock");
+    let lock = fs::read_to_string(&lock_path).unwrap();
+    let build = || paranoid_in(&dir, &["build", "--require-recorded", "-o", "image.tar"]);
+
+    let out = build();
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("default: the lock records no digest for it"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!dir.join("image.tar").exists());
+
+    // A digest recorded for other inputs, then one from before image
+    // formats.
+    let zeros = "0".repeat(64);
+    let recorded = |format: &str| {
+        format!(
+            "{lock}\n[image.expected]\ndigest = \"sha256:{zeros}\"\n{format}\
+             paranoid = \"0.7.2\"\nepoch = 0\ninputs = \"sha256:{zeros}\"\n"
+        )
+    };
+    fs::write(&lock_path, recorded("format = 1\n")).unwrap();
+    let out = build();
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("default: the lock's digest is for other inputs"),
+        "{}",
+        stderr(&out)
+    );
+    fs::write(&lock_path, recorded("")).unwrap();
+    let out = build();
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("recorded by paranoid 0.7.2, before image formats"),
+        "{}",
+        stderr(&out)
+    );
+
+    let out = paranoid_in(&dir, &["build", "--require-recorded", "--record"]);
+    assert!(!out.status.success());
+}
+
 /// A set: one lock for both images, then each built on its own.
 #[test]
 #[ignore]
@@ -820,6 +867,12 @@ fn e2e_no_check_builds_past_a_recorded_digest() {
 
     let out = paranoid_in(dir, &["build", "--no-check", "--record"]);
     assert!(!out.status.success());
+
+    // With the digest it records for what it builds, the lock passes
+    // --require-recorded.
+    fs::write(&lock_path, &recorded).unwrap();
+    let out = paranoid_in(dir, &["build", "-o", "image.tar", "--require-recorded"]);
+    assert!(out.status.success(), "build failed: {}", stderr(&out));
 }
 
 /// The image format, and the digest an image built in it gets. A change

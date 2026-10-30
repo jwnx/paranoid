@@ -69,6 +69,13 @@ pub struct BuildArgs {
     #[arg(long, conflicts_with = "record")]
     no_check: bool,
 
+    /// Fail, before building anything, unless the lock records a digest
+    /// to check each image against: one for its inputs, image format and
+    /// SOURCE_DATE_EPOCH. Without it, a build that has nothing to check
+    /// says so and goes ahead.
+    #[arg(long, conflicts_with_all = ["record", "no_check"])]
+    require_recorded: bool,
+
     /// Re-download packages even if they are cached.
     #[arg(long)]
     force_download: bool,
@@ -154,6 +161,23 @@ pub async fn run(args: BuildArgs, quiet: bool) -> Result<(), CliError> {
     let created = source_date_epoch()?;
     let epoch = created.as_datetime().timestamp();
     let mut changed = false;
+
+    // Every image that can't be checked at once, before the first build
+    // takes its time.
+    if args.require_recorded {
+        let mut unrecorded = Vec::new();
+        for id in &images {
+            let inputs = paranoid::build::inputs(&manifest, &lock, id).map_err(CliError::build)?;
+            let previous = lock.image(id).and_then(|image| image.expected.as_ref());
+            let unchecked = previous.and_then(|previous| previous.unchecked(&inputs, epoch));
+            if let Some(why) = unchecked_reason(previous, unchecked, epoch) {
+                unrecorded.push(format!("{id}: {why}"));
+            }
+        }
+        if !unrecorded.is_empty() {
+            return Err(CliError::unrecorded(&unrecorded));
+        }
+    }
 
     for id in &images {
         let output = output_for(id);
@@ -270,32 +294,17 @@ pub async fn run(args: BuildArgs, quiet: bool) -> Result<(), CliError> {
                 st::fmt_size(report.image.total_size),
             );
             if !args.record {
-                let why = match (&previous, unchecked) {
-                    (Some(_), None) if mismatch.is_some() => {
+                let why = match unchecked_reason(previous.as_ref(), unchecked, epoch) {
+                    None if mismatch.is_some() => {
                         "The digest isn't the one the lock records; --no-check wrote it anyway."
                             .to_string()
                     }
-                    (Some(_), None) => "The digest matches the one the lock records.".to_string(),
-                    (Some(previous), Some(Unchecked::Format)) => match previous.format {
-                        Some(format) => format!(
-                            "The lock's digest is for image format {format}, and this paranoid \
-                             writes {IMAGE_FORMAT}, so it wasn't checked."
-                        ),
-                        None => format!(
-                            "The lock's digest was recorded by paranoid {}, before image \
-                             formats, so it wasn't checked; record it again.",
-                            previous.paranoid
-                        ),
-                    },
-                    (Some(previous), Some(Unchecked::Epoch)) => format!(
-                        "The lock's digest is for SOURCE_DATE_EPOCH {}, not {epoch}, so it \
-                         wasn't checked.",
-                        previous.epoch
-                    ),
-                    (Some(_), Some(Unchecked::Inputs)) => {
-                        "The lock's digest is for other inputs, so it wasn't checked.".to_string()
+                    None => "The digest matches the one the lock records.".to_string(),
+                    Some(why) => {
+                        let mut why = why;
+                        why[..1].make_ascii_uppercase();
+                        format!("{why}, so it wasn't checked.")
                     }
-                    (None, _) => "The lock records no digest for this build to check.".to_string(),
                 };
                 eprintln!("{why}");
             }
@@ -307,6 +316,35 @@ pub async fn run(args: BuildArgs, quiet: bool) -> Result<(), CliError> {
     }
 
     Ok(())
+}
+
+/// Why a build can't be checked against what the lock records for it, or
+/// `None` if it can.
+fn unchecked_reason(
+    previous: Option<&ExpectedDigest>,
+    unchecked: Option<Unchecked>,
+    epoch: i64,
+) -> Option<String> {
+    let Some(previous) = previous else {
+        return Some("the lock records no digest for it".to_string());
+    };
+    Some(match unchecked? {
+        Unchecked::Format => match previous.format {
+            Some(format) => format!(
+                "the lock's digest is for image format {format}, and this paranoid writes \
+                 {IMAGE_FORMAT}"
+            ),
+            None => format!(
+                "the lock's digest was recorded by paranoid {}, before image formats",
+                previous.paranoid
+            ),
+        },
+        Unchecked::Epoch => format!(
+            "the lock's digest is for SOURCE_DATE_EPOCH {}, not {epoch}",
+            previous.epoch
+        ),
+        Unchecked::Inputs => "the lock's digest is for other inputs".to_string(),
+    })
 }
 
 /// The image creation time: `SOURCE_DATE_EPOCH` when set, the Unix epoch

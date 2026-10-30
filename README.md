@@ -68,7 +68,7 @@ paranoid build   [-f MANIFEST] [--lock LOCK] [-o OUT] [--image ID]...
                  [--cache-dir DIR] [--jobs N] [--force-download]
                  [--allow-stale] [--allow-unmet]
                  [--runtime podman|docker] [--check-reproducible]
-                 [--record | --no-check]
+                 [--record | --no-check | --require-recorded]
 paranoid cache push    [URL|DIR] [-f MANIFEST] [--lock LOCK] [--cache-dir DIR]
                        [--jobs N]
 paranoid diff    OLD NEW [--json | --images]
@@ -867,7 +867,10 @@ recording again. When the check
 applies and the image comes out different, the build fails without
 writing it: something that should be reproducible isn't. `--no-check`
 writes the image anyway and warns, leaving the lock as it is, for
-looking into what changed. A lock holds
+looking into what changed. `--require-recorded` turns a skipped check
+into an error: it fails before building anything, naming each image the
+lock has no digest to check against and why, so CI can't build an image
+nobody recorded. A lock holds
 one digest per image: `--record` warns when it replaces a different one,
 writes the lock after each image it builds, and records only from a lock
 that's current. `lock` keeps a recorded digest when it re-resolves, as

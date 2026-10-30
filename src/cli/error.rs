@@ -98,6 +98,20 @@ impl CliError {
         Self(msg)
     }
 
+    /// Images with no recorded digest to check, built with
+    /// `--require-recorded`.
+    pub fn unrecorded(unrecorded: &[String]) -> Self {
+        let mut msg = String::from("nothing to check these builds against:");
+        for u in unrecorded {
+            msg.push_str(&format!("\n  {u}"));
+        }
+        msg.push_str(
+            "\nrecord their digests with `paranoid build --record` and commit the lock, \
+             or build without --require-recorded",
+        );
+        Self(msg)
+    }
+
     /// A lock that no longer stands for the manifest, used without
     /// `--allow-stale`.
     pub fn stale(path: &Path) -> Self {
