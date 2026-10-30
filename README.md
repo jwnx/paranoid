@@ -74,6 +74,8 @@ paranoid cache push    [URL|DIR] [-f MANIFEST] [--lock LOCK] [--cache-dir DIR]
 paranoid diff    OLD NEW [--json | --images]
 paranoid inspect lock  [FILE] [--tree | --json] [--image ID]
 paranoid inspect image [PATH]
+paranoid sbom    [-f MANIFEST] [--lock LOCK] [--image ID]
+                 [--format spdx|cyclonedx] [-o FILE]
 ```
 
 `-q` silences everything but errors. `--help` on any command has the rest.
@@ -1033,6 +1035,55 @@ For instance, the digest a lock records for `pg17`:
 $ paranoid inspect lock --json --image pg17 | jq -r '.images[0].expected.digest'
 ```
 
+## SBOM
+
+`paranoid sbom` describes an image as a software bill of materials, for
+the tools that track what's in an image and which advisories apply to it:
+vulnerability scanners such as Grype and Trivy, Dependency-Track, GitHub's
+SBOM attestations. It reads the lock, so it needs no build and no scan.
+
+```sh
+$ paranoid sbom > sbom.spdx.json                       # SPDX 2.3
+$ paranoid sbom --format cyclonedx -o sbom.cdx.json    # CycloneDX 1.6
+$ paranoid sbom --image pg17                           # one image of a set
+```
+
+Both are JSON, and say the same:
+
+- Each Debian package, with its version, SHA-256, where its `.deb` is in
+  the repository's snapshot, and a package URL that scanners match
+  advisories on:
+  `pkg:deb/debian/libssl3@3.0.16-1~deb12u1?arch=arm64&distro=debian-12&upstream=openssl`.
+  `distro` comes from the first repository whose codename paranoid knows
+  (Debian 10 to 14, Ubuntu 20.04 to 25.10), `bookworm-security` and
+  `bookworm-pgdg` included, and `upstream` is the package's
+  [source package](#lock), which Debian files advisories by. A lock
+  written before paranoid kept source packages has none until it
+  re-resolves; `paranoid lock --force` does that, though without a
+  `snapshot` it also picks up newer packages.
+- The operating system, `debian` `12`, which scanners need to know
+  which advisories apply. A scanner given the image itself reads it from
+  `/etc/os-release`, which only an image with `base-files` has; without
+  it Grype matches nothing, while the SBOM names it either way.
+- Each `[files]` entry, with its URL, SHA-256 and version, as a generic
+  package URL.
+- What depends on what, from the lock's dependency graph.
+- Each repository's snapshot and the SHA-256 of its `InRelease`.
+- The image, by the digest the lock [records](#recorded-digests) for it
+  when that still holds, as `pkg:oci/...@sha256:...`. That ties the list
+  to an image digest without building or opening the image.
+
+The same lock gives the same SBOM: its time is the newest snapshot's
+rather than now, and its id is derived from what it describes, so it can
+be committed and diffed. Licenses are `NOASSERTION` for now. In
+CycloneDX each package also carries Syft's `syft:metadata:source`
+properties, which is where Grype looks for the source package there.
+Scanned with Grype, both formats find the same vulnerabilities as a scan
+of the image.
+
+An SBOM covers what paranoid puts in the image. Layers a Dockerfile adds
+on top of a paranoid base need a scanner of their own.
+
 ## HACKING
 
 ```sh
@@ -1087,6 +1138,18 @@ off): `build` checks everything it reads from the cache against the
 lock, so the cache only saves downloads. Its outputs are the `version`,
 the binary's `path` and the `cache-dir`. It runs on Linux (amd64 and
 arm64) and macOS runners.
+
+To attest an image's SBOM next to the image, hand it to
+`actions/attest-sbom`:
+
+```yaml
+- run: paranoid sbom --image pg17 -o sbom.spdx.json
+- uses: actions/attest-sbom@v2
+  with:
+    subject-name: ghcr.io/fly/pg17
+    subject-digest: ${{ steps.push.outputs.digest }}
+    sbom-path: sbom.spdx.json
+```
 
 ## STATUS
 
